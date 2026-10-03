@@ -11,5 +11,13 @@ name = "npro-core"
 version = "0.0.2"
 
 [[package]]
+name = "npro-fuzz"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-test",
+]
+
+[[package]]
 name = "npro-test"
 version = "0.0.2"

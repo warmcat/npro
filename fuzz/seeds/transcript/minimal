@@ -1,0 +1,1 @@
+{"format": "lws-transcript/1", "case": "x", "side": "client", "t0_us": 1000000000, "t0_wall": 1767225600, "seed": 0, "steps": [{"t": 1000, "tx": "4745"}, {"t": 2000, "close": ""}]}

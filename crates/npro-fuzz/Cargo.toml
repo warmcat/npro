@@ -1,0 +1,20 @@
+[package]
+name        = "npro-fuzz"
+description = "Fuzz harnesses for npro: each target's input handling and its oracle, for libFuzzer and for the smoke tests"
+publish     = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core = { path = "../npro-core" }
+npro-test = { path = "../npro-test" }
+
+[dev-dependencies]
+npro-core = { path = "../npro-core", features = ["replay"] }
+
+[lints]
+workspace = true

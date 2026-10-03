@@ -23,6 +23,9 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "deny"
 wildcards         = "deny"
+# path dependencies between the workspace's own crates: cargo deny allows
+# these only in crates that are not published, such as npro-fuzz
+allow-wildcard-paths = true
 
 # The bouncers at the door.  Any crate in the graph that is not named here
 # fails the gate, however deep in the tree it sits: a crate admitted for one
@@ -35,6 +38,7 @@ allow = [
 	# the workspace
 	"npro",
 	"npro-core",
+	"npro-fuzz",
 	"npro-test",
 
 	# admitted dependencies, each with its entry in docs/dependencies.md:
