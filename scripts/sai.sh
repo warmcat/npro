@@ -31,6 +31,19 @@ jobs="${SAI_PARALLEL:-4}"
 nostd_crates="npro-core"
 nostd_targets="thumbv6m-none-eabi thumbv7em-none-eabihf riscv32imc-unknown-none-elf"
 
+# Refuse a toolchain older than the workspace's rust-version up front: cargo
+# itself only says it cannot parse the manifest.  A distro's packaged cargo
+# is the usual cause, when rustup is not installed for the builder's user.
+msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+have=$(rustc --version 2>/dev/null | sed -n 's/^rustc \([0-9]*\.[0-9]*\).*/\1/p')
+if [ -z "$have" ] ||
+   [ "$(printf '%s\n%s\n' "$msrv" "$have" | sort -t. -k1,1n -k2,2n | head -n1)" != "$msrv" ]; then
+	echo "rustc ${have:-not found} on this builder; npro needs $msrv or later." >&2
+	echo "Install rustup for the user sai runs jobs as, see docs/sai.md:" >&2
+	echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default" >&2
+	exit 1
+fi
+
 profile="${1:-}"
 [ $# -gt 0 ] && shift
 

@@ -52,6 +52,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 That gives stable with rustfmt and clippy, which is all the `test`
 profile needs.  Updating later is `rustup update`.
 
+A distro's packaged cargo is usually too old: Ubuntu noble's is 1.75, and
+npro needs the workspace's `rust-version`, 1.85, the first to know
+edition 2024.  `scripts/sai.sh` checks `rustc` before anything else, and
+refuses an older one with the install command, rather than leaving cargo
+to fail parsing the manifest.
+
 ### The fedora44 x86_64 builder, which runs everything else
 
 On top of the above:
