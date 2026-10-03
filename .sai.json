@@ -1,0 +1,116 @@
+{
+	"schema": "sai-1",
+
+	#
+	# The platform names are the C tree's, so a builder serves both.  Each
+	# unix platform runs scripts/sai.sh with the configuration's "cmake",
+	# which names a profile there: sai's step template only substitutes
+	# ${prep}, ${cmake} and ${cpack}, so "cmake" carries it.  What each
+	# builder needs installed is in docs/sai.md.
+	#
+	# The toolchain part of the names (gcc, llvm, msvc) is the C build's;
+	# rustc builds npro everywhere, and uses that platform's linker.
+	#
+
+	"platforms": {
+		"linux-fedora44/x86_64-amd/gcc": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"rocky9/x86_64-amd/gcc": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"rocky9/aarch64-a72a55-rk3588/gcc": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"linux-ubuntu-2404/aarch64-a72-bcm2711-rpi4/gcc": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"ubuntu-noble/riscv64/gcc": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"netbsd-OSX-bigsur/x86_64-intel-i3/llvm": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"netbsd-OSX-tahoe/aarch64-apple-m1/llvm": {
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"freebsd/aarch64/llvm": {
+			"default": false,
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
+		"w11/x86_64-amd/msvc": {
+			"default": false,
+			"build": [ "cargo test --workspace --all-features --locked -j %SAI_PARALLEL%" ]
+		}
+	},
+
+	"configurations": {
+
+		# the tests, natively, on every default platform: x86_64 and
+		# aarch64 linux, riscv64, and macOS on intel and apple silicon
+
+		"test": {
+			"cmake":	"test"
+		},
+
+		# platforms whose rust comes from their own packages, or that
+		# run a fixed command: tests only
+
+		"test-freebsd": {
+			"cmake":	"test",
+			"platforms":	"none, freebsd/aarch64/llvm"
+		},
+		"test-windows": {
+			"cmake":	"",
+			"platforms":	"none, w11/x86_64-amd/msvc"
+		},
+
+		# every gate a commit must pass, as scripts/ci.sh runs them: fmt,
+		# clippy, tests, docs, the MSRV build, the no_std build, cargo deny
+		# and cargo audit
+
+		"gate": {
+			"cmake":	"gate",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# clippy over every combination of every crate's features: the
+		# rust form of C's build option dimensions, since code behind a
+		# feature is only compiled when it is on
+
+		"features": {
+			"cmake":	"features",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# the sans-IO crates for targets with no std: cortex-m0 (no
+		# atomics), cortex-m4f, and a 32-bit risc-v microcontroller
+
+		"nostd": {
+			"cmake":	"nostd",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# the tests under Miri interpreting a machine sai has no builder
+		# for: big-endian 64-bit, and 32-bit little-endian, where usize and
+		# byte order differ from every builder above
+
+		"miri-big-endian": {
+			"cmake":	"miri s390x-unknown-linux-gnu",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+		"miri-32bit": {
+			"cmake":	"miri i686-unknown-linux-gnu",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# C lws main-dev's api-test-sansio transcripts, recorded afresh and
+		# compared with npro's copies: fails when C's behaviour moved and
+		# npro has not been synced with it
+
+		"c-oracle": {
+			"cmake":	"oracle",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		}
+	}
+}

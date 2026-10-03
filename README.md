@@ -43,6 +43,9 @@ sansIO half is the specification, and the port is held to it by:
 - the dependency tree stays close to empty (cargo deny + audit)
 - maximally linted via clippy to enforce code quality
 - fuzzing in CI on pushes and when CI idle
+- CI runs tests natively on Linux, macOS, risc-v, aarach64, Windows
+- Big-endian + 32-bit via Miri
+- Every feature combination tested
 
 ## Licence
 
