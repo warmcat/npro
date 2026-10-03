@@ -55,6 +55,16 @@ away with the overlay.  Shut the base down cleanly afterwards, and let
 sai-virt make fresh overlays: an overlay made from the old base must not
 be used with the new one.
 
+Size the base for what the jobs build.  The fedora44 builder, with
+everything below installed, filled a 10 GB root; 40 GB is comfortable.
+After growing a base image, raise sai-virt's overlay size to match:
+`"overlay_size"` in the platform's file in `/etc/sai/virt/conf.d/`, which
+is 20G if not given.  The overlay must be at least the base's virtual
+size; a smaller one leaves the guest's LVM unable to activate, and the job
+VM hangs at boot just after `Started systemd-journald.service`.  The
+overlays live in `/dev/shm`, so they take RAM as jobs write to them, not
+disk.
+
 ### What each builder needs
 
 | builder | configurations | needs |
@@ -62,7 +72,7 @@ be used with the new one.
 | x86_64 and aarch64 Linux, riscv64, both macOS | `test` | rustup with stable (`--profile default`) |
 | fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle` | everything below |
 | freebsd/aarch64 | `test-freebsd` | `pkg install rust`, 1.85 or later; rustup has no FreeBSD aarch64 host |
-| w11/x86_64 | `test-windows` | `rustup-init.exe`, as the account the sai service runs as, with its `%USERPROFILE%\.cargo\bin` on the service's `PATH` |
+| w11/x86_64 | `test-windows` | rustup with stable for the MSVC host, on the sai service's `PATH`: see below |
 
 **Every builder with rustup**, as the `sai` user:
 
@@ -95,6 +105,47 @@ dnf install git cmake make gcc zlib-devel
 Miri builds a standard library for each target it interprets.
 `miri setup` does it once ahead of time; otherwise every job on a fresh
 overlay spends several minutes on it.
+
+**The Windows builder.**  rustup's Windows installer is `rustup-init.exe`,
+from <https://rustup.rs>:
+<https://win.rustup.rs/x86_64> redirects to
+<https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe>,
+with its checksum beside it at the same URL plus `.sha256`
+(`certutil -hashfile rustup-init.exe SHA256` to compare).
+`winget install Rustlang.Rustup` fetches the same thing.
+
+The job step runs a bare `cargo`, so cargo must be on the `PATH` the sai
+builder service starts with.  rustup normally installs per user and adds
+its `bin` to that user's `PATH` only, which a service running as
+LocalSystem never sees.  Install it to a fixed place and put that on the
+system `PATH` instead.  `setx /M` sets them for processes started later,
+so the installer also needs them set in the shell it runs from.  From an
+administrator PowerShell:
+
+```powershell
+setx /M RUSTUP_HOME C:\rust\rustup
+setx /M CARGO_HOME C:\rust\cargo
+$env:RUSTUP_HOME = 'C:\rust\rustup'
+$env:CARGO_HOME = 'C:\rust\cargo'
+.\rustup-init.exe -y --default-host x86_64-pc-windows-msvc --profile default --no-modify-path
+```
+
+In `cmd`, the two `$env:` lines are `set RUSTUP_HOME=C:\rust\rustup` and
+`set CARGO_HOME=C:\rust\cargo`.  Do not use those `set` lines in
+PowerShell: there `set` makes a PowerShell variable, not an environment
+variable, and rustup then installs under `%USERPROFILE%` as usual.  The
+installer ends by printing where it installed; it should say `C:\rust`.
+
+then add `C:\rust\cargo\bin` to the system `PATH` (System Properties →
+Environment Variables), and reboot: services only see a changed system
+environment after one.  If the service account is not an administrator,
+give it read access to `C:\rust`, and write access to
+`C:\rust\cargo\registry`, where cargo would cache downloaded crates.
+
+The linker is MSVC's `link.exe`, from the Visual Studio Build Tools the
+builder already has for building C lws.  `rustup-init.exe` warns if it
+cannot find them.  As the service's account (or in a new administrator
+`cmd`), `cargo --version` should then print 1.85 or later.
 
 ### Checking a builder
 
