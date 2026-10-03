@@ -1,0 +1,20 @@
+[package]
+name        = "npro-core"
+description = "The sans-IO core of npro: connection state, time and random as inputs, and the substrate the protocol crates share"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "networking"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[features]
+# SeededRandom: lws' deterministic random, for replaying C's transcripts.
+# Never a source for a real connection's keys or masks.
+replay = []
+
+[lints]
+workspace = true

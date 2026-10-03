@@ -7,5 +7,9 @@ name = "npro"
 version = "0.0.2"
 
 [[package]]
+name = "npro-core"
+version = "0.0.2"
+
+[[package]]
 name = "npro-test"
 version = "0.0.2"
