@@ -72,7 +72,7 @@ disk.
 | x86_64 and aarch64 Linux, riscv64, both macOS | `test` | rustup with stable (`--profile default`) |
 | fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle` | everything below |
 | freebsd/aarch64 | `test-freebsd` | `pkg install rust`, 1.85 or later; rustup has no FreeBSD aarch64 host |
-| w11/x86_64 | `test-windows` | rustup with stable for the MSVC host, on the sai service's `PATH`: see below |
+| w11/x86_64 | `test-windows` | rustup with stable for the MSVC host, and an `env` for the platform in the builder's configuration: see below |
 
 **Every builder with rustup**, as the `sai` user:
 
@@ -114,17 +114,14 @@ with its checksum beside it at the same URL plus `.sha256`
 (`certutil -hashfile rustup-init.exe SHA256` to compare).
 `winget install Rustlang.Rustup` fetches the same thing.
 
-The job step runs a bare `cargo`, so cargo must be on the `PATH` the sai
-builder service starts with.  rustup normally installs per user and adds
-its `bin` to that user's `PATH` only, which a service running as
-LocalSystem never sees.  Install it to a fixed place and put that on the
-system `PATH` instead.  `setx /M` sets them for processes started later,
-so the installer also needs them set in the shell it runs from.  From an
-administrator PowerShell:
+sai-builder does not pass its own environment to a job: on Windows, as
+on unix, the job starts with only a fixed `PATH`, `LANG` and `TERM`, plus
+`HOME` and the `SAI_*` variables.  So the system `PATH` does not reach it,
+and everything cargo needs is set per platform in the builder's
+configuration instead (below).  rustup goes in a fixed place outside any
+profile.  From an administrator PowerShell:
 
 ```powershell
-setx /M RUSTUP_HOME C:\rust\rustup
-setx /M CARGO_HOME C:\rust\cargo
 $env:RUSTUP_HOME = 'C:\rust\rustup'
 $env:CARGO_HOME = 'C:\rust\cargo'
 .\rustup-init.exe -y --default-host x86_64-pc-windows-msvc --profile default --no-modify-path
@@ -136,16 +133,49 @@ PowerShell: there `set` makes a PowerShell variable, not an environment
 variable, and rustup then installs under `%USERPROFILE%` as usual.  The
 installer ends by printing where it installed; it should say `C:\rust`.
 
-then add `C:\rust\cargo\bin` to the system `PATH` (System Properties →
-Environment Variables), and reboot: services only see a changed system
-environment after one.  If the service account is not an administrator,
-give it read access to `C:\rust`, and write access to
-`C:\rust\cargo\registry`, where cargo would cache downloaded crates.
+The account the jobs run as must be able to read `C:\rust\rustup` and
+write `C:\rust\cargo`, where cargo keeps its package cache and the lock on
+it.  For an ordinary account, here `sai`:
+ 
+ ```powershell
+ icacls C:\rust\rustup /grant 'sai:(OI)(CI)RX' /T
+ icacls C:\rust\cargo /grant 'sai:(OI)(CI)M' /T
+ ```
+ 
+Then give the platform an `env` in the builder's configuration file.  It
+is JSON, so every backslash is doubled: a single one is read as an escape,
+and `\r` in `C:\rust\rustup` becomes a carriage return.
+
+```json
+{
+	"name":	"w11/x86_64-amd/msvc",
+	"env": [
+		"PATH=c:\\rust\\cargo\\bin;c:\\Windows\\System32;c:\\Windows",
+		"RUSTUP_HOME=c:\\rust\\rustup",
+		"CARGO_HOME=c:\\rust\\cargo",
+		"SystemRoot=c:\\Windows",
+		"TEMP=c:\\Users\\sai.sai-vm\\AppData\\Local\\Temp",
+		"TMP=c:\\Users\\sai.sai-vm\\AppData\\Local\\Temp"
+	],
+	...
+}
+```
+
+- `PATH`: rustup's `cargo` first, then the system's own programs.
+- `RUSTUP_HOME`, `CARGO_HOME`: without them `cargo` looks for its
+  toolchains under the profile, and finds none.
+- `SystemRoot`: much of Win32, sockets and crypto among it, fails
+  without it.
+- `TEMP`, `TMP`: where rustc and `link.exe` write temporary files.  They
+  must be in the profile of the account the jobs run as, which need not
+  be named after it: here the jobs run in `C:\Users\sai.sai-vm`, and
+  `link.exe` failed with `LNK1104: cannot open file '...\Temp\lnk{...}.tmp'`
+  while they pointed at `C:\Users\sai`.
 
 The linker is MSVC's `link.exe`, from the Visual Studio Build Tools the
-builder already has for building C lws.  `rustup-init.exe` warns if it
-cannot find them.  As the service's account (or in a new administrator
-`cmd`), `cargo --version` should then print 1.85 or later.
+builder already has for building C lws.  rustc finds Visual Studio
+itself, so none of its variables (`LIB`, `INCLUDE`, `VCINSTALLDIR`) are
+needed in `env`.
 
 ### Checking a builder
 

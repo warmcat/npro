@@ -61,7 +61,9 @@ These came from real incidents, not taste.
 - **Ask before installing tools or system packages.**  Never install
   Node.js or anything with an npm-style uncontrolled dependency tree, even
   in a throwaway environment.  New crate dependencies are covered by
-  AGENTS.md: close to zero, each justified in its commit.
+  AGENTS.md: close to zero, each justified in its commit.  `deny.toml`
+  admits crates only by name, and docs/dependencies.md says how one is
+  admitted; never add one without asking.
 - **Say what is not done.**  If a phase ends incomplete, list exactly
   what is missing.  Never leave something silently half-done.
 - **When a partner makes a design call, record it and don't reopen it.**

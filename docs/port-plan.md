@@ -68,7 +68,8 @@ it.
      gets a 403 through the control-character check, and a block with no
      method is refused later with no status.  Both need checking against
      `main-dev` first.
-4. **Dependencies (agreed).**
+4. **Dependencies (agreed).**  [dependencies.md](dependencies.md) is the
+   register, and `deny.toml` admits crates only by name.
    - **SHA-1 and base64** (the ws accept): write them in-tree in the core
      crate, as C does in `lib/misc`, checked against the RFC 3174 and
      RFC 4648 vectors.  They are about 150 lines together and not worth a

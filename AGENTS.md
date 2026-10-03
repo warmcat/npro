@@ -109,7 +109,10 @@ We are very concerned about:
    adding it: MSRV-compatible, no `build.rs` that touches the network, no
    large proc-macro trees behind the core.  `cargo deny` and `cargo audit`
    configs are committed and gate CI.  Default features are the minimum
-   that builds something useful; everything else is opt-in.
+   that builds something useful; everything else is opt-in.  `deny.toml`
+   admits crates only by name, transitive ones included: a new dependency
+   is the maintainer's decision, asked for first, and follows
+   docs/dependencies.md, which is its register.
 
  - No `Rc<RefCell<_>>` or `Arc<Mutex<_>>` inside the protocol crates.
    Interior mutability in the core means the ownership of the design is

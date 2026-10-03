@@ -1,5 +1,14 @@
-# cargo deny: what may enter the dependency tree.  The tree is meant to stay
-# close to empty; each dependency is justified in the commit that adds it.
+# cargo deny: what may enter the dependency tree.
+#
+# npro admits a dependency only by name.  The tree is meant to stay close to
+# empty, and a crate gets in only because someone decided it should, not
+# because something already admitted brought it along.  docs/dependencies.md
+# is the register of what is admitted and why; adding a crate means adding it
+# here and there, in the commit that brings it in, with its justification.
+#
+# The graph is every crate any target of the workspace can pull in, with all
+# features, for every platform, including dev-dependencies: tests and tools
+# run on developers' machines and builders too.
 
 [graph]
 all-features = true
@@ -14,6 +23,37 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "deny"
 wildcards         = "deny"
+
+# The bouncers at the door.  Any crate in the graph that is not named here
+# fails the gate, however deep in the tree it sits: a crate admitted for one
+# job does not get to bring its own guests.
+#
+# cargo deny treats an empty list as "no allowlist", so the workspace's own
+# crates are named here too, and keep the list in force while nothing else
+# is on it.  A new workspace crate is added here when it is created.
+allow = [
+	# the workspace
+	"npro",
+	"npro-core",
+	"npro-test",
+
+	# admitted dependencies, each with its entry in docs/dependencies.md:
+	# (none)
+]
+
+# A build script runs arbitrary code on the build machine at compile time,
+# as a proc-macro does (proc-macros are kept out by the allowlist above).
+# No crate may have a build script unless it is also named here, and no
+# crate may ship prebuilt executables or scripts.
+[bans.build]
+allow-build-scripts = [
+	# (none)
+]
+executables = "deny"
+interpreted = "deny"
+include-dependencies = true
+include-workspace = true
+include-archives = true
 
 [sources]
 unknown-registry = "deny"
