@@ -11,3 +11,4 @@
 pub mod base64;
 pub mod random;
 pub mod sha1;
+pub mod utf8;
