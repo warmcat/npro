@@ -621,6 +621,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "megabytes of text: native runs keep it, Miri runs the small cases"
+    )]
     fn refuses_too_many_steps_and_too_much_text() {
         let many = vec![r#"{"t": 0, "rx": ""}"#; MAX_STEPS + 1].join(",");
         assert!(matches!(refused(&with_steps(&many)), Error::TooManySteps));

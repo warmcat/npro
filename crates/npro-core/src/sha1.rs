@@ -189,12 +189,20 @@ mod tests {
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
         assert_eq!(
-            hex(Sha1::digest(&vec![b'a'; 1_000_000])),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
-        assert_eq!(
             hex(Sha1::digest(b"")),
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a million bytes: native runs keep it, Miri runs the shorter vectors"
+    )]
+    fn rfc_3174_a_million_a() {
+        assert_eq!(
+            hex(Sha1::digest(&vec![b'a'; 1_000_000])),
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
         );
     }
 

@@ -3,6 +3,10 @@
 use npro_test::{Side, StepKind, vendored};
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "hundreds of kilobytes of transcripts: native runs keep it"
+)]
 fn every_vendored_transcript_reads() {
     let all = vendored().unwrap();
 

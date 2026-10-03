@@ -149,6 +149,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "millions of cases: native runs keep it, Miri runs the targeted ones"
+    )]
     fn agrees_with_the_standard_library_on_every_short_sequence() {
         for a in 0..=255u8 {
             assert_eq!(whole(&[a]), oracle(&[a]), "{a:02x}");
