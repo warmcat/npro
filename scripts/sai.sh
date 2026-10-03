@@ -14,7 +14,9 @@
 #   oracle          C lws main-dev's transcripts, recorded afresh, compared
 #                   with the copies in crates/npro-test/transcripts
 #
-# docs/sai.md says what each builder needs installed.
+# Each profile first checks for the tools it uses and lists any that are
+# missing with their install commands; docs/sai.md says what each builder
+# needs.
 
 set -eu
 
@@ -31,38 +33,39 @@ jobs="${SAI_PARALLEL:-4}"
 nostd_crates="npro-core"
 nostd_targets="thumbv6m-none-eabi thumbv7em-none-eabihf riscv32imc-unknown-none-elf"
 
-# Refuse a toolchain older than the workspace's rust-version up front: cargo
-# itself only says it cannot parse the manifest.  A distro's packaged cargo
-# is the usual cause, when rustup is not installed for the builder's user.
-msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
-have=$(rustc --version 2>/dev/null | sed -n 's/^rustc \([0-9]*\.[0-9]*\).*/\1/p')
-if [ -z "$have" ] ||
-   [ "$(printf '%s\n%s\n' "$msrv" "$have" | sort -t. -k1,1n -k2,2n | head -n1)" != "$msrv" ]; then
-	echo "rustc ${have:-not found} on this builder; npro needs $msrv or later." >&2
-	echo "Install rustup for the user sai runs jobs as, see docs/sai.md:" >&2
-	echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default" >&2
-	exit 1
-fi
+. scripts/require.sh
 
 profile="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$profile" in
 gate)
+	# ci.sh checks its own tools
 	exec scripts/ci.sh
 	;;
 
 test)
+	require_rust
+	require_done
 	cargo --version
 	exec cargo test --workspace --all-features --locked -j "$jobs"
 	;;
 
 features)
+	require_rust
+	require_cargo clippy "rustup component add clippy"
+	require_cargo hack "cargo install --locked cargo-hack"
+	require_done
 	exec cargo hack clippy --workspace --feature-powerset --all-targets \
 		--locked -j "$jobs" -- -D warnings
 	;;
 
 nostd)
+	require_rust
+	for t in $nostd_targets; do
+		require_target "$t"
+	done
+	require_done
 	for t in $nostd_targets; do
 		for c in $nostd_crates; do
 			echo "== $c for $t"
@@ -74,6 +77,13 @@ nostd)
 
 miri)
 	target="${1:?miri needs a target, eg s390x-unknown-linux-gnu}"
+	require_rust
+	require_toolchain nightly \
+		"rustup toolchain install nightly --profile minimal --component miri,rust-src"
+	require_run "miri for nightly" \
+		"rustup component add miri rust-src --toolchain nightly" \
+		cargo +nightly miri --version
+	require_done
 	# npro-test reads its transcripts from disk, which Miri's isolation
 	# would refuse
 	MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" \
@@ -86,6 +96,13 @@ oracle)
 	# every transcript needs: fault injection for the seeded random,
 	# extensions and zlib for the permessage-deflate ones
 	c="${LWS_ORACLE:-$HOME/lws-oracle}"
+	require_cmd git "dnf install git"
+	require_cmd cmake "dnf install cmake"
+	require_cmd make "dnf install make"
+	require_cmd cc "dnf install gcc"
+	require_run "zlib headers" "dnf install zlib-devel" \
+		sh -c 'echo "#include <zlib.h>" | cc -E - >/dev/null'
+	require_done
 	if [ ! -d "$c/.git" ]; then
 		git clone --depth 50 -b main-dev \
 			https://libwebsockets.org/repo/libwebsockets "$c"

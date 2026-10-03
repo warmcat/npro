@@ -5,17 +5,25 @@
 #
 #   scripts/ci.sh
 #
-# Set CARGO_TARGET_DIR to keep build output out of the tree.  The MSRV build
-# needs the toolchain named in Cargo.toml's rust-version (rustup toolchain
-# install 1.85 --profile minimal); cargo-deny and cargo-audit must be
-# installed, and the no_std check needs the thumbv7em-none-eabihf target
-# (rustup target add thumbv7em-none-eabihf).
+# Set CARGO_TARGET_DIR to keep build output out of the tree.  It checks
+# first for everything it uses, and lists what is missing with the commands
+# that install it; docs/toolchain.md explains each piece.
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
 msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+
+. scripts/require.sh
+require_rust
+require_cargo fmt "rustup component add rustfmt"
+require_cargo clippy "rustup component add clippy"
+require_toolchain "$msrv" "rustup toolchain install $msrv --profile minimal"
+require_target thumbv7em-none-eabihf
+require_cargo deny "cargo install --locked cargo-deny"
+require_cargo audit "cargo install --locked cargo-audit"
+require_done
 
 echo "== fmt"
 cargo fmt --all --check

@@ -31,84 +31,116 @@ How the C build's dimensions map here:
 - **Machines sai has no builder for**, big-endian and 32-bit, are
   interpreted by Miri rather than run on hardware.
 
-## Installing Rust on a builder
+## Setting up a builder
 
-Install as the user the sai builder runs jobs as.  sai sets `HOME` to the
-builder's home for each job, and `scripts/sai.sh` puts `$HOME/.cargo/bin`
-first on `PATH`, so rustup's usual per-user install is found without
-changing the builder daemon's environment.
+[toolchain.md](toolchain.md) explains the pieces: rustup, toolchains,
+components, targets, and cargo subcommands.  This section says which ones
+each builder needs, and the things that are particular to sai.
 
-### Every unix builder with rustup
+### Install as the user sai runs jobs as
 
-These are the Linux builders (x86_64, aarch64 and riscv64) and the macOS
-ones.  rustup provides host toolchains for all of them.  A C linker must
-be present: it is already, as these builders build C lws.  On macOS that
-means the Xcode command line tools.
+sai runs each job as the builder's user (`sai`), with `HOME` set to that
+user's home, and `scripts/sai.sh` puts `$HOME/.cargo/bin` first on `PATH`.
+So rustup must be installed **for that user**.  An install for your own
+login, or for root, is invisible to the jobs.
+
+```sh
+sudo -iu sai          # a login shell as sai, with its HOME
+```
+
+On a builder whose jobs run in **sai-virt overlays** of a base VM image,
+install into the base image, by booting the base itself, while no job is
+using an overlay of it.  Anything installed inside a job's overlay goes
+away with the overlay.  Shut the base down cleanly afterwards, and let
+sai-virt make fresh overlays: an overlay made from the old base must not
+be used with the new one.
+
+### What each builder needs
+
+| builder | configurations | needs |
+|---|---|---|
+| x86_64 and aarch64 Linux, riscv64, both macOS | `test` | rustup with stable (`--profile default`) |
+| fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle` | everything below |
+| freebsd/aarch64 | `test-freebsd` | `pkg install rust`, 1.85 or later; rustup has no FreeBSD aarch64 host |
+| w11/x86_64 | `test-windows` | `rustup-init.exe`, as the account the sai service runs as, with its `%USERPROFILE%\.cargo\bin` on the service's `PATH` |
+
+**Every builder with rustup**, as the `sai` user:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default
 ```
 
-That gives stable with rustfmt and clippy, which is all the `test`
-profile needs.  Updating later is `rustup update`.
+Or install the distro's `rustup` package, then run `rustup default stable`
+as `sai`; [toolchain.md](toolchain.md) covers both routes.  Do not rely on
+distro `cargo` / `rustc` packages: Ubuntu 24.04's 1.75 is too old to read
+the workspace.  On macOS, the Xcode command line tools provide the linker.
 
-A distro's packaged cargo is usually too old: Ubuntu noble's is 1.75, and
-npro needs the workspace's `rust-version`, 1.85, the first to know
-edition 2024.  `scripts/sai.sh` checks `rustc` before anything else, and
-refuses an older one with the install command, rather than leaving cargo
-to fail parsing the manifest.
-
-### The fedora44 x86_64 builder, which runs everything else
-
-On top of the above:
+**The fedora44 builder**, on top of that, as `sai`:
 
 ```sh
-rustup toolchain install 1.85 --profile minimal          # the MSRV build
-rustup toolchain install nightly --profile minimal --component miri,rust-src
-rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf riscv32imc-unknown-none-elf
-cargo install --locked cargo-deny cargo-audit cargo-hack
-dnf install cmake gcc zlib-devel git                   # the C oracle build
+rustup toolchain install 1.85 --profile minimal                               # gate: the MSRV build
+rustup toolchain install nightly --profile minimal --component miri,rust-src  # miri-*
+rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf riscv32imc-unknown-none-elf   # nostd, gate
+cargo install --locked cargo-hack cargo-deny cargo-audit                       # features, gate
+cargo +nightly miri setup --target s390x-unknown-linux-gnu                     # build Miri's std once
+cargo +nightly miri setup --target i686-unknown-linux-gnu
 ```
 
-The first Miri run of each target builds that target's standard library
-for Miri, and takes a few minutes.  Later runs reuse it.
+and, as root, for the C build `c-oracle` does:
 
-Network access during jobs:
-- `cargo audit` fetches the RustSec advisory database from github.com on
-  each run;
-- the oracle clones and fetches libwebsockets from libwebsockets.org,
+```sh
+dnf install git cmake make gcc zlib-devel
+```
+
+Miri builds a standard library for each target it interprets.
+`miri setup` does it once ahead of time; otherwise every job on a fresh
+overlay spends several minutes on it.
+
+### Checking a builder
+
+As `sai`:
+
+```sh
+rustc --version                    # 1.85 or later
+rustup toolchain list              # fedora44: stable, 1.85, nightly
+rustup target list --installed     # fedora44: the three no_std targets
+cargo hack --version; cargo deny --version; cargo audit --version   # fedora44
+```
+
+Each profile in `scripts/sai.sh` also checks for exactly what it uses
+before running.  A job on a builder that lacks something fails at once,
+listing what is missing and the command for each, rather than partway
+through with a cargo error.
+
+### Network access during jobs
+
+- `cargo audit` (in `gate`) fetches the RustSec advisory database from
+  github.com.
+- `c-oracle` clones and fetches libwebsockets from libwebsockets.org,
   keeping its checkout in `$HOME/lws-oracle` (or `$LWS_ORACLE`).
 
 Nothing else fetches.  The workspace has no dependencies, and every build
 is `--locked`.
 
-### freebsd/aarch64
+### When a job fails on setup
 
-rustup has no host toolchain for aarch64 FreeBSD, so use the packaged one,
-which must be at least the workspace's `rust-version` (1.85):
+| what the job log shows | why | fix |
+|---|---|---|
+| `rustc 1.75 is older than npro's rust-version 1.85`, or cargo's `` `resolver` setting `3` is not valid `` | the job found the distro's cargo: rustup is not installed for `sai` | install rustup as `sai`, as above |
+| `no such command: hack` (or `deny`, `audit`) | the cargo subcommand is not installed for `sai` | `cargo install --locked cargo-hack` (etc.) as `sai` |
+| `toolchain '1.85-…' is not installed` | the MSRV toolchain is missing | `rustup toolchain install 1.85 --profile minimal` as `sai` |
+| something installed earlier is missing again | it was installed inside a sai-virt overlay, not the base image | install it into the base image |
+| Miri spends minutes "preparing a sysroot" every job | Miri's std is rebuilt in each fresh overlay | `cargo +nightly miri setup --target …` in the base image |
 
-```sh
-pkg install rust
-```
+### Notes on particular builders
 
-It installs under `/usr/local/bin`, which the builder's `PATH` already has.
-
-### w11/x86_64 (MSVC)
-
-Run `rustup-init.exe` from <https://rustup.rs> with the default host,
-`x86_64-pc-windows-msvc`; the builder already has the Visual Studio build
-tools it links with.  Do it as the account the sai builder service runs
-as, and make sure that account's `%USERPROFILE%\.cargo\bin` is on the
-service's `PATH`, since the Windows step runs `cargo` directly under
-`cmd`.
-
-### Later
-
-- **esp32**: building for the ESP32's xtensa cores needs Espressif's Rust
-  fork, installed with `espup`.  That waits until there is something to
-  run on the device.
-- **fuzzing**: cargo-fuzz needs nightly and clang.  It joins the fuzz
-  builder once the h1 parser has fuzz targets.
+- **ubuntu-noble/riscv64** stays on Ubuntu 24.04.  From 25.10 on, Ubuntu
+  supports only RISC-V hardware meeting a newer profile, which this
+  board's silicon does not.  rustup supports it as it is.
+- **esp32**, later: xtensa needs Espressif's Rust fork, installed with
+  `espup`, once there is something to run on the device.
+- **fuzzing**, later: cargo-fuzz needs nightly and clang, and joins the
+  fuzz builder with the h1 parser's fuzz targets.
 
 ## A possible sai change
 

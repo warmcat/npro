@@ -47,6 +47,9 @@ sansIO half is the specification, and the port is held to it by:
 - Big-endian + 32-bit via Miri
 - Every feature combination tested
 
+[docs/toolchain.md](docs/toolchain.md) explains how to set a machine up to run
+the tests.
+
 ## Licence
 
 MIT
