@@ -82,6 +82,18 @@ These came from real incidents, not taste.
   behind features.  quinn / quinn-proto is the model for the split.  No
   git submodules.  Member crate names are not yet reserved on crates.io:
   check before assuming one is free.
+- **Superseded 2026-09-30: the project is `npro`**, with its site at
+  https://npro.rs (Andy's domain, DNSSEC signed, on the libwebsockets.org
+  server).  `lws-core` had been taken by an unrelated project.
+  - Wherever this file says `lws`, `lws-core`, `lws-h1` and so on for the
+    Rust crates, read `npro`, `npro-core`, `npro-h1`.
+  - Reserved on crates.io by Andy: `npro`, `npro-core`, `npro-h1`,
+    `npro-ws`, `npro-h2`, `npro-h3`, `npro-quic`, `npro-wt`, `npro-io`,
+    `npro-mqtt` and `npro-http`.
+  - The `lws` crate is kept, not deleted.  Its 0.0.2 points at npro, and
+    goes out once npro.rs and the npro git repository are up.
+- The port plan, phases, exit checks and the running assessment of the C
+  tree as a basis are in docs/port-plan.md.
 - Trust posture: `forbid(unsafe_code)`, a tiny dependency tree, the
   conformance suites (autobahn for ws, h2spec, h3spec), cargo-fuzz seeded
   from the C corpus, differential tests against C lws, clippy with
