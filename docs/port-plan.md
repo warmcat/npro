@@ -1,6 +1,6 @@
 # npro: plan for the sansIO port
 
-Status: agreed, 2026-10-03.  Phase 0 is starting.  npro is the Rust port of
+Status: agreed, 2026-10-03.  Phases 0 and 1a are done.  npro is the Rust port of
 libwebsockets' sansIO half (https://npro.rs).
 
 This plan puts into practice the C tree's porting guide
@@ -446,40 +446,45 @@ whose variants carry the data of that state:
 
 ## 3. Phases
 
-### Phase 0: scaffold and gates
+### Phase 0: scaffold and gates (done, 2026-10-03)
 
-- **Commit 1**: turn the repository into the workspace (`crates/*`) and
-  move the placeholder to `crates/lws` as the facade.  Add
-  `[workspace.lints]`, `rust-toolchain` or the MSRV check, `deny.toml`,
-  `.github`-independent CI scripts (`scripts/ci.sh`, run by sai or by
-  hand), and a README stating plainly that the port is AI-driven and how
-  it is checked.
-- **Commit 2**: add the `npro-test` crate, with the transcript reader and
-  its own tests over the three C transcripts, which are vendored as test
-  data with their provenance recorded.
+Three commits:
+- **The workspace** (`crates/*`, with the `npro` facade), its
+  `[workspace.lints]`, `clippy.toml`, `deny.toml`, the README, and
+  `scripts/ci.sh`.  CI runs fmt, clippy (with all features and with the
+  defaults), test, doc, the MSRV 1.85 check, the no_std build, cargo deny
+  and cargo audit.
+- **`npro-test`**: a strict reader for `lws-transcript/1`, and copies of
+  the C transcripts with `C-COMMIT` and the C README beside them.
+  `scripts/sync-c-oracle.sh` refreshes them from a C checkout.  The fuzz
+  seeds join them when the first fuzz target does.
 
-  Vendoring the transcripts copies data, not C sources.  The alternative
-  is pointing at an external checkout through an environment variable.
-  Vendoring is recommended so that `cargo test` needs nothing outside the
-  repository, and a script `scripts/sync-c-oracle.sh` refreshes them and
-  the fuzz seeds from a given C checkout.
+**Exit check, met**: every gate passes at 1.85 and at stable, and the
+reader takes all 48 transcripts.
 
-**Exit check**: CI passes at 1.85 and stable, and the transcript reader
-round-trips all three files.
+### Phase 1a: substrate in the core crate (done, 2026-10-03)
 
-### Phase 1a: substrate in the core crate
+- **Random**: the `Random` trait, one draw per `fill()`, failing as
+  `Unavailable`.  `SeededRandom`, behind the additive `replay` feature, is
+  C's stream; it is pinned by the `api-test-random-prng` vector and by the
+  ws-client transcript's key and first mask.
+- **`sha1` and `base64`** (encode only), with their RFC vectors and
+  RFC 6455's accept value.
+- **The incremental UTF-8 validator.**  It is checked exhaustively
+  against `core::str::from_utf8`, and once, outside the tree, against C's
+  own `lws_check_utf8()`: 134M cases, none differing.
+- **`time::Instant`**, in microseconds, with `core::time::Duration` for
+  intervals.  Wall time and deadlines come with their first users.
+- **Ids and size newtypes** move to the crates that define them: a
+  `StreamId` belongs to h2.
 
-- `Instant`, `Duration`, `WallTime` and `Deadline`.
-- The `Random` trait and `XoshiroRandom`, with the
-  `api-test-random-prng` vector: seed 1234 gives
-  `6b42899ea363a1a3 246007bbb76764dc`.
-- `sha1` and `base64` with their RFC vectors.
-- The incremental UTF-8 validator, with a property test that the one-shot
-  and fragmented runs are the same.
-- The id and size newtypes.
+**Property tests** need no dependency.  The generators are written over
+`SeededRandom`, so a failing case is reproduced from its seed.  Every
+parser gets the one-shot vs fragmented oracle.
 
-**Exit check**: vectors pass; clippy passes with
-`indexing_slicing`, `arithmetic_side_effects` and `as_conversions`.
+**Exit check, met**: the vectors pass, and clippy passes with
+`indexing_slicing`, `arithmetic_side_effects` and `as_conversions`
+denied.
 
 ### Phase 1b: the connection machines
 
