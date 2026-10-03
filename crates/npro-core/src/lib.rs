@@ -5,7 +5,9 @@
 //! substrate the protocols are built from.  Nothing here owns a socket, a
 //! thread or a clock; the IO side, or a test, supplies all of them.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod base64;
 pub mod random;
+pub mod sha1;
