@@ -56,7 +56,8 @@ else is on it.  A new workspace crate is added to it when it is created.
 | the protocol crates: npro-core, -h1, -ws, -h2, -h3, -quic, -wt, -mqtt, -http | nothing, except crates agreed below, each behind an opt-in feature, `no_std`, and with no build script |
 | npro-io, the IO adapter | std, and what its tls decision admits |
 | integrations with a runtime or framework, such as tokio | that runtime, in its own opt-in crate or feature, never a default |
-| npro-test, fuzz targets, tools | what testing needs, admitted like anything else; fuzz targets live in their own workspace with their own lock file |
+| npro-test, npro-fuzz, tools | what testing needs, admitted like anything else |
+| the libFuzzer targets in `fuzz/` | libFuzzer and what builds it, in a workspace of their own with its own `Cargo.lock` and `deny.toml`, so none of it enters the main workspace's graph |
 | npro, the facade | the npro crates only |
 
 A protocol crate never depends on an IO crate, an async runtime, or a
@@ -95,12 +96,43 @@ Removing a dependency is the same in reverse: take it out of
 
 ## The register
 
+### The main workspace
+
 Admitted: **none**.  npro builds from its own sources and the Rust
 toolchain alone.
 
 | crate | used by | feature | why | build script | unsafe | admitted in |
 |---|---|---|---|---|---|---|
 | (none yet) | | | | | | |
+
+### The fuzz workspace
+
+`fuzz/` builds the libFuzzer targets ([fuzzing.md](fuzzing.md)) and
+nothing else; no npro crate depends on it.  Its door is `fuzz/deny.toml`,
+which `scripts/fuzz.sh` checks before it builds anything.  It checks the
+Linux graph only, since that is where fuzzing runs: on Windows,
+`jobserver` would also bring `getrandom`, `r-efi` and `cfg-if`.
+
+The choice was between this, the standard Rust route, and linking the
+builder's own libFuzzer runtime through a shim of npro's own.  The shim
+would have admitted no crates, but needed `unsafe` code in npro to turn
+libFuzzer's pointer and length into a slice; npro took the crates, so
+that none of its own code needs qualifying as safe.
+
+| crate | why | build script | unsafe | licence |
+|---|---|---|---|---|
+| `libfuzzer-sys` 0.4.13 | the `fuzz_target!` macro, and libFuzzer's runtime, whose C++ sources it carries | compiles those sources with `cc`; nothing else, and no network | the macro's entry point, taking libFuzzer's pointer and length | (MIT or Apache-2.0) and **NCSA**, the LLVM licence of libFuzzer's sources, admitted for this workspace only |
+| `arbitrary` | a dependency of `libfuzzer-sys`, for targets taking structured input; npro's take bytes | none.  It ships its maintainer's `publish.sh`, never run by a build, admitted by checksum | some | MIT or Apache-2.0 |
+| `cc` | compiles libFuzzer, from `libfuzzer-sys`' build script | none | some | MIT or Apache-2.0 |
+| `find-msvc-tools` | split out of `cc` | none | some | MIT or Apache-2.0 |
+| `jobserver` | `cc`'s share of cargo's parallel jobs | none | some | MIT or Apache-2.0 |
+| `libc` | `jobserver` and `cc` on unix | probes the rustc version, no network | the C bindings it is for | MIT or Apache-2.0 |
+| `shlex` | `cc`'s parsing of compiler flags from the environment | none | a little | MIT or Apache-2.0 |
+
+Apart from `libfuzzer-sys` and `arbitrary`, which are linked into the
+targets, they are build-time only: they run on the fuzz builder while the
+targets build.  All were admitted
+in the commit adding the libFuzzer targets.
 
 ## Decided, not yet admitted
 

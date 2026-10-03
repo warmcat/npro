@@ -22,6 +22,7 @@ unix platform has one step, `scripts/sai.sh ${cmake}`.  Each configuration's
 | `miri-big-endian` | `miri s390x-unknown-linux-gnu` | fedora44 x86_64 | the tests pass on a big-endian machine, interpreted by Miri |
 | `miri-32bit` | `miri i686-unknown-linux-gnu` | fedora44 x86_64 | the tests pass where `usize` is 32 bits |
 | `c-oracle` | `oracle` | fedora44 x86_64 | C lws main-dev, built afresh, records the same transcripts npro holds |
+| `fuzz` | `fuzz 60` | fuzz-debian13 x86_64 | no known bug still crashes, and a minute of libFuzzer on each fuzz target finds nothing new; two idle tasks carry on fuzzing in idle time, with the corpora in the `fuzz` pool ([fuzzing.md](fuzzing.md)) |
 
 How the C build's dimensions map here:
 - **The `cmake` option dimensions** become the `features` configuration.
@@ -72,6 +73,7 @@ disk.
 | x86_64 and aarch64 Linux, riscv64, both macOS | `test` | rustup with stable (`--profile default`) |
 | fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle` | everything below |
 | freebsd/aarch64 | `test-freebsd` | `pkg install rust`, 1.85 or later; rustup has no FreeBSD aarch64 host |
+| fuzz-debian13 x86_64 | `fuzz`, and its idle tasks | rustup with stable and nightly, cargo-fuzz, cargo-deny, a C++ compiler and llvm-symbolizer, and an `idle` object for the platform in the builder's configuration: see below |
 | w11/x86_64 | `test-windows` | rustup with stable for the MSVC host, and an `env` for the platform in the builder's configuration: see below |
 
 **Every builder with rustup**, as the `sai` user:
@@ -105,6 +107,40 @@ dnf install git cmake make gcc zlib-devel
 Miri builds a standard library for each target it interprets.
 `miri setup` does it once ahead of time; otherwise every job on a fresh
 overlay spends several minutes on it.
+
+**The fuzz builder**, the C tree's `fuzz-linux-debian13/x86_64-amd/gcc`,
+which already has clang for C's fuzzing.  As `sai`, after rustup:
+
+```sh
+rustup toolchain install nightly --profile minimal   # cargo-fuzz builds with nightly
+cargo install --locked cargo-fuzz cargo-deny
+```
+
+and, as root, what libFuzzer's runtime is built with, and what turns the
+sanitizer's addresses into function names:
+
+```sh
+apt install g++ llvm      # llvm provides llvm-symbolizer
+```
+
+`scripts/fuzz.sh` also finds a versioned `llvm-symbolizer-NN` if that is
+all there is.  Without one, reports have addresses but no function names,
+and sai-server cannot tell one bug from another.
+
+For the idle tasks, the platform in the builder's configuration needs an
+`idle` object (sai's `READMEs/README-idle.md`).  It belongs to the
+platform, so if C's fuzzing idle tasks already have one there, it serves
+npro's too; otherwise, eg:
+
+```json
+"idle": {
+	"share":	50,
+	"instances":	2,
+	"slice-secs":	900
+}
+```
+
+With 900 second slices, every target gets a turn in each slice.
 
 **The Windows builder.**  rustup's Windows installer is `rustup-init.exe`,
 from <https://rustup.rs>:
@@ -199,9 +235,12 @@ through with a cargo error.
   github.com.
 - `c-oracle` clones and fetches libwebsockets from libwebsockets.org,
   keeping its checkout in `$HOME/lws-oracle` (or `$LWS_ORACLE`).
+- `fuzz` fetches the fuzz workspace's dependencies from crates.io, as
+  `fuzz/Cargo.lock` pins them (`cargo fetch --locked`), once per builder.
+  The pool is synced by sai-builder itself, not the job.
 
-Nothing else fetches.  The workspace has no dependencies, and every build
-is `--locked`.
+Nothing else fetches.  The main workspace has no dependencies, and every
+build is `--locked`.
 
 ### When a job fails on setup
 
@@ -210,6 +249,7 @@ is `--locked`.
 | `rustc 1.75 is older than npro's rust-version 1.85`, or cargo's `` `resolver` setting `3` is not valid `` | the job found the distro's cargo: rustup is not installed for `sai` | install rustup as `sai`, as above |
 | `no such command: hack` (or `deny`, `audit`) | the cargo subcommand is not installed for `sai` | `cargo install --locked cargo-hack` (etc.) as `sai` |
 | `toolchain '1.85-…' is not installed` | the MSRV toolchain is missing | `rustup toolchain install 1.85 --profile minimal` as `sai` |
+| `no such command: fuzz` | cargo-fuzz is not installed for `sai` | `cargo install --locked cargo-fuzz` as `sai` |
 | something installed earlier is missing again | it was installed inside a sai-virt overlay, not the base image | install it into the base image |
 | Miri spends minutes "preparing a sysroot" every job | Miri's std is rebuilt in each fresh overlay | `cargo +nightly miri setup --target …` in the base image |
 
@@ -220,8 +260,6 @@ is `--locked`.
   board's silicon does not.  rustup supports it as it is.
 - **esp32**, later: xtensa needs Espressif's Rust fork, installed with
   `espup`, once there is something to run on the device.
-- **fuzzing**, later: cargo-fuzz needs nightly and clang, and joins the
-  fuzz builder with the h1 parser's fuzz targets.
 
 ## A possible sai change
 

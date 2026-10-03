@@ -38,6 +38,10 @@
 			"default": false,
 			"build": [ "scripts/sai.sh ${cmake}" ]
 		},
+		"fuzz-linux-debian13/x86_64-amd/gcc": {
+			"default": false,
+			"build": [ "scripts/sai.sh ${cmake}" ]
+		},
 		"w11/x86_64-amd/msvc": {
 			"default": false,
 			"build": [ "cargo test --workspace --all-features --locked -j %SAI_PARALLEL%" ]
@@ -111,6 +115,27 @@
 		"c-oracle": {
 			"cmake":	"oracle",
 			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# libFuzzer over every fuzz target (scripts/fuzz.sh), 60s each,
+		# after replaying the reproducers of the bugs found so far.  The
+		# corpora are in the "fuzz" pool, which sai keeps synced between
+		# every builder fuzzing npro, so coverage keeps advancing; pools
+		# belong to a repo, so this is not the C tree's "fuzz" pool.
+		# Findings go to sai-server through the pool, which shows them
+		# only to admins: they can be unfixed security bugs, and logs are
+		# public.
+		#
+		# Two idle tasks per platform carry on fuzzing the latest
+		# completed push in builders' idle time, where their conf allows
+		# it, sharing each slice (SAI_IDLE_SECS) between the targets in
+		# turn.  docs/fuzzing.md has the details.
+
+		"fuzz": {
+			"cmake":	"fuzz 60",
+			"platforms":	"none, fuzz-linux-debian13/x86_64-amd/gcc",
+			"idle":		2,
+			"pool":		"fuzz"
 		}
 	}
 }

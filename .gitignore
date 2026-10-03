@@ -1,1 +1,6 @@
 /target
+# what cargo fuzz run makes by default, used by hand in fuzz/
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

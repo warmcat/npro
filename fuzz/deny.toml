@@ -1,0 +1,77 @@
+# cargo deny for the fuzz workspace: what may enter what fuzzing builds.
+#
+# This is the same door as the main workspace's deny.toml, for a separate
+# graph: these crates build the libFuzzer targets, and are never a dependency
+# of anything npro ships.  Each admitted crate has its entry in the fuzz
+# section of docs/dependencies.md.  scripts/fuzz.sh runs this check before it
+# builds anything.
+#
+#   cargo deny --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml
+
+[graph]
+all-features = true
+# fuzzing runs on Linux builders only; on Windows, jobserver would also bring
+# getrandom, r-efi and cfg-if
+targets = [
+	"x86_64-unknown-linux-gnu",
+	"aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# NCSA: the LLVM licence of the libFuzzer sources libfuzzer-sys carries
+allow = ["MIT", "NCSA"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards         = "deny"
+# path dependencies between the npro crates, none of them published
+allow-wildcard-paths = true
+
+allow = [
+	# the fuzz targets, and the npro crates they drive
+	"npro-fuzz-targets",
+	"npro-fuzz",
+	"npro-core",
+	"npro-test",
+
+	# libFuzzer's runtime and the fuzz_target! macro
+	"libfuzzer-sys",
+	"arbitrary",
+
+	# building libFuzzer's C++ sources, in libfuzzer-sys' build script
+	"cc",
+	"find-msvc-tools",
+	"jobserver",
+	"libc",
+	"shlex",
+]
+
+[bans.build]
+allow-build-scripts = [
+	# compiles the libFuzzer runtime it carries, with cc
+	"libfuzzer-sys",
+	# probes the rustc version for cfgs
+	"libc",
+]
+executables = "deny"
+interpreted = "deny"
+include-dependencies = true
+include-workspace = true
+include-archives = true
+
+# arbitrary's package carries its maintainer's release script, which runs
+# cargo publish and nothing else, and is never run by a build.  Admitted by
+# checksum, so a changed script is looked at again.
+[[bans.build.bypass]]
+crate = "arbitrary"
+allow = [
+	{ path = "publish.sh", checksum = "752e221bdd960666b127df15effddd3d789ff3f1762498961fc79ae99f9a27f1" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"

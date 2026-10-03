@@ -14,6 +14,6 @@ The `transcript` target also starts from every transcript in
 
 Seeds are small and readable on purpose: each is a case worth starting from,
 named for what it is.  What the fuzzer finds goes in its corpus, which is
-kept between runs, not here.  When the protocol crates arrive, their
+kept between runs, not here ([docs/fuzzing.md](../../docs/fuzzing.md)).  When the protocol crates arrive, their
 targets' seeds come from the C library's corpora (`fuzz/fuzz-*/seeds` in
 the C tree), copied with where they came from.

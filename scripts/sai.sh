@@ -13,6 +13,8 @@
 #                   big-endian machine without needing one
 #   oracle          C lws main-dev's transcripts, recorded afresh, compared
 #                   with the copies in crates/npro-test/transcripts
+#   fuzz [secs]     libFuzzer over every fuzz target (scripts/fuzz.sh), in
+#                   CI and in sai's idle time, with the corpora in a pool
 #
 # Each profile first checks for the tools it uses and lists any that are
 # missing with their install commands; docs/sai.md says what each builder
@@ -132,8 +134,18 @@ oracle)
 	exit 1
 	;;
 
+fuzz)
+	# libFuzzer's line for every new unit and its periodic status would
+	# swamp the job log, as in C's fuzz job: keep its start, the final
+	# stats and any report.  FUZZ_OPTS set on the builder still wins.
+	FUZZ_OPTS="${FUZZ_OPTS:--verbosity=0}"
+	export FUZZ_OPTS
+	# fuzz.sh checks its own tools
+	exec scripts/fuzz.sh "$@"
+	;;
+
 *)
-	echo "usage: $0 gate | test | features | nostd | miri <target> | oracle" >&2
+	echo "usage: $0 gate | test | features | nostd | miri <target> | oracle | fuzz [secs]" >&2
 	exit 1
 	;;
 esac

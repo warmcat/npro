@@ -457,8 +457,8 @@ Three commits:
   and cargo audit.
 - **`npro-test`**: a strict reader for `lws-transcript/1`, and copies of
   the C transcripts with `C-COMMIT` and the C README beside them.
-  `scripts/sync-c-oracle.sh` refreshes them from a C checkout.  The fuzz
-  seeds join them when the first fuzz target does.
+  `scripts/sync-c-oracle.sh` refreshes them from a C checkout.  C's fuzz
+  seeds join `fuzz/seeds/` with the targets that use them.
 
 **Exit check, met**: every gate passes at 1.85 and at stable, and the
 reader takes all 48 transcripts.
@@ -486,6 +486,16 @@ parser gets the one-shot vs fragmented oracle.
 **Exit check, met**: the vectors pass, and clippy passes with
 `indexing_slicing`, `arithmetic_side_effects` and `as_conversions`
 denied.
+
+### Fuzzing (done, 2026-10-03)
+
+Ahead of the parsers, so that each is fuzzed from its first commit:
+`crates/npro-fuzz` holds a harness per target with an oracle, smoke-tested
+in `cargo test`; `fuzz/` holds the libFuzzer targets in a workspace of its
+own; `scripts/fuzz.sh` runs them by hand and under sai, in CI and idle
+time, with the corpora in a sai pool.  The first targets are the
+substrate's: `utf8`, `sha1`, `base64`, and the transcript reader.
+[fuzzing.md](fuzzing.md) has the details.
 
 ### Phase 1b: the connection machines
 
@@ -523,8 +533,8 @@ listed and agreed.
   bytes per body, as C does.
 - **Tests**:
   - the one-shot vs randomly fragmented oracle, as a property test;
-  - `cargo-fuzz` targets `h1-request`, `h1-response` and `chunked`,
-    seeded from `fuzz/fuzz-h1/seeds`;
+  - fuzz targets `h1-request`, `h1-response` and `chunked`, seeded from
+    C's `fuzz/fuzz-h1/seeds`, added as [fuzzing.md](fuzzing.md) says;
   - a differential test against C on the same inputs, comparing the
     parsed token table and the verdict.  This needs a small C harness
     built from the reference tree outside this repository; it is
@@ -629,7 +639,7 @@ not pending output; mux parked rx; the kept-warm joiner's status.
 | transcripts byte for byte | C `api-test-sansio` | `cargo test`, every commit |
 | state edge set vs C trace | C `LWS_WITH_STATE_TRACE` | `cargo test`, vendored edge file |
 | one-shot vs fragmented parse | agent-context "Parsers" | proptest, every parser |
-| fuzz, seeded from C corpora | `fuzz/fuzz-*/seeds` | smoke over the seeds in CI; campaigns by hand |
+| fuzz, with an oracle per target | C's `fuzz/fuzz-*/seeds`, copied into `fuzz/seeds/` | smoke tests in `cargo test` everywhere; libFuzzer in sai CI and idle time ([fuzzing.md](fuzzing.md)) |
 | differential parse vs C | C tree built outside the repo | optional CI job |
 | autobahn / h2spec / h3spec | conformance suites | per phase, once `npro-io` exists |
 | lints, docs, deny, audit, MSRV | AGENTS.md | CI, every commit |

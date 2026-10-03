@@ -31,7 +31,9 @@ sansIO half is the specification, and the port is held to it by:
   which npro replays;
 - **the C state tables**: every state transition C allows, from
   `lib/sansio/wsi-state.c`, which npro's state enums must match;
-- **fuzzing**, seeded from the C library's fuzz corpora;
+- **fuzzing**, each target checked against an oracle, on every build
+  and in sai's idle time, seeded from the C library's fuzz corpora
+  ([docs/fuzzing.md](docs/fuzzing.md));
 - **differential and conformance testing**, against C lws and the
   autobahn, h2spec and h3spec suites, as the IO crate makes them possible.
 

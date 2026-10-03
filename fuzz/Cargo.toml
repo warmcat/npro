@@ -1,0 +1,54 @@
+# The libFuzzer targets: one bin per npro_fuzz::Target, each a line handing
+# libFuzzer's input to that target's harness in crates/npro-fuzz.
+#
+# A workspace of its own, with its own Cargo.lock and deny.toml, so that what
+# fuzzing needs to build never enters the main workspace's dependency graph.
+# Built by cargo-fuzz, with nightly: see docs/fuzzing.md.
+
+[package]
+name    = "npro-fuzz-targets"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+npro-fuzz     = { path = "../crates/npro-fuzz" }
+
+[[bin]]
+name  = "utf8"
+path  = "fuzz_targets/utf8.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "sha1"
+path  = "fuzz_targets/sha1.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "base64"
+path  = "fuzz_targets/base64.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "transcript"
+path  = "fuzz_targets/transcript.rs"
+test  = false
+doc   = false
+bench = false
+
+[lints.rust]
+unsafe_code     = "forbid"
+unexpected_cfgs = "deny"
+
+[workspace]
