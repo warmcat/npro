@@ -1,0 +1,13 @@
+[package]
+name        = "lws"
+version     = "0.0.1"
+license     = "MIT"
+homepage    = "https://libwebsockets.org"
+description = "Modern all-safe networking library supporting h1, h2, h3, ws, wt sans-IO and with socket IO + tls"
+edition     = "2024"
+readme      = "README.md"
+repository  = "https://libwebsockets.org/git/lws-rs"
+keywords    = ["websocket", "http2", "http3", "sans-io", "networking"]
+categories  = ["network-programming", "web-programming::websocket"]
+rust-version = "1.85"
+[dependencies]
