@@ -1,0 +1,20 @@
+# cargo deny: what may enter the dependency tree.  The tree is meant to stay
+# close to empty; each dependency is justified in the commit that adds it.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MIT"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards         = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"

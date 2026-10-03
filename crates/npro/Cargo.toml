@@ -1,0 +1,15 @@
+[package]
+name         = "npro"
+description  = "Safe sans-IO h1, h2, h3, ws and wt protocols: the Rust port of libwebsockets' sansIO half"
+readme       = "../../README.md"
+keywords     = ["websocket", "http2", "http3", "sans-io", "networking"]
+categories   = ["network-programming", "web-programming::websocket", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[lints]
+workspace = true

@@ -1,13 +1,36 @@
-[package]
-name        = "lws"
-version     = "0.0.1"
-license     = "MIT"
-homepage    = "https://libwebsockets.org"
-description = "Modern all-safe networking library supporting h1, h2, h3, ws, wt sans-IO and with socket IO + tls"
-edition     = "2024"
-readme      = "README.md"
-repository  = "https://libwebsockets.org/git/lws-rs"
-keywords    = ["websocket", "http2", "http3", "sans-io", "networking"]
-categories  = ["network-programming", "web-programming::websocket"]
+[workspace]
+resolver = "3"
+members  = ["crates/*"]
+
+[workspace.package]
+version      = "0.0.2"
+edition      = "2024"
 rust-version = "1.85"
-[dependencies]
+license      = "MIT"
+homepage     = "https://npro.rs"
+repository   = "https://libwebsockets.org/git/npro"
+
+[workspace.lints.rust]
+unsafe_code     = "forbid"
+missing_docs    = "deny"
+unexpected_cfgs = "deny"
+
+# What AGENTS.md asks of every crate: nothing that can panic on input, no
+# unchecked arithmetic on lengths, no lossy integer casts.  A lint is
+# silenced only by an #[allow] on the one item, with a reason.
+
+[workspace.lints.clippy]
+unwrap_used              = "deny"
+expect_used              = "deny"
+panic                    = "deny"
+unreachable              = "deny"
+todo                     = "deny"
+unimplemented            = "deny"
+indexing_slicing         = "deny"
+arithmetic_side_effects  = "deny"
+as_conversions           = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss           = "deny"
+cast_possible_wrap       = "deny"
+missing_errors_doc       = "deny"
+must_use_candidate       = "deny"
