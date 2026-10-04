@@ -1,0 +1,1 @@
+3c84590755f25011dbe14196c8d13361ca678929 http: a repeated h1 header's value loses its leading OWS too

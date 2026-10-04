@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+Host : x
+:status: 200
+uri-args: y
+put: z
+get : w
+X	Y: t
+

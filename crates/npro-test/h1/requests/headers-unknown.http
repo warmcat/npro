@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+X-One: 1
+X-Two:	 two 
+X-Empty:
+x-one: again
+

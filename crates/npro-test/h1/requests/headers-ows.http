@@ -1,0 +1,9 @@
+GET / HTTP/1.1
+Host:	 h
+Accept: 	 a
+Accept:	 b 
+Accept:  	
+Accept: 	 c
+User-Agent:	x	
+X-Unknown: 	 u
+
