@@ -11,5 +11,6 @@
 pub mod base64;
 pub mod random;
 pub mod sha1;
+pub mod state;
 pub mod time;
 pub mod utf8;
