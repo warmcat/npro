@@ -419,31 +419,33 @@ Buffers without `alloc`:
   fragment cap.
 - **Tx.**  The tx side owns nothing but its position.
 
-The **connection** is one struct holding four machines, each its own enum
-whose variants carry the data of that state:
+The **connection** is four machines, each its own enum, with the role,
+the side and the socket's usability: `npro_core::state::Machines`.  As
+built in phase 1b, which departs from the first form of this plan (per-role
+enums carrying each state's data) for reasons given there:
 
-- `Transport`: phase 1 needs only `Up` / `Failed`, but all of C's variants
-  are declared so that the trace maps.
-- `Carrier`, per role.
-- `Transaction`, per role.
-- `Close`.
-- The role is an enum of role states (`H1Server`, `H1Client`, `Ws`, ...),
-  and a role change is a transition.
-- **Events**: C's `LWS_WSIEV_*` become a `WsiEvent` enum.  The transition
-  function is one `match (role, side, state, event)` per machine, with no
-  `_ =>` arm, so an unlisted edge does not compile rather than being
-  checked.  Rows where C accepts `ANY` source state are spelled out.  The
-  plan is to list them from the C table, and question each one in review:
-  `RESTART`, `CONN_FAILED`, `RETARGET`, `CLOSE_FLUSH`, `CLOSE_STAGED` and
-  `SOCKET_GONE`.
-- **Trace**: behind a `trace` feature, the port writes the same line as C's
-  `LWS_WITH_STATE_TRACE`, `LRS h1/S:HEADERS -> h1/S:ESTABLISHED set_state ev=...`.
-  That makes the C edge set over the same transcripts diffable against
-  the port's: README.sans-io-split.md rule 3, "the trace is the oracle".
-- **Close invariants** are types, not checks.  Examples: the ws close
-  states exist only inside the `Ws` role, so `RETURNED_CLOSE` on a
-  non-ws role cannot be written.  `Shutdown` exists only on the server
-  side.
+- `Transport`, `Carrier`, `Live` (the transaction) and `Close`, each one
+  enum shared by every role, as in C; all of C's transport phases are
+  declared.  The fields are private, and only the event table writes them.
+- `Role` (`None`, `H1`, `Ws`, `RawSkt` so far) and `Side`; a role or side
+  change is a transition like any other.
+- **Events**: C's `LWS_WSIEV_*` are the `Event` enum.  The transition
+  function is one `match` on the event, exhaustive, so an event cannot be
+  added without its rows; within it, the rows are C's, in C's order, with
+  `_` for C's `"*"` and `ANY`.  An event with no row is refused, as C
+  refuses it (and `LWS_WITH_STATE_CHECK` aborts).  The `ANY` rows are C's
+  as they are: `RESTART`, `CONN_FAILED`, `RETARGET`, the close events.
+- **Trace**: every change is an `Edge`, whose `Display` is the line C's
+  `LWS_WITH_STATE_TRACE` writes, less the connection's tag:
+  `LRS h1/S:HEADERS -> h1/S:H1_UPGRADE set_state ev=REQ_HDRS_COMPLETE`.
+  It needs no feature: writing lines is the IO side's business.  That
+  makes C's edge set diffable against the port's: README.sans-io-split.md
+  rule 3, "the trace is the oracle".
+- **Close invariants** are refusals, as C's check makes them aborts: no
+  polite close phase entered with the socket unusable, no shutdown on a
+  raw socket, the close never going backwards, no live state while a
+  client restarts.  The rows themselves keep `RETURNED_CLOSE` to ws and
+  `SHUTDOWN` to servers.
 
 ## 3. Phases
 
@@ -497,20 +499,50 @@ time, with the corpora in a sai pool.  The first targets are the
 substrate's: `utf8`, `sha1`, `base64`, and the transcript reader.
 [fuzzing.md](fuzzing.md) has the details.
 
-### Phase 1b: the connection machines
+### Phase 1b: the connection machines (done, 2026-10-04)
 
-- The four machines and the `WsiEvent` transition function, for the roles
-  in stage 1: h1 client and server, ws, and raw if cheap.
-- Property tests:
-  - no event sequence reaches a state the C table does not;
-  - the invariants of section 2 hold.
-- A test that checks the port's full edge set against a vendored
-  `sort -u` of C's trace over its ctest suite, restricted to stage-1
-  roles, in both directions.  An edge C has and the port lacks, or the
-  reverse, fails with the edge named.
+- **`npro_core::state`**: the four machines, the role, side and socket,
+  the `Event` enum and C's event table rows for the stage-1 roles: h1
+  client and server, ws, and raw sockets.  The setters are C's
+  (`lws_wsi_set_state_ev()`, `lws_wsi_role_transition_ev()`): a live state
+  ends the transport phase, a handshake-named state is the carrier's until
+  it is established, a restart leaves the old socket and close behind.
+- **The oracles**, in `crates/npro-test/states/` from C `2dc2a33c`
+  (`scripts/sync-c-states.sh` refreshes them): C's table rows verbatim,
+  and the 373 distinct edges C's whole ctest suite takes with the trace
+  and the check on (248 tests, all passing; 202 of the edges are between
+  stage-1 roles).
+- **The tests**, `crates/npro-test/tests/states.rs`:
+  - a second model of C's machines, in C's terms, reading its rows from
+    the copy of C's table.  Every state the port reaches from a birth
+    (3,022 of them, walked exhaustively, which subsumes the property
+    tests this plan asked for) is driven with every event, with and
+    without each role a site can give, through both: 604,400 cases,
+    agreeing on refusal, machines after, setter and trace line;
+  - every one of C's 202 stage-1 edges is one the port takes;
+  - the structural invariants hold in every reachable state.
 
-**Exit check**: the edge-set comparison is clean, or every difference is
-listed and agreed.
+  Each was checked by planting bugs: a wrong row, a missing row, a setter
+  keeping the transport or the dead socket, the close going backwards, no
+  unusable-socket rule, tracing every edge.  Every one fails the tests.
+
+**Exit check, met, with one difference listed for agreement.**  The port
+takes every edge C takes, and takes none C's table does not.  The other
+direction of the plan's comparison, every edge the port can take seen in
+C's trace, does not hold and is not meant to: the port reaches 4,047
+traced edges, C's suite exercises 202, and the rest are edges C's table
+allows that its tests do not reach (C's own comment: "statically present
+edges no test reaches").  Row-level equivalence with C's table replaces
+that direction.
+
+**Departure from section 2's first form**, to agree: the machines are one
+enum each, shared by the roles, as C's are, rather than per-role enums
+carrying each state's data.  C's machines cross roles: the close machine
+is one ordered sequence that ws phases sit inside, and a role change
+carries it (h1 to ws); the carrier's names are reused per transaction.
+Keeping C's shape is what lets the port be held to C's table row by row.
+Typed per-role views for the protocol crates (an `H1Server` that can only
+be in its states) can sit on top when phase 1d has callers for them.
 
 ### Phase 1c: h1 parsing
 
