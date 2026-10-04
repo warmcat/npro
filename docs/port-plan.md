@@ -1,6 +1,6 @@
 # npro: plan for the sansIO port
 
-Status: agreed, 2026-10-03.  Phases 0 and 1a are done.  npro is the Rust port of
+Status: agreed, 2026-10-03.  Phases 0, 1a and 1b are done.  npro is the Rust port of
 libwebsockets' sansIO half (https://npro.rs).
 
 This plan puts into practice the C tree's porting guide
@@ -507,11 +507,12 @@ substrate's: `utf8`, `sha1`, `base64`, and the transcript reader.
   (`lws_wsi_set_state_ev()`, `lws_wsi_role_transition_ev()`): a live state
   ends the transport phase, a handshake-named state is the carrier's until
   it is established, a restart leaves the old socket and close behind.
-- **The oracles**, in `crates/npro-test/states/` from C `2dc2a33c`
-  (`scripts/sync-c-states.sh` refreshes them): C's table rows verbatim,
-  and the 373 distinct edges C's whole ctest suite takes with the trace
-  and the check on (248 tests, all passing; 202 of the edges are between
-  stage-1 roles).
+- **The oracles**, in `crates/npro-test/states/` (`scripts/sync-c-states.sh`
+  refreshes them): C's table rows with their line in `wsi-state.c`, every
+  distinct edge C's ctest suite takes and every table row it fires (C's
+  `LRSROW` trace), over the three builds C measures coverage with, all with
+  `LWS_WITH_STATE_TRACE` and `LWS_WITH_STATE_CHECK`, and C's README, which
+  lists the rows no test fires and why.
 - **The tests**, `crates/npro-test/tests/states.rs`:
   - a second model of C's machines, in C's terms, reading its rows from
     the copy of C's table.  Every state the port reaches from a birth
@@ -519,30 +520,35 @@ substrate's: `utf8`, `sha1`, `base64`, and the transcript reader.
     tests this plan asked for) is driven with every event, with and
     without each role a site can give, through both: 604,400 cases,
     agreeing on refusal, machines after, setter and trace line;
-  - every one of C's 202 stage-1 edges is one the port takes;
+  - every one of C's 244 stage-1 edges is one the port takes;
   - the structural invariants hold in every reachable state.
 
   Each was checked by planting bugs: a wrong row, a missing row, a setter
   keeping the transport or the dead socket, the close going backwards, no
   unusable-socket rule, tracing every edge.  Every one fails the tests.
 
-**Exit check, met, with one difference listed for agreement.**  The port
-takes every edge C takes, and takes none C's table does not.  The other
-direction of the plan's comparison, every edge the port can take seen in
-C's trace, does not hold and is not meant to: the port reaches 4,047
-traced edges, C's suite exercises 202, and the rest are edges C's table
-allows that its tests do not reach (C's own comment: "statically present
-edges no test reaches").  Row-level equivalence with C's table replaces
-that direction.
+**Exit check, met.**  The port takes every edge C's suite takes, and none
+C's table does not.  The plan's other direction, every edge the port can
+take seen in C's trace, was the wrong measure: rows that fire from any
+state multiply into thousands of edges whose code is one path.  It is
+replaced by row coverage.  C's trace now names each table row as it fires,
+C's suite was given tests for the rows it never fired (and fixes where
+those found bugs), unreachable rows were dropped, and C's README lists
+every row still unfired with why: 21 over its three builds.  npro's states
+test requires each row npro's machines can fire to be one C's suite fires
+or one of those.  That check needs the oracle measured where C measures
+it: a host without IPv6 never connects to a second address, and h3
+needs gnutls.
 
-**Departure from section 2's first form**, to agree: the machines are one
-enum each, shared by the roles, as C's are, rather than per-role enums
-carrying each state's data.  C's machines cross roles: the close machine
-is one ordered sequence that ws phases sit inside, and a role change
-carries it (h1 to ws); the carrier's names are reused per transaction.
-Keeping C's shape is what lets the port be held to C's table row by row.
-Typed per-role views for the protocol crates (an `H1Server` that can only
-be in its states) can sit on top when phase 1d has callers for them.
+**The machines' shape, agreed (2026-10-04)**: one enum per machine,
+shared by the roles, as C's are, rather than per-role enums carrying each
+state's data.  The protocols share the machines' abstractions: the close
+machine is one ordered sequence the ws phases sit inside, which a role
+change carries (h1 to ws), and the carrier's names are reused per
+transaction.  Keeping C's shape also lets the port be held to C's table
+row by row.  Typed per-role views for the protocol crates (an `H1Server`
+that can only be in its states) can sit on top when phase 1d has callers
+for them.
 
 ### Phase 1c: h1 parsing
 
