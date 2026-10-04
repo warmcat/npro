@@ -115,19 +115,8 @@ pub(super) const fn row(
         // the transport finished: a server starts on the request, an h1
         // client on sending one, the rest are up
         Event::TransportUp => match (role, side, from, site_role) {
-            (
-                Role::H1,
-                Client,
-                St::Unconnected
-                | St::WaitingSsl
-                | St::WaitingConnect
-                | St::H1cIssueHandshake
-                | St::H1cIssueHandshake2,
-                None,
-            ) => live(Live::H1cIssueHandshake2),
-            (Role::H1, Client, St::H2WaitingToSendHeaders, None) => {
-                live(Live::H2WaitingToSendHeaders)
-            }
+            // inherited from an idle leader
+            (Role::H1, Client, St::Unconnected, None) => live(Live::H1cIssueHandshake2),
             (
                 Role::RawSkt,
                 Client,
@@ -137,12 +126,11 @@ pub(super) const fn row(
                 | St::WaitingProxyReply,
                 None,
             ) => live(Live::Established),
-            (Role::H1, Server, St::SslAckPending | St::AwaitingSslAccept | St::SslInit, None) => {
+            // the accept on a worker is AWAITING_SSL_ACCEPT
+            (Role::H1, Server, St::SslAckPending | St::AwaitingSslAccept, None) => {
                 live(Live::Headers)
             }
-            (_, Server, St::SslAckPending | St::AwaitingSslAccept | St::SslInit, None) => {
-                live(Live::Established)
-            }
+            (_, Server, St::SslAckPending | St::AwaitingSslAccept, None) => live(Live::Established),
             // the non-tls fallback established the connection before the
             // accept path reports the transport up
             (_, Server, St::Established, None) => live(Live::Established),
@@ -164,16 +152,14 @@ pub(super) const fn row(
 
         // a client request queued on, or issued by, a connection
         Event::Queued => match (side, from, site_role) {
-            (Client, St::Unconnected | St::H1cIssueHandshake2, None) => {
-                live(Live::H2WaitingToSendHeaders)
-            }
+            (Client, St::Unconnected, None) => live(Live::H2WaitingToSendHeaders),
             _ => None,
         },
         Event::ReqIssue => match (role, side, from, site_role) {
             (
                 Role::H1,
                 Client,
-                St::H2WaitingToSendHeaders | St::Established | St::Idling | St::WaitingServerReply,
+                St::H2WaitingToSendHeaders | St::Established | St::WaitingServerReply,
                 None,
             ) => live(Live::H1cIssueHandshake2),
             _ => None,
@@ -184,10 +170,7 @@ pub(super) const fn row(
             (
                 Role::H1,
                 Client,
-                St::WaitingSsl
-                | St::WaitingConnect
-                | St::H1cIssueHandshake
-                | St::H1cIssueHandshake2,
+                St::WaitingSsl | St::H1cIssueHandshake | St::H1cIssueHandshake2,
                 None,
             ) => live(Live::WaitingServerReply),
             _ => None,
@@ -196,10 +179,7 @@ pub(super) const fn row(
             (
                 Role::H1,
                 Client,
-                St::WaitingSsl
-                | St::WaitingConnect
-                | St::H1cIssueHandshake
-                | St::H1cIssueHandshake2,
+                St::WaitingSsl | St::H1cIssueHandshake | St::H1cIssueHandshake2,
                 None,
             ) => live(Live::IssueHttpBody),
             _ => None,
@@ -221,8 +201,11 @@ pub(super) const fn row(
         // transaction ends, from wherever it had got to
         Event::TxnCompleted => match (role, side, from, site_role) {
             (Role::H1, Client, St::Established, None) => live(Live::Idling),
+            // only an app reading on past the end of an unframed body
             (_, Client, St::Idling, None) => live(Live::Idling),
             (Role::H1, Server, St::TxnCompleting, None) => live(Live::TxnCompleted),
+            // from H1_UPGRADE, the upgrade refused; from TXN_COMPLETED, only
+            // an app completing twice
             (
                 Role::H1,
                 Server,
@@ -231,15 +214,15 @@ pub(super) const fn row(
                 | St::DiscardBody
                 | St::DoingTransaction
                 | St::H1Upgrade
-                | St::TxnCompleted
-                | St::IssuingFile
-                | St::AwaitingFileRead,
+                | St::TxnCompleted,
                 None,
             ) => live(Live::TxnCompleted),
             _ => None,
         },
 
-        // request headers: the h1 server decides on the upgrade
+        // request headers: the h1 server decides on the upgrade; from
+        // ESTABLISHED, the next request after a file completion the app did
+        // not complete
         Event::ReqHdrsComplete => match (role, side, from, site_role) {
             (Role::H1, Server, St::Headers | St::Established, None) => live(Live::H1Upgrade),
             _ => None,
@@ -257,7 +240,7 @@ pub(super) const fn row(
 
         // the request body
         Event::BodyBegin => match (role, side, from, site_role) {
-            (Role::H1, Server, St::Established | St::DoingTransaction, None) => live(Live::Body),
+            (Role::H1, Server, St::DoingTransaction, None) => live(Live::Body),
             _ => None,
         },
         // an h1 body is complete before its answer is: the next request,
@@ -266,8 +249,9 @@ pub(super) const fn row(
             (Role::H1, Server, St::Body, None) => live(Live::DoingTransaction),
             _ => None,
         },
-        // the user completed the transaction before reading the body, maybe
-        // with a read of a file out on a worker, reaped by the completion
+        // the user completed the transaction before reading the body, or
+        // its completion waited for the answer to go and finds the body
+        // unread
         Event::BodyDiscard => match (role, side, from, site_role) {
             (
                 Role::H1,
@@ -276,8 +260,6 @@ pub(super) const fn row(
                 | St::Established
                 | St::DoingTransaction
                 | St::H1Upgrade
-                | St::IssuingFile
-                | St::AwaitingFileRead
                 | St::TxnCompleting,
                 None,
             ) => live(Live::DiscardBody),
@@ -285,7 +267,9 @@ pub(super) const fn row(
         },
 
         // the user completed the transaction with its answer still queued:
-        // completion waits for that to go
+        // completion waits for that to go.  From DISCARD_BODY only an app
+        // writing after it completed reaches it, from TXN_COMPLETED only one
+        // answering again, and from TXN_COMPLETING only one completing twice
         Event::TxnCompleting => match (role, side, from, site_role) {
             (
                 Role::H1,
@@ -296,9 +280,7 @@ pub(super) const fn row(
                 | St::DoingTransaction
                 | St::H1Upgrade
                 | St::TxnCompleted
-                | St::IssuingFile
-                | St::TxnCompleting
-                | St::AwaitingFileRead,
+                | St::TxnCompleting,
                 None,
             ) => live(Live::TxnCompleting),
             _ => None,
@@ -399,27 +381,12 @@ pub(super) const fn row(
             _ => None,
         },
 
-        // raw: from the request, the upgrade, the non-tls fallback on a tls
-        // listener, a kept-alive connection or a listener already raw; an h1
-        // client's own raw upgrade
+        // raw, on a server: from the request, the non-tls fallback on a tls
+        // listener, or a later request on a kept-alive connection or a
+        // listener already raw
         Event::RawUpgraded => match (role, side, from, site_role) {
-            (
-                _,
-                Server,
-                St::Headers | St::H1Upgrade | St::SslInit | St::SslAckPending | St::Established,
-                Some(_),
-            ) => change(
+            (_, Server, St::Headers | St::SslAckPending | St::Established, Some(_)) => change(
                 RoleTo::Site,
-                SideTo::Keep,
-                RoleState::Live(Live::Established),
-            ),
-            (
-                Role::H1,
-                Client,
-                St::Established | St::WaitingServerReply,
-                None | Some(Role::RawSkt),
-            ) => change(
-                RoleTo::Named(Role::RawSkt),
                 SideTo::Keep,
                 RoleState::Live(Live::Established),
             ),
@@ -487,9 +454,7 @@ pub(super) const fn row(
             _ => None,
         },
         Event::TlsAcceptQueued => match (side, from, site_role) {
-            (Server, St::SslInit | St::SslAckPending, None) => {
-                transport(Transport::AwaitingSslAccept)
-            }
+            (Server, St::SslAckPending, None) => transport(Transport::AwaitingSslAccept),
             _ => None,
         },
         Event::ConnFailed => match (side, site_role) {
@@ -512,7 +477,10 @@ pub(super) const fn row(
             _ => None,
         },
         // the peer's CLOSE, perhaps beating the one we were about to send:
-        // answer his and drop ours
+        // answer his and drop ours.  Only ws over a mux stream gets that far,
+        // since its network connection goes on reading for its other
+        // streams; a ws connection of its own reads nothing more until its
+        // close has gone
         Event::WsPeerClose => match (role, from, site_role) {
             (Role::Ws, St::Established | St::WaitingToSendClose, None) => {
                 close(Close::ReturnedClose)

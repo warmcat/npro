@@ -233,6 +233,8 @@ mod states {
 
     #[derive(Clone, Debug)]
     struct Row {
+        /// The row's line in C's wsi-state.c, by which C's trace names it.
+        line: u32,
         role: String,
         side: String,
         from: Option<String>,
@@ -298,12 +300,14 @@ mod states {
         let text = fs::read_to_string(states_dir().join("wsi-event-edges.txt")).unwrap();
         let mut rows = Vec::new();
 
+        // each line of the table, after its line in wsi-state.c and a tab;
+        // a row is R(role, side, from, event, to_role, to_side, to)
         for line in text.lines() {
-            let line = line.trim();
-            if !line.starts_with('{') {
+            let (n, src) = line.split_once('\t').unwrap();
+            let Some(row) = src.trim().strip_prefix("R(") else {
                 continue;
-            }
-            let body = &line[1..line.find('}').unwrap()];
+            };
+            let body = &row[..row.find("),").unwrap()];
             let f: Vec<&str> = body.split(',').map(str::trim).collect();
             assert_eq!(f.len(), 7, "row {line}");
 
@@ -320,6 +324,7 @@ mod states {
             };
 
             rows.push(Row {
+                line: n.parse().unwrap(),
                 role: f[0].trim_matches('"').to_owned(),
                 side: f[1].trim_matches('"').to_owned(),
                 from,
@@ -329,7 +334,7 @@ mod states {
                 to,
             });
         }
-        assert!(rows.len() > 200, "only {} rows read", rows.len());
+        assert!(rows.len() > 150, "only {} rows read", rows.len());
         rows
     }
 
@@ -343,12 +348,17 @@ mod states {
         Refused,
     }
 
-    /// `lws_wsi_event_x()`, with `LWS_WITH_STATE_CHECK`'s check of the result.
-    fn c_event(rows: &[Row], w: &Word, ev: &str, ops: Option<&'static str>) -> COutcome {
+    /// The row of C's table an event matches: the first, as in C.
+    fn c_row<'a>(
+        rows: &'a [Row],
+        w: &Word,
+        ev: &str,
+        ops: Option<&'static str>,
+    ) -> Option<&'a Row> {
         let from = w.reported();
         let w_side = w.side.to_string();
 
-        let Some(r) = rows.iter().find(|r| {
+        rows.iter().find(|r| {
             r.ev == ev
                 && r.from.as_deref().is_none_or(|f| f == from)
                 && (r.role == "*" || r.role == w.role)
@@ -359,7 +369,12 @@ mod states {
                     (Some(t), Some(o)) => t != "P" && t == o,
                     (None, Some(_)) => false,
                 }
-        }) else {
+        })
+    }
+
+    /// `lws_wsi_event_x()`, with `LWS_WITH_STATE_CHECK`'s check of the result.
+    fn c_event(rows: &[Row], w: &Word, ev: &str, ops: Option<&'static str>) -> COutcome {
+        let Some(r) = c_row(rows, w, ev, ops) else {
             return COutcome::Refused;
         };
 
@@ -556,7 +571,12 @@ mod states {
                         Some(role) => n.event_as(ev, role),
                     };
                     let theirs = c_event(&rows, &w, ev.name(), site.map(Role::name));
-                    let what = format!("{} ev={} site={site:?}", w.fmt(), ev.name());
+                    // C's row, by its line in wsi-state.c, if one matches
+                    let row = c_row(&rows, &w, ev.name(), site.map(Role::name)).map_or_else(
+                        || "no row".to_owned(),
+                        |r| format!("wsi-state.c:{}", r.line),
+                    );
+                    let what = format!("{} ev={} site={site:?} ({row})", w.fmt(), ev.name());
 
                     match (ours, theirs) {
                         (Err(_), COutcome::Refused) => {}

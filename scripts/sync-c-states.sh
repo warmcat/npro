@@ -4,16 +4,34 @@
 #
 #   scripts/sync-c-states.sh /path/to/libwebsockets [build dir]
 #
-# The rows of C's event table go to crates/npro-test/states/, verbatim, and
-# the state edges C's ctest suite takes beside them, from a build with
-# LWS_WITH_STATE_TRACE and LWS_WITH_STATE_CHECK (so the suite also aborts on
-# any edge the table does not allow).  The C commit is recorded in C-COMMIT.
-# The checkout should be clean, as for sync-c-oracle.sh.
+# Into crates/npro-test/states/, replacing what is there:
 #
-# The build goes to <checkout>/build-npro-states unless a build dir is
-# given; it is reconfigured each time.  It is a default build without h3,
-# which needs gnutls; C's ctest-background.sh needs netstat or ss to see its
-# test servers come up.  The suite takes some minutes.
+#   wsi-event-edges.txt  the rows of C's event table, each line of the table
+#                        prefixed by its line in wsi-state.c, which is how
+#                        C's trace names a row
+#   edges.txt            every distinct state edge C's ctest suite takes,
+#                        sorted, without each connection's tag
+#   rows-fired.txt       every row of the table the suite fires, from C's
+#                        LRSROW lines
+#   README.lws.md        C's README.wsi-state-machines.md, which lists the
+#                        rows no test fires and why
+#   C-COMMIT             the C commit
+#
+# The suite runs in the three builds C's README measures coverage over: the
+# default, one adding the options some rows need, and one with tls accepts
+# on a worker.  Each has LWS_WITH_STATE_TRACE and LWS_WITH_STATE_CHECK, so
+# the suite also aborts on any edge the table does not allow.  h3 is left
+# out, since it needs gnutls.
+#
+# The builds go to <build dir>-<name>, by default <checkout>/build-npro-
+# states-<name>; they are reconfigured each time.  C's ctest-background.sh
+# needs netstat or ss to see its test servers come up.  Expect most of an
+# hour.  The checkout should be clean, as for sync-c-oracle.sh.
+#
+# Any failing test stops the sync: the edges are only an oracle from a
+# suite that passes.  CTEST_ARGS is passed to every ctest, eg,
+# CTEST_ARGS="-E api-test-foo" to leave out a test that fails for reasons
+# outside the state machines; the commit names it, and why.
 
 set -eu
 
@@ -26,6 +44,7 @@ c="$1"
 b="${2:-$c/build-npro-states}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 dst="$here/crates/npro-test/states"
+jobs="${SAI_PARALLEL:-4}"
 
 if [ -n "$(git -C "$c" status --porcelain -- lib include CMakeLists.txt)" ]; then
 	echo "$c has uncommitted changes" >&2
@@ -36,28 +55,47 @@ if ! command -v netstat >/dev/null 2>&1 && ! command -v ss >/dev/null 2>&1; then
 	exit 1
 fi
 
-cmake -S "$c" -B "$b" -DCMAKE_BUILD_TYPE=DEBUG \
-	-DLWS_WITH_STATE_TRACE=ON -DLWS_WITH_STATE_CHECK=ON \
-	-DLWS_WITH_HTTP3=OFF -DLWS_WITH_MINIMAL_EXAMPLES=ON \
-	-DLWS_WITHOUT_EXTENSIONS=OFF -DLWS_WITH_ZLIB=ON \
-	-DLWS_WITH_SYS_FAULT_INJECTION=ON
-cmake --build "$b" -j "${SAI_PARALLEL:-4}"
-
 raw="$(mktemp)"
 trap 'rm -f "$raw"' EXIT
-(cd "$b" && LWS_STATE_TRACE_FILE="$raw" ctest -j "${SAI_PARALLEL:-4}" --timeout 180)
 
-# the table's rows, between its opening and its closing brace
+# run C's suite in one build: $1 its name, the rest its cmake options
+suite() {
+	name="$1"
+	shift
+	echo "== C build: $name"
+	cmake -S "$c" -B "$b-$name" -DCMAKE_BUILD_TYPE=DEBUG \
+		-DLWS_WITH_STATE_TRACE=ON -DLWS_WITH_STATE_CHECK=ON \
+		-DLWS_WITH_HTTP3=OFF -DLWS_WITH_MINIMAL_EXAMPLES=ON \
+		-DLWS_WITHOUT_EXTENSIONS=OFF -DLWS_WITH_ZLIB=ON "$@"
+	cmake --build "$b-$name" -j "$jobs"
+	# shellcheck disable=SC2086
+	(cd "$b-$name" && LWS_STATE_TRACE_FILE="$raw" \
+		ctest -j "$jobs" --timeout 180 ${CTEST_ARGS:-})
+}
+
+suite default
+suite options -DLWS_WITH_ASYNC_QUEUE=ON -DLWS_WITH_SOCKS5=ON \
+	-DLWS_ROLE_MQTT=ON -DLWS_WITH_HTTP_PROXY=ON -DLWS_ROLE_RAW_PROXY=ON \
+	-DLWS_WITH_SYS_FAULT_INJECTION=ON -DLWS_WITH_EMAIL=ON
+suite worker -DLWS_WITH_ASYNC_QUEUE=ON -DLWS_MAX_SMP=2
+
+# the table, each line with its line in wsi-state.c
 awk '/^static const struct lws_wsi_event_edge lws_wsi_event_edges\[\] = \{/ { f = 1; next }
      f && /^\};/ { exit }
-     f' "$c/lib/sansio/wsi-state.c" > "$dst/wsi-event-edges.txt"
+     f { printf "%d\t%s\n", NR, $0 }' "$c/lib/sansio/wsi-state.c" > "$dst/wsi-event-edges.txt"
 
 # each edge once, without the connection's tag: "LRS from -> to how [ev=X]"
-sed -E -e 's/^(LRS [^ ]+ -> [^ ]+ [^ ]+) .*( ev=[A-Z0-9_]+)$/\1\2/' -e t \
-       -e 's/^(LRS [^ ]+ -> [^ ]+ [^ ]+) .*$/\1/' "$raw" |
+grep '^LRS ' "$raw" |
+	sed -E -e 's/^(LRS [^ ]+ -> [^ ]+ [^ ]+) .*( ev=[A-Z0-9_]+)$/\1\2/' -e t \
+	       -e 's/^(LRS [^ ]+ -> [^ ]+ [^ ]+) .*$/\1/' |
 	LC_ALL=C sort -u > "$dst/edges.txt"
 
+# each row fired, once: "LRSROW <line> role side from event"
+grep '^LRSROW ' "$raw" | sort -u -k2,2n > "$dst/rows-fired.txt"
+
+cp "$c/READMEs/README.wsi-state-machines.md" "$dst/README.lws.md"
 git -C "$c" log -1 --format='%H %s' > "$dst/C-COMMIT"
 
-echo "$(grep -c '^[[:space:]]*{' "$dst/wsi-event-edges.txt") rows and" \
+echo "$(grep -c '	[[:space:]]*R(' "$dst/wsi-event-edges.txt") rows," \
+     "$(wc -l < "$dst/rows-fired.txt") fired, and" \
      "$(wc -l < "$dst/edges.txt") edges from $(cut -c1-12 "$dst/C-COMMIT")"
