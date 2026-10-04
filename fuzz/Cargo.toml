@@ -47,6 +47,27 @@ test  = false
 doc   = false
 bench = false
 
+[[bin]]
+name  = "h1-request"
+path  = "fuzz_targets/h1_request.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "h1-response"
+path  = "fuzz_targets/h1_response.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "chunked"
+path  = "fuzz_targets/chunked.rs"
+test  = false
+doc   = false
+bench = false
+
 [lints.rust]
 unsafe_code     = "forbid"
 unexpected_cfgs = "deny"

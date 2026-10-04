@@ -195,9 +195,48 @@ fn transcript() {
     .unwrap();
 }
 
+/// A seed, sometimes changed, after a split byte which may also choose the
+/// target's configuration.
+fn seeded(r: &mut SeededRandom, seeds: &[Vec<u8>]) -> Vec<u8> {
+    let seed = seeds
+        .get(index_below(r, seeds.len()))
+        .map_or(&[][..], Vec::as_slice);
+    // past the seed's own control byte
+    let body = seed.get(1..).unwrap_or_default();
+    let body = if below(r, 4) == 0 {
+        body.to_vec()
+    } else {
+        mutated(r, body)
+    };
+    split_then(r, body)
+}
+
+#[test]
+fn h1_request() {
+    smoke(Target::H1Request, seeded).unwrap();
+}
+
+#[test]
+fn h1_response() {
+    smoke(Target::H1Response, seeded).unwrap();
+}
+
+#[test]
+fn chunked() {
+    smoke(Target::Chunked, seeded).unwrap();
+}
+
 #[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
-    let tested = ["utf8", "sha1", "base64", "transcript"];
+    let tested = [
+        "utf8",
+        "sha1",
+        "base64",
+        "transcript",
+        "h1-request",
+        "h1-response",
+        "chunked",
+    ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

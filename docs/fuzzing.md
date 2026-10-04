@@ -22,13 +22,18 @@ Fuzzing runs in three places:
 | `sha1` | `npro_core::sha1::Sha1`, for the ws accept | the digest of the message fed in pieces equals the digest of it in one go |
 | `base64` | `npro_core::base64::encode` | a strict decoder in the harness gets the input back; exactly `encoded_len` bytes are used and no more written; a buffer one byte short, or empty, is refused with nothing written |
 | `transcript` | npro-test's transcript reader | whatever it accepts keeps its limits, and step times never go backwards |
+| `h1-request` | `npro_h1::head` as a server | the head in one piece and in pieces comes to the same verdict and leaves the same table; a refused head stays refused; no value holds a CR, LF or NUL; a complete request's path from `/` has no `//`, `/./` or `/../` step and no `/.` or `/..` at its end.  The top bit of the first byte picks a 256 byte table with token limits, so limits are within reach |
+| `h1-response` | `npro_h1::head` as a client | as `h1-request` |
+| `chunked` | `npro_h1::chunked::Dechunk` | a second reading of RFC 9112 7.1 with C's bounds, written apart from the decoder: the same data, ending at the same byte, or refused, in one piece and in pieces |
 
 A target that splits its input to feed it in pieces takes the split from
 the input's first byte, so libFuzzer explores the split like the rest of
 the input.
 
-The h1 parser's targets come next, in phase 1c of
-[port-plan.md](port-plan.md), seeded from the C library's corpora.
+What the h1 targets cannot see, a verdict that is wrong the same way
+whole and in pieces, is what `crates/npro-test/tests/h1_c.rs` checks:
+npro's parser against C's over thousands of heads
+([its README](../crates/npro-test/h1/README.md)).
 
 ## Where things are
 

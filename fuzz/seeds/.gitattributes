@@ -1,0 +1,5 @@
+# inputs as they go on the wire, CRLFs and all: no tool may change their
+# line ends, and a patch carries them as bytes
+h1-request/** binary
+h1-response/** binary
+chunked/** binary

@@ -35,6 +35,7 @@ allow = [
 	# the fuzz targets, and the npro crates they drive
 	"npro-fuzz-targets",
 	"npro-fuzz",
+	"npro-h1",
 	"npro-core",
 	"npro-test",
 

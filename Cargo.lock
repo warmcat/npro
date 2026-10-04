@@ -15,6 +15,7 @@ name = "npro-fuzz"
 version = "0.0.2"
 dependencies = [
  "npro-core",
+ "npro-h1",
  "npro-test",
 ]
 

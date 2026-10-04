@@ -78,6 +78,7 @@ name = "npro-fuzz"
 version = "0.0.2"
 dependencies = [
  "npro-core",
+ "npro-h1",
  "npro-test",
 ]
 
@@ -88,6 +89,10 @@ dependencies = [
  "libfuzzer-sys",
  "npro-fuzz",
 ]
+
+[[package]]
+name = "npro-h1"
+version = "0.0.2"
 
 [[package]]
 name = "npro-test"

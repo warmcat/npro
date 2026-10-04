@@ -15,26 +15,26 @@ use npro_test::{MAX_BYTES, MAX_STEPS, Transcript};
     reason = "a panic is how a fuzz target reports a finding to libFuzzer"
 )]
 #[cold]
-fn finding(target: &str, what: fmt::Arguments<'_>) -> ! {
+pub(crate) fn finding(target: &str, what: fmt::Arguments<'_>) -> ! {
     panic!("{target}: {what}")
 }
 
 /// The input's first byte, which chooses how a target splits the rest,
 /// and the rest.
-fn control(data: &[u8]) -> (u8, &[u8]) {
+pub(crate) fn control(data: &[u8]) -> (u8, &[u8]) {
     data.split_first().map_or((0, data), |(c, rest)| (*c, rest))
 }
 
 /// `bytes` split into pieces of 0 to 16 bytes, the sizes drawn from a
 /// small generator seeded by `ctl`.  Pieces are what arrives in one read,
 /// so empty ones are included: a reader can be handed nothing.
-struct Pieces<'a> {
+pub(crate) struct Pieces<'a> {
     rest: &'a [u8],
     state: u32,
 }
 
 impl<'a> Pieces<'a> {
-    fn new(ctl: u8, bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(ctl: u8, bytes: &'a [u8]) -> Self {
         Self {
             rest: bytes,
             state: u32::from(ctl),

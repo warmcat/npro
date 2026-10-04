@@ -20,8 +20,10 @@
 
 #![forbid(unsafe_code)]
 
+mod h1;
 mod targets;
 
+pub use h1::{chunked, h1_request, h1_response};
 pub use targets::{base64, sha1, transcript, utf8};
 
 /// A fuzz target: its name is the libFuzzer target's, the seed directory's
@@ -45,11 +47,25 @@ pub enum Target {
     Base64,
     /// [`transcript`]: npro-test's transcript reader.
     Transcript,
+    /// [`h1_request`]: the h1 head parser, as a server.
+    H1Request,
+    /// [`h1_response`]: the h1 head parser, as a client.
+    H1Response,
+    /// [`chunked`]: the chunked transfer coding's decoder.
+    Chunked,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 4] = [Self::Utf8, Self::Sha1, Self::Base64, Self::Transcript];
+    pub const ALL: [Self; 7] = [
+        Self::Utf8,
+        Self::Sha1,
+        Self::Base64,
+        Self::Transcript,
+        Self::H1Request,
+        Self::H1Response,
+        Self::Chunked,
+    ];
 
     /// The target's name.
     #[must_use]
@@ -59,6 +75,9 @@ impl Target {
             Self::Sha1 => "sha1",
             Self::Base64 => "base64",
             Self::Transcript => "transcript",
+            Self::H1Request => "h1-request",
+            Self::H1Response => "h1-response",
+            Self::Chunked => "chunked",
         }
     }
 
@@ -74,6 +93,9 @@ impl Target {
             Self::Sha1 => sha1(data),
             Self::Base64 => base64(data),
             Self::Transcript => transcript(data),
+            Self::H1Request => h1_request(data),
+            Self::H1Response => h1_response(data),
+            Self::Chunked => chunked(data),
         }
     }
 }

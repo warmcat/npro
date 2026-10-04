@@ -14,6 +14,16 @@ The `transcript` target also starts from every transcript in
 
 Seeds are small and readable on purpose: each is a case worth starting from,
 named for what it is.  What the fuzzer finds goes in its corpus, which is
-kept between runs, not here ([docs/fuzzing.md](../../docs/fuzzing.md)).  When the protocol crates arrive, their
-targets' seeds come from the C library's corpora (`fuzz/fuzz-*/seeds` in
-the C tree), copied with where they came from.
+kept between runs, not here ([docs/fuzzing.md](../../docs/fuzzing.md)).
+The protocol crates' targets start from the C library's corpora
+(`fuzz/fuzz-*/seeds` in the C tree), copied with where they came from:
+
+- `h1-request`: C's `fuzz/fuzz-h1/seeds`, each behind a control byte of
+  0, named as there (`absuri.http`, `get.http`...), and some of
+  `crates/npro-test/h1/requests/`, named as there;
+- `h1-response` and `chunked`: some of `crates/npro-test/h1/responses/`
+  and `chunked/`.
+
+A `tight-*` seed's control byte has its top bit set, choosing the small
+table with token limits.  A seed named `regress-*` is an input the fuzzer
+once failed on, kept so it is tried every run, as in C.
