@@ -1,6 +1,6 @@
 # npro: plan for the sansIO port
 
-Status: agreed, 2026-10-03.  Phases 0, 1a and 1b are done.  npro is the Rust port of
+Status: agreed, 2026-10-03.  Phases 0, 1a, 1b and 1c are done.  npro is the Rust port of
 libwebsockets' sansIO half (https://npro.rs).
 
 This plan puts into practice the C tree's porting guide
@@ -550,33 +550,67 @@ row by row.  Typed per-role views for the protocol crates (an `H1Server`
 that can only be in its states) can sit on top when phase 1d has callers
 for them.
 
-### Phase 1c: h1 parsing
+### Phase 1c: h1 parsing (done, 2026-10-04)
 
-- **The request and response header parser.**  It is byte-restartable,
-  with no recursion.  Its limits come from config:
-  - `max_http_header_data`, 4096 by default and capped at 32768;
-  - the per-token limits;
-  - `WSI_TOKEN_COUNT` fragments.
-- **Name matching.**  This is a `match` on the lowercased name, not C's
-  generated lextable trie.  The trie is an implementation detail; the
-  token set, the colon handling, and the method and version strings are
-  the behaviour.
-- **URI decoding and normalisation.**  `%XX`, then the control-character
-  refusal, then `//`, `/./` and `/../`, never above root, plus the
-  urlargs splitting.  The refusals are the same as C's `LPR_REFUSED`: 403,
-  or 414 / 431 past a limit, pinned by the `h1-uri-*` and
-  `h1-header-past-limit` transcripts.
-- **The chunked decoder**, shared by client and server.  It requires at
-  least one hex digit, and extensions plus trailers are bounded at 4096
-  bytes per body, as C does.
-- **Tests**:
-  - the one-shot vs randomly fragmented oracle, as a property test;
-  - fuzz targets `h1-request`, `h1-response` and `chunked`, seeded from
-    C's `fuzz/fuzz-h1/seeds`, added as [fuzzing.md](fuzzing.md) says;
-  - a differential test against C on the same inputs, comparing the
-    parsed token table and the verdict.  This needs a small C harness
-    built from the reference tree outside this repository; it is
-    optional in CI.
+The crate `npro-h1`, `no_std` with no dependencies, is C's
+`lib/sansio/http/parsers.c`:
+
+- **`token`**: C's `enum lws_token_indexes`, its 97 tokens with C's
+  indices and spellings, with every header option on as C's default build
+  has it.  Name matching is `lookup()` over the spellings: no spelling is
+  the start of another, so a name is matched exactly when C's lextable
+  reaches its terminal, and the trie itself is not ported.
+- **`table`**: C's ah, `HeaderTable<S>` over caller-owned storage, at most
+  32768 bytes.  Its layout is C's byte for byte in what it uses up (each
+  value's NUL, each unknown header's eight byte record, the `?`'s unused
+  byte, C's 97 fragment slots), so a head fills it at the same byte as C's.
+  Presence is a `Slot::Present`, not a nonzero index.  A client's own
+  request goes in with `create()`, and an interim response is dropped with
+  `snapshot()` and `rewind()`.
+- **`head`**: C's `lws_parse()` and `lws_parse_urldecode()`, byte for byte
+  restartable.  C's `parser_state`, `ues`, `ups`, `post_literal_equal`,
+  `lextable_pos` and `unk_pos` are enums.  A refusal is a `Cause`, one per
+  way out of C's parser, and what a server answers for it (`LPR_REFUSED`'s
+  400, 403, 414, 431, 501 or 505, or none for `LPR_FAIL`).  Limits are the
+  table's size and per-token `Config::with_limit()`, C's `token_limits`.
+- **`chunked`**: C's `lws_http_dechunk_framing()`, handing back the payload
+  where it lies in the input; **`fields`**: C's Content-Length and
+  lone-`chunked` Transfer-Encoding readers.
+
+Porting it found three bugs in C, fixed there first (lws 3c8459075 and
+the two before it), so npro follows C as it now is: C marked "no name
+begun" by the name's record being at offset 0, which a server's first
+name is, so it began that name twice, losing nine bytes of every
+request's ah, and took a LF as a request's second byte as a bare LF; C's
+strict server took a header line starting with a bare CR into an unknown
+header's name; and a repeated header's value kept its leading spaces,
+where RFC 9110's OWS is not part of a value.
+
+**The tests**, in `crates/npro-test`:
+
+- **The differential test against C**, `tests/h1_c.rs`.  The plan had it as
+  a C harness in an optional CI job; it is instead an oracle vendored like
+  the state machines': `scripts/sync-c-h1.sh` builds C static, compiles
+  `h1/c-heads.c` against its private headers to call `lws_parse()` and the
+  dechunker directly, and records what C makes of a corpus (C's fuzz-h1
+  seeds and heads written to reach each branch, as a server and as a
+  client, and chunked bodies), with twelve variations of each, in C's
+  default configuration and a tight one: 7,007 cases.  npro must reach
+  the same verdict and leave the same table, down to the bytes used.
+- **The one-shot vs fragmented oracle** over the same heads, each split
+  three ways, and over every transcript's first request split at each
+  byte.
+- **The transcripts**: the `h1-uri-*`, `h1-reqline-*` and
+  `h1-header-past-limit` requests come to the path, urlargs or refusal C's
+  `sansio-uri` app answered with, and the h1 client cases' heads and
+  framing headers read as C read them (`tests/h1_heads.rs`).
+- **Fuzz targets** `h1-request`, `h1-response` and `chunked`, seeded from
+  C's `fuzz/fuzz-h1/seeds` and the corpus ([fuzzing.md](fuzzing.md)).
+
+**Exit check, met.**  Every case of the vendored oracle agrees with C,
+and planted bugs in the
+parser and dechunker (a limit off by one, `+` left alone in the query, the
+continuation's SP dropped) each fail it.
 
 ### Phase 1d: the h1 transaction, server and client
 
@@ -678,7 +712,7 @@ not pending output; mux parked rx; the kept-warm joiner's status.
 | state edge set vs C trace | C `LWS_WITH_STATE_TRACE` | `cargo test`, vendored edge file |
 | one-shot vs fragmented parse | agent-context "Parsers" | proptest, every parser |
 | fuzz, with an oracle per target | C's `fuzz/fuzz-*/seeds`, copied into `fuzz/seeds/` | smoke tests in `cargo test` everywhere; libFuzzer in sai CI and idle time ([fuzzing.md](fuzzing.md)) |
-| differential parse vs C | C tree built outside the repo | optional CI job |
+| differential parse vs C | C's `lws_parse()` and dechunker over a corpus, `scripts/sync-c-h1.sh` | `cargo test`, vendored `c-heads.txt` |
 | autobahn / h2spec / h3spec | conformance suites | per phase, once `npro-io` exists |
 | lints, docs, deny, audit, MSRV | AGENTS.md | CI, every commit |
 
@@ -690,4 +724,4 @@ not pending output; mux parked rx; the kept-warm joiner's status.
 - Whether `Random` is `&mut dyn` or a generic parameter.  Generic avoids
   the vtable, but spreads a type parameter through every connection.
 - tls in `npro-io`.
-- Where autobahn and the C differential builds run in CI.
+- Where autobahn runs in CI, and whether the C oracles are measured there (`sync-c-states.sh` and `sync-c-h1.sh` are run by hand).
