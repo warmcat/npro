@@ -7,6 +7,8 @@
 //! - [`table`]: where the head's headers are kept, in caller-owned storage,
 //!   found by
 //! - [`token`]: the headers lws knows by name;
+//! - [`chunked`]: the chunked transfer coding's framing, shared by client
+//!   and server;
 //! - [`fields`]: what a few header values mean, as C reads them.
 //!
 //! The h1 client and server transactions come next, in phase 1d of the
@@ -15,6 +17,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod chunked;
 pub mod fields;
 pub mod head;
 pub mod table;
