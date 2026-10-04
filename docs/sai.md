@@ -172,12 +172,12 @@ installer ends by printing where it installed; it should say `C:\rust`.
 The account the jobs run as must be able to read `C:\rust\rustup` and
 write `C:\rust\cargo`, where cargo keeps its package cache and the lock on
 it.  For an ordinary account, here `sai`:
- 
- ```powershell
- icacls C:\rust\rustup /grant 'sai:(OI)(CI)RX' /T
- icacls C:\rust\cargo /grant 'sai:(OI)(CI)M' /T
- ```
- 
+
+```powershell
+icacls C:\rust\rustup /grant 'sai:(OI)(CI)RX' /T
+icacls C:\rust\cargo /grant 'sai:(OI)(CI)M' /T
+```
+
 Then give the platform an `env` in the builder's configuration file.  It
 is JSON, so every backslash is doubled: a single one is read as an escape,
 and `\r` in `C:\rust\rustup` becomes a carriage return.
