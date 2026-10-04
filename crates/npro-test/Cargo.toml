@@ -11,6 +11,7 @@ repository.workspace   = true
 
 [dev-dependencies]
 npro-core = { path = "../npro-core" }
+npro-h1   = { path = "../npro-h1" }
 
 [lints]
 workspace = true

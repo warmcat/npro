@@ -27,4 +27,5 @@ name = "npro-test"
 version = "0.0.2"
 dependencies = [
  "npro-core",
+ "npro-h1",
 ]
