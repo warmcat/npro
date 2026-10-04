@@ -9,5 +9,8 @@ license.workspace      = true
 homepage.workspace     = true
 repository.workspace   = true
 
+[dev-dependencies]
+npro-core = { path = "../npro-core" }
+
 [lints]
 workspace = true

@@ -8,6 +8,13 @@
 //! this crate's `transcripts/` directory.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    expect(
+        unused_crate_dependencies,
+        reason = "npro-core is a dev-dependency for the state tests in tests/, which the unit tests do not use"
+    )
+)]
 
 mod transcript;
 

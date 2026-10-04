@@ -1,5 +1,10 @@
 //! Every transcript copied from C reads, and says what its README says.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one uses only npro-test"
+)]
+
 use npro_test::{Side, StepKind, vendored};
 
 #[test]
