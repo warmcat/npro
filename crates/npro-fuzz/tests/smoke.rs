@@ -4,6 +4,11 @@
 //! is `scripts/fuzz.sh`.  A failure here reproduces exactly, since the
 //! inputs are the same every run.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one drives npro-test only through npro-fuzz"
+)]
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,7 +57,7 @@ fn index_below(r: &mut SeededRandom, n: usize) -> usize {
     usize::try_from(below(r, n)).unwrap_or(0)
 }
 
-fn byte(r: &mut SeededRandom) -> u8 {
+const fn byte(r: &mut SeededRandom) -> u8 {
     let [b, ..] = r.next_u64().to_le_bytes();
     b
 }

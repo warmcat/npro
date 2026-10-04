@@ -35,6 +35,10 @@ const H0: [u32; 5] = [
 /// assert_eq!(h.finish(), Sha1::digest(b"abc"));
 /// ```
 #[derive(Clone, Debug)]
+#[expect(
+    missing_copy_implementations,
+    reason = "a copy made by accident would hash on from the middle of a message"
+)]
 pub struct Sha1 {
     state: [u32; 5],
     /// Bytes of the current block taken so far.
@@ -126,13 +130,17 @@ impl Sha1 {
     }
 
     /// The compression function over the full block (RFC 3174 6.1).
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "a to e, f, k and w are RFC 3174's names, which the code is checked against"
+    )]
     fn compress(&mut self) {
         // the message schedule, kept as the last 16 words: each round's
         // word is w[0], and the next is made from w[13], w[8], w[2], w[0]
         let mut w = [0u32; 16];
-        for (d, c) in w.iter_mut().zip(self.block.chunks_exact(4)) {
-            if let &[a, b, c, e] = c {
-                *d = u32::from_be_bytes([a, b, c, e]);
+        for (word, bytes) in w.iter_mut().zip(self.block.chunks_exact(4)) {
+            if let &[b0, b1, b2, b3] = bytes {
+                *word = u32::from_be_bytes([b0, b1, b2, b3]);
             }
         }
 
@@ -173,7 +181,12 @@ mod tests {
     use super::*;
 
     fn hex(d: [u8; DIGEST_LEN]) -> String {
-        d.iter().map(|b| format!("{b:02x}")).collect()
+        use core::fmt::Write;
+
+        d.iter().fold(String::new(), |mut s, b| {
+            write!(s, "{b:02x}").unwrap();
+            s
+        })
     }
 
     #[test]

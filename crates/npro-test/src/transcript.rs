@@ -12,9 +12,9 @@
 //! each once; lowercase hex; no string escapes; no recursion.  Anything else
 //! is a new format version, and refused.
 
+use core::{fmt, num::NonZeroU64};
 use std::{
-    fmt, fs, io,
-    num::NonZeroU64,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -165,11 +165,23 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            _ => None,
+            Self::TooLarge
+            | Self::Syntax { .. }
+            | Self::UnknownFormat
+            | Self::UnknownKey { .. }
+            | Self::DuplicateKey(_)
+            | Self::MissingKey(_)
+            | Self::BadSide { .. }
+            | Self::BadHex { .. }
+            | Self::BadStep { .. }
+            | Self::Overflow { .. }
+            | Self::TooManySteps
+            | Self::TimeGoesBackwards { .. }
+            | Self::CaseMismatch => None,
         }
     }
 }
@@ -219,11 +231,11 @@ impl Transcript {
             "format" => once(&mut format, "format", c.string()?),
             "case" => once(&mut case, "case", c.string()?),
             "side" => {
-                let at = c.value_offset();
+                let value_at = c.value_offset();
                 let s = match c.string()? {
                     "server" => Side::Server,
                     "client" => Side::Client,
-                    _ => return Err(Error::BadSide { offset: at }),
+                    _ => return Err(Error::BadSide { offset: value_at }),
                 };
                 once(&mut side, "side", s)
             }
@@ -344,11 +356,11 @@ impl<'a> Cursor<'a> {
         self.b.get(self.pos).copied()
     }
 
-    fn bump(&mut self) {
+    const fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
     }
 
-    fn syntax(&self, expected: &'static str) -> Error {
+    const fn syntax(&self, expected: &'static str) -> Error {
         Error::Syntax {
             offset: self.pos,
             expected,
@@ -395,7 +407,7 @@ impl<'a> Cursor<'a> {
             .get(start..self.pos)
             .ok_or_else(|| self.syntax("a string"))?;
         self.bump();
-        std::str::from_utf8(s).map_err(|_| Error::Syntax {
+        core::str::from_utf8(s).map_err(|_| Error::Syntax {
             offset: start,
             expected: "UTF-8",
         })

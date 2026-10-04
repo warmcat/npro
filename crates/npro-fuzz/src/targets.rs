@@ -10,7 +10,7 @@ use npro_test::{MAX_BYTES, MAX_STEPS, Transcript};
 
 /// Reports a finding to whatever is driving the target: libFuzzer, which
 /// treats a panic as a crash and keeps the input, or a smoke test.
-#[allow(
+#[expect(
     clippy::panic,
     reason = "a panic is how a fuzz target reports a finding to libFuzzer"
 )]
@@ -72,9 +72,8 @@ enum Utf8End {
 
 /// The oracle: how `text` ends according to `core::str`.
 fn utf8_end_by_core(text: &[u8]) -> Utf8End {
-    let e = match core::str::from_utf8(text) {
-        Ok(_) => return Utf8End::Complete,
-        Err(e) => e,
+    let Err(e) = core::str::from_utf8(text) else {
+        return Utf8End::Complete;
     };
     if e.error_len().is_none() {
         return Utf8End::Partial;
@@ -86,7 +85,7 @@ fn utf8_end_by_core(text: &[u8]) -> Utf8End {
     let from = e.valid_up_to();
     let refused = (from..text.len()).find(|&i| {
         text.get(..=i)
-            .is_some_and(|p| core::str::from_utf8(p).is_err_and(|e| e.error_len().is_some()))
+            .is_some_and(|p| core::str::from_utf8(p).is_err_and(|pe| pe.error_len().is_some()))
     });
     Utf8End::InvalidAt(refused.unwrap_or(from))
 }
@@ -102,15 +101,15 @@ pub fn utf8(data: &[u8]) {
     let (ctl, text) = control(data);
     let expect = utf8_end_by_core(text);
 
-    let mut v = Utf8Validator::new();
+    let mut one_at_a_time = Utf8Validator::new();
     let mut bytewise = None;
     for (i, b) in text.iter().enumerate() {
-        if v.feed(core::slice::from_ref(b)).is_err() {
+        if one_at_a_time.feed(core::slice::from_ref(b)).is_err() {
             bytewise = Some(Utf8End::InvalidAt(i));
             break;
         }
     }
-    let bytewise = bytewise.unwrap_or(if v.at_boundary() {
+    let bytewise = bytewise.unwrap_or(if one_at_a_time.at_boundary() {
         Utf8End::Complete
     } else {
         Utf8End::Partial

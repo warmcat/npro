@@ -15,9 +15,23 @@ unsafe_code     = "forbid"
 missing_docs    = "deny"
 unexpected_cfgs = "deny"
 
+# Off by default in rustc, the nearest thing to C's -Wextra.  Each finds
+# something real: an API wider than it is reachable, a dependency nothing
+# uses, a type that could be Copy, idioms older editions allowed.
+rust_2018_idioms               = { level = "deny", priority = -1 }
+unreachable_pub                = "deny"
+unused_crate_dependencies      = "deny"
+unused_qualifications          = "deny"
+unused_lifetimes               = "deny"
+redundant_lifetimes            = "deny"
+let_underscore_drop            = "deny"
+trivial_numeric_casts          = "deny"
+missing_debug_implementations  = "deny"
+missing_copy_implementations   = "deny"
+
 # What AGENTS.md asks of every crate: nothing that can panic on input, no
 # unchecked arithmetic on lengths, no lossy integer casts.  A lint is
-# silenced only by an #[allow] on the one item, with a reason.
+# silenced only by an #[expect] on the one item, with a reason.
 
 [workspace.lints.clippy]
 unwrap_used              = "deny"
@@ -34,3 +48,43 @@ cast_sign_loss           = "deny"
 cast_possible_wrap       = "deny"
 missing_errors_doc       = "deny"
 must_use_candidate       = "deny"
+
+# pedantic: clippy's -Wextra.  Some of it is taste; a lint that fights the
+# house style is turned off here, once, with why.
+pedantic = { level = "deny", priority = -1 }
+
+# AGENTS.md's rules, as lints rather than comments:
+#  - a match on state has no `_ =>` arm, so a new state is handled
+#    everywhere or the build fails
+wildcard_enum_match_arm = "deny"
+#  - a lint is silenced on the one item, with a reason, and with #[expect]
+#    rather than #[allow]: #[expect] fails once the lint stops firing, so
+#    a stale silencing cannot outlive what it was for
+allow_attributes_without_reason = "deny"
+allow_attributes                = "deny"
+#  - no_std: what only needs core or alloc does not reach for std
+std_instead_of_core   = "deny"
+std_instead_of_alloc  = "deny"
+alloc_instead_of_core = "deny"
+#  - stack use that is fine on a server and overflows a microcontroller
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+#  - a library does not print, exit, leak, or panic where it returns errors
+print_stdout        = "deny"
+print_stderr        = "deny"
+dbg_macro           = "deny"
+exit                = "deny"
+mem_forget          = "deny"
+unwrap_in_result    = "deny"
+panic_in_result_fn  = "deny"
+#  - protocol code has no floating point
+float_arithmetic = "deny"
+#  - a name reused for something unrelated reads as the old thing
+shadow_unrelated = "deny"
+#  - from nursery, which is otherwise left off as unfinished
+missing_const_for_fn = "deny"
+
+[workspace.lints.rustdoc]
+private_intra_doc_links   = "deny"
+unescaped_backticks       = "deny"
+missing_crate_level_docs  = "deny"

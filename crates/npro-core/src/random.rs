@@ -71,6 +71,10 @@ impl core::error::Error for Unavailable {}
 /// ```
 #[cfg(feature = "replay")]
 #[derive(Clone, Debug)]
+#[expect(
+    missing_copy_implementations,
+    reason = "a copy made by accident would draw the same random twice"
+)]
 pub struct SeededRandom {
     s: [u64; 4],
 }
@@ -88,7 +92,7 @@ impl SeededRandom {
     }
 
     /// The next 64-bit word of the stream (C's `lws_xos()`).
-    pub fn next_u64(&mut self) -> u64 {
+    pub const fn next_u64(&mut self) -> u64 {
         let [s0, s1, s2, s3] = &mut self.s;
         let result = s1.wrapping_mul(5).rotate_left(7).wrapping_mul(9);
         let t = s1.wrapping_shl(17);
@@ -122,7 +126,7 @@ impl Random for SeededRandom {
 /// reference splitmix64 mixes it after.  This is C's, so that the streams
 /// match; the textbook one would seed a different stream.
 #[cfg(feature = "replay")]
-fn splitmix64(s: &mut u64) -> u64 {
+const fn splitmix64(s: &mut u64) -> u64 {
     let mut r = *s;
     *s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
     r = (r ^ (r >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

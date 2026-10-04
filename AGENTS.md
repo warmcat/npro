@@ -125,8 +125,14 @@ We are very concerned about:
    `arithmetic_side_effects` and `as_conversions` enabled in the core,
    `cargo doc` with `missing_docs` denied on public items,
    `cargo semver-checks` on release, and a build at the pinned
-   `rust-version`.  A lint is silenced only with an `#[allow]` on the one
-   item, carrying a reason.
+   `rust-version`.  Beyond those, the workspace denies clippy's `pedantic`
+   group and rustc's useful off-by-default lints (the `-Wextra` of Rust),
+   and lints that turn the rules here into checks: no wildcard arm on an
+   enum, no `std` where `core` or `alloc` will do, no large stack frames;
+   the list, and why each is there, is `[workspace.lints]` in Cargo.toml.
+   A lint is silenced only with an `#[expect]` (not `#[allow]`, which the
+   lints refuse) on the one item, carrying a reason: `#[expect]` fails
+   once the lint stops firing, so a silencing cannot outlive its reason.
 
  - Tests are part of the feature.  Every parser has a `cargo-fuzz` target
    seeded from the C corpus; state machines get property tests; public
