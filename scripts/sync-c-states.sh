@@ -20,8 +20,9 @@
 # The suite runs in the three builds C's README measures coverage over: the
 # default, one adding the options some rows need, and one with tls accepts
 # on a worker.  Each has LWS_WITH_STATE_TRACE and LWS_WITH_STATE_CHECK, so
-# the suite also aborts on any edge the table does not allow.  h3 is left
-# out, since it needs gnutls.
+# the suite also aborts on any edge the table does not allow.  h3 is built
+# where gnutls is installed, as C's own measurement is; without it the rows
+# only h3 reaches (quic to tcp among them) are never fired.
 #
 # The builds go to <build dir>-<name>, by default <checkout>/build-npro-
 # states-<name>; they are reconfigured each time.  C's ctest-background.sh
@@ -55,6 +56,13 @@ if ! command -v netstat >/dev/null 2>&1 && ! command -v ss >/dev/null 2>&1; then
 	exit 1
 fi
 
+if pkg-config --exists gnutls 2>/dev/null; then
+	h3=ON
+else
+	h3=OFF
+	echo "no gnutls: building without h3, so its rows will not fire" >&2
+fi
+
 raw="$(mktemp)"
 trap 'rm -f "$raw"' EXIT
 
@@ -65,7 +73,7 @@ suite() {
 	echo "== C build: $name"
 	cmake -S "$c" -B "$b-$name" -DCMAKE_BUILD_TYPE=DEBUG \
 		-DLWS_WITH_STATE_TRACE=ON -DLWS_WITH_STATE_CHECK=ON \
-		-DLWS_WITH_HTTP3=OFF -DLWS_WITH_MINIMAL_EXAMPLES=ON \
+		-DLWS_WITH_HTTP3="$h3" -DLWS_WITH_MINIMAL_EXAMPLES=ON \
 		-DLWS_WITHOUT_EXTENSIONS=OFF -DLWS_WITH_ZLIB=ON "$@"
 	cmake --build "$b-$name" -j "$jobs"
 	# shellcheck disable=SC2086
