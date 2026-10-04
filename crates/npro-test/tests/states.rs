@@ -666,6 +666,80 @@ mod states {
         }
     }
 
+    /// The rows C's README says no test fires, as "role side from event".
+    fn c_rows_unfired() -> BTreeSet<String> {
+        let text = fs::read_to_string(states_dir().join("README.lws.md")).unwrap();
+        let start = text.find("### Rows no test fires").unwrap();
+        let section = &text[start..];
+        let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+
+        // each is a `role side from event` in backticks
+        section
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| s.split_whitespace().count() == 4)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "the walk of 3,000 states: native runs keep it")]
+    fn every_row_npro_can_fire_c_fires_or_says_why_not() {
+        let rows = rows();
+        let (states, _) = reachable();
+
+        // the rows C's suite fires, by their line, from C's LRSROW lines
+        let text = fs::read_to_string(states_dir().join("rows-fired.txt")).unwrap();
+        let fired: HashSet<u32> = text
+            .lines()
+            .map(|l| l.split(' ').nth(1).unwrap().parse().unwrap())
+            .collect();
+        let explained = c_rows_unfired();
+
+        // the rows npro's machines can fire
+        let mut ours = BTreeSet::new();
+        for m in &states {
+            let w = word(*m);
+            for ev in Event::ALL {
+                for site in sites() {
+                    let ops = site.map(Role::name);
+                    if let (Some(r), COutcome::Edge(..)) = (
+                        c_row(&rows, &w, ev.name(), ops),
+                        c_event(&rows, &w, ev.name(), ops),
+                    ) {
+                        ours.insert((
+                            r.line,
+                            r.role.clone(),
+                            r.side.clone(),
+                            r.from.clone(),
+                            r.ev.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let untested: Vec<String> = ours
+            .iter()
+            .filter(|(line, ..)| !fired.contains(line))
+            .map(|(line, role, side, from, ev)| {
+                (
+                    line,
+                    format!("{role} {side} {} {ev}", from.as_deref().unwrap_or("ANY")),
+                )
+            })
+            .filter(|(_, key)| !explained.contains(key))
+            .map(|(line, key)| format!("wsi-state.c:{line}: {key}"))
+            .collect();
+        assert!(
+            untested.is_empty(),
+            "rows npro can fire that C's suite never fires, and C's README does not explain:\n{}",
+            untested.join("\n")
+        );
+        assert!(ours.len() > 60, "npro fires only {} rows", ours.len());
+    }
+
     #[test]
     fn the_c_table_copy_has_rows_for_every_event_npro_has() {
         let rows = rows();

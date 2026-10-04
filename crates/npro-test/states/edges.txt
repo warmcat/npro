@@ -1,4 +1,5 @@
 LRS (none)/-:(zero) -> (none)/-:UNCONNECTED role_transition
+LRS (none)/-:(zero) -> h3/-:UNCONNECTED role_transition
 LRS (none)/-:(zero) -> listen/-:UNCONNECTED role_transition
 LRS (none)/-:(zero) -> netlink/-:UNCONNECTED role_transition
 LRS (none)/-:(zero) -> pipe/-:UNCONNECTED role_transition
@@ -6,6 +7,7 @@ LRS (none)/-:(zero) -> raw-file/-:UNCONNECTED role_transition
 LRS (none)/-:UNCONNECTED -> (none)/S:UNCONNECTED role_transition ev=SERVER_SIDE
 LRS (none)/-:UNCONNECTED -> h1/C:UNCONNECTED role_transition ev=CLIENT_BIND
 LRS (none)/-:UNCONNECTED -> mqtt/C:UNCONNECTED role_transition ev=CLIENT_BIND
+LRS (none)/-:UNCONNECTED -> quic/C:UNCONNECTED role_transition ev=CLIENT_BIND
 LRS (none)/-:UNCONNECTED -> raw-proxy/C:UNCONNECTED role_transition ev=CLIENT_BIND
 LRS (none)/-:UNCONNECTED -> raw-skt/C:UNCONNECTED role_transition ev=CLIENT_BIND
 LRS (none)/S:UNCONNECTED -> h1/S:HEADERS role_transition ev=ADOPTED
@@ -13,11 +15,19 @@ LRS (none)/S:UNCONNECTED -> h1/S:SSL_INIT role_transition ev=ADOPTED_TLS
 LRS (none)/S:UNCONNECTED -> h2/C:UNCONNECTED role_transition ev=MUX_INSERTED
 LRS (none)/S:UNCONNECTED -> h2/S:H2_AWAIT_PREFACE role_transition ev=H2_SELECTED
 LRS (none)/S:UNCONNECTED -> h2/S:UNCONNECTED role_transition ev=MUX_INSERTED
+LRS (none)/S:UNCONNECTED -> h3/C:ESTABLISHED role_transition ev=CONTROL_STREAM_OPENED
+LRS (none)/S:UNCONNECTED -> h3/S:ESTABLISHED role_transition ev=CONTROL_STREAM_OPENED
 LRS (none)/S:UNCONNECTED -> mqtt/C:UNCONNECTED role_transition ev=MUX_INSERTED
+LRS (none)/S:UNCONNECTED -> quic/C:ESTABLISHED role_transition ev=CONN_TAKEOVER
+LRS (none)/S:UNCONNECTED -> quic/C:UNCONNECTED role_transition ev=MUX_INSERTED
+LRS (none)/S:UNCONNECTED -> quic/S:ESTABLISHED role_transition ev=ADOPTED
+LRS (none)/S:UNCONNECTED -> quic/S:SSL_INIT role_transition ev=ADOPTED_TLS
+LRS (none)/S:UNCONNECTED -> quic/S:UNCONNECTED role_transition ev=MUX_INSERTED
 LRS (none)/S:UNCONNECTED -> raw-file/S:ESTABLISHED role_transition ev=ADOPTED
 LRS (none)/S:UNCONNECTED -> raw-proxy/S:ESTABLISHED role_transition ev=ADOPTED
 LRS (none)/S:UNCONNECTED -> raw-skt/S:ESTABLISHED role_transition ev=ADOPTED
 LRS (none)/S:UNCONNECTED -> raw-skt/S:SSL_INIT role_transition ev=ADOPTED_TLS
+LRS (none)/S:UNCONNECTED -> wt/C:ESTABLISHED role_transition ev=WT_STREAM
 LRS h1/C:DEAD_SOCKET -> h1/C:DEAD_SOCKET+told set_close ev=USER_TOLD
 LRS h1/C:DEAD_SOCKET+failed -> h1/C:DEAD_SOCKET+failed+unusable set_unusable
 LRS h1/C:DEAD_SOCKET+failed+unusable -> h1/C:DEAD_SOCKET+failed set_unusable
@@ -58,6 +68,8 @@ LRS h1/C:UNCONNECTED -> h1/C:H2_WAITING_TO_SEND_HEADERS set_state ev=QUEUED
 LRS h1/C:UNCONNECTED -> h1/C:WAITING_CONNECT set_transport ev=CONNECT_START
 LRS h1/C:UNCONNECTED -> h1/C:WAITING_DNS set_transport ev=DNS_START
 LRS h1/C:UNCONNECTED -> h2/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=MUX_STREAM_ADOPTED
+LRS h1/C:UNCONNECTED -> h3/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=MUX_STREAM_ADOPTED
+LRS h1/C:UNCONNECTED -> quic/C:UNCONNECTED role_transition ev=CLIENT_BIND
 LRS h1/C:UNCONNECTED+failed -> h1/C:UNCONNECTED+failed+closing set_close ev=CLOSE_ENTERED
 LRS h1/C:UNCONNECTED+failed -> h1/C:UNCONNECTED+failed+unusable set_unusable
 LRS h1/C:UNCONNECTED+failed+closing -> h1/C:DEAD_SOCKET+failed set_close ev=SOCKET_GONE
@@ -95,9 +107,11 @@ LRS h1/C:WAITING_SSL -> h2/C:H2_AWAIT_PREFACE role_transition ev=H2_SELECTED
 LRS h1/S:AWAITING_FILE_READ -> h1/S:AWAITING_FILE_READ+closing set_close ev=CLOSE_ENTERED
 LRS h1/S:AWAITING_FILE_READ -> h1/S:ISSUING_FILE set_state ev=FILE_READ_DONE
 LRS h1/S:AWAITING_FILE_READ+closing -> h1/S:SHUTDOWN set_close ev=CLOSE_STAGED
+LRS h1/S:AWAITING_SSL_ACCEPT -> h1/S:AWAITING_SSL_ACCEPT+closing set_close ev=CLOSE_ENTERED
 LRS h1/S:AWAITING_SSL_ACCEPT -> h1/S:AWAITING_SSL_ACCEPT+unusable set_unusable
 LRS h1/S:AWAITING_SSL_ACCEPT -> h1/S:HEADERS set_state ev=TRANSPORT_UP
 LRS h1/S:AWAITING_SSL_ACCEPT -> h1/S:SSL_ACK_PENDING set_transport ev=TLS_ACCEPT_PENDING
+LRS h1/S:AWAITING_SSL_ACCEPT+closing -> h1/S:SHUTDOWN set_close ev=CLOSE_STAGED
 LRS h1/S:AWAITING_SSL_ACCEPT+closing+unusable -> h1/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS h1/S:AWAITING_SSL_ACCEPT+unusable -> h1/S:AWAITING_SSL_ACCEPT+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h1/S:BODY -> h1/S:BODY+closing set_close ev=CLOSE_ENTERED
@@ -163,6 +177,7 @@ LRS h1/S:SSL_ACK_PENDING -> h1/S:SSL_ACK_PENDING+closing set_close ev=CLOSE_ENTE
 LRS h1/S:SSL_ACK_PENDING -> h1/S:SSL_ACK_PENDING+unusable set_unusable
 LRS h1/S:SSL_ACK_PENDING -> raw-skt/S:ESTABLISHED role_transition ev=RAW_UPGRADED
 LRS h1/S:SSL_ACK_PENDING+closing -> h1/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h1/S:SSL_ACK_PENDING+closing -> h1/S:SHUTDOWN set_close ev=CLOSE_STAGED
 LRS h1/S:SSL_ACK_PENDING+closing+unusable -> h1/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS h1/S:SSL_ACK_PENDING+unusable -> h1/S:SSL_ACK_PENDING+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h1/S:SSL_INIT -> h1/S:SSL_ACK_PENDING set_transport ev=TLS_ACCEPT_PENDING
@@ -186,10 +201,13 @@ LRS h2/C:DEAD_SOCKET+unusable -> h2/C:DEAD_SOCKET set_unusable
 LRS h2/C:DEAD_SOCKET+unusable -> h2/C:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
 LRS h2/C:ESTABLISHED -> h2/C:BODY set_state ev=BODY_BEGIN
 LRS h2/C:ESTABLISHED -> h2/C:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS h2/C:ESTABLISHED -> h2/C:ESTABLISHED+unusable set_unusable
 LRS h2/C:ESTABLISHED -> h2/C:IDLING set_state ev=LAST_STREAM_CLOSED
 LRS h2/C:ESTABLISHED -> h2/C:UNCONNECTED+failed set_transport ev=CONN_FAILED
 LRS h2/C:ESTABLISHED -> h2/C:UNCONNECTED+restarting set_transport ev=RETARGET
 LRS h2/C:ESTABLISHED+closing -> h2/C:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h2/C:ESTABLISHED+closing+unusable -> h2/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h2/C:ESTABLISHED+unusable -> h2/C:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h2/C:H2_AWAIT_PREFACE -> h2/C:H2_WAITING_TO_SEND_HEADERS set_state ev=H2_PREFACE_SENT
 LRS h2/C:H2_WAITING_TO_SEND_HEADERS -> h2/C:ESTABLISHED set_state ev=MUX_MIGRATED
 LRS h2/C:H2_WAITING_TO_SEND_HEADERS -> h2/C:H2_WAITING_TO_SEND_HEADERS+closing set_close ev=CLOSE_ENTERED
@@ -216,12 +234,9 @@ LRS h2/C:WAITING_SERVER_REPLY -> ws/Ce:ESTABLISHED role_transition ev=WS_UPGRADE
 LRS h2/C:WAITING_SERVER_REPLY+closing -> h2/C:DEAD_SOCKET set_close ev=SOCKET_GONE
 LRS h2/C:WAITING_SERVER_REPLY+closing+unusable -> h2/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS h2/C:WAITING_SERVER_REPLY+unusable -> h2/C:WAITING_SERVER_REPLY+closing+unusable set_close ev=CLOSE_ENTERED
-LRS h2/S:AWAITING_FILE_READ -> h2/S:AWAITING_FILE_READ+unusable set_unusable
 LRS h2/S:AWAITING_FILE_READ -> h2/S:DISCARD_BODY set_state ev=BODY_DISCARD
 LRS h2/S:AWAITING_FILE_READ -> h2/S:ISSUING_FILE set_state ev=FILE_READ_DONE
 LRS h2/S:AWAITING_FILE_READ -> h2/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
-LRS h2/S:AWAITING_FILE_READ+closing+unusable -> h2/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
-LRS h2/S:AWAITING_FILE_READ+unusable -> h2/S:AWAITING_FILE_READ+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h2/S:BODY -> h2/S:BODY+closing set_close ev=CLOSE_ENTERED
 LRS h2/S:BODY -> h2/S:DISCARD_BODY set_state ev=BODY_DISCARD
 LRS h2/S:BODY -> h2/S:ESTABLISHED set_state ev=BODY_COMPLETE
@@ -229,10 +244,8 @@ LRS h2/S:BODY -> h2/S:ISSUING_FILE set_state ev=FILE_BEGIN
 LRS h2/S:BODY -> h2/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
 LRS h2/S:BODY+closing -> h2/S:DEAD_SOCKET set_close ev=SOCKET_GONE
 LRS h2/S:DEAD_SOCKET -> h2/S:DEAD_SOCKET+told set_close ev=USER_TOLD
-LRS h2/S:DEAD_SOCKET -> h2/S:DEAD_SOCKET+unusable set_unusable
 LRS h2/S:DEAD_SOCKET+told -> h2/S:DEAD_SOCKET+told+unusable set_unusable
 LRS h2/S:DEAD_SOCKET+told+unusable -> h2/S:DEAD_SOCKET+told set_unusable
-LRS h2/S:DEAD_SOCKET+unusable -> h2/S:DEAD_SOCKET set_unusable
 LRS h2/S:DEAD_SOCKET+unusable -> h2/S:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
 LRS h2/S:DEFERRING_ACTION -> h2/S:DEFERRING_ACTION+closing set_close ev=CLOSE_ENTERED
 LRS h2/S:DEFERRING_ACTION -> h2/S:DEFERRING_ACTION+unusable set_unusable
@@ -243,6 +256,7 @@ LRS h2/S:DEFERRING_ACTION+unusable -> h2/S:DEFERRING_ACTION+closing+unusable set
 LRS h2/S:DISCARD_BODY -> h2/S:DISCARD_BODY+closing set_close ev=CLOSE_ENTERED
 LRS h2/S:DISCARD_BODY -> h2/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
 LRS h2/S:DISCARD_BODY+closing -> h2/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h2/S:DOING_TRANSACTION -> h2/S:BODY set_state ev=BODY_BEGIN
 LRS h2/S:DOING_TRANSACTION -> h2/S:DISCARD_BODY set_state ev=BODY_DISCARD
 LRS h2/S:DOING_TRANSACTION -> h2/S:DOING_TRANSACTION+closing set_close ev=CLOSE_ENTERED
 LRS h2/S:DOING_TRANSACTION -> h2/S:ISSUING_FILE set_state ev=FILE_BEGIN
@@ -262,11 +276,8 @@ LRS h2/S:ESTABLISHED+closing+unusable -> h2/S:DEAD_SOCKET+unusable set_close ev=
 LRS h2/S:ESTABLISHED+unusable -> h2/S:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h2/S:FLUSHING_BEFORE_CLOSE -> h2/S:DEAD_SOCKET set_close ev=SOCKET_GONE
 LRS h2/S:H2_AWAIT_PREFACE -> h2/S:H2_AWAIT_PREFACE+closing set_close ev=CLOSE_ENTERED
-LRS h2/S:H2_AWAIT_PREFACE -> h2/S:H2_AWAIT_PREFACE+unusable set_unusable
 LRS h2/S:H2_AWAIT_PREFACE -> h2/S:H2_AWAIT_SETTINGS set_state ev=H2_PREFACE_RX
 LRS h2/S:H2_AWAIT_PREFACE+closing -> h2/S:SHUTDOWN set_close ev=CLOSE_STAGED
-LRS h2/S:H2_AWAIT_PREFACE+closing+unusable -> h2/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
-LRS h2/S:H2_AWAIT_PREFACE+unusable -> h2/S:H2_AWAIT_PREFACE+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h2/S:H2_AWAIT_SETTINGS -> h2/S:ESTABLISHED set_state ev=H2_SETTINGS_ACKED
 LRS h2/S:HEADERS -> h2/S:DEFERRING_ACTION set_state ev=REQ_HDRS_COMPLETE
 LRS h2/S:HEADERS -> h2/S:DOING_TRANSACTION set_state ev=ACTION_BEGIN
@@ -296,10 +307,106 @@ LRS h2/S:TXN_COMPLETING+closing -> h2/S:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE
 LRS h2/S:TXN_COMPLETING+closing+unusable -> h2/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS h2/S:TXN_COMPLETING+unusable -> h2/S:TXN_COMPLETING+closing+unusable set_close ev=CLOSE_ENTERED
 LRS h2/S:UNCONNECTED -> h2/S:HEADERS set_state ev=STREAM_OPENED
+LRS h3/C:DEAD_SOCKET -> h3/C:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS h3/C:DEAD_SOCKET+failed -> h3/C:DEAD_SOCKET+failed+unusable set_unusable
+LRS h3/C:DEAD_SOCKET+failed+unusable -> h3/C:DEAD_SOCKET+failed set_unusable
+LRS h3/C:DEAD_SOCKET+restarting -> h3/C:DEAD_SOCKET+restarting+unusable set_unusable
+LRS h3/C:DEAD_SOCKET+restarting+unusable -> h1/C:UNCONNECTED role_transition ev=RESTART
+LRS h3/C:DEAD_SOCKET+told -> h3/C:DEAD_SOCKET+told+unusable set_unusable
+LRS h3/C:DEAD_SOCKET+told+unusable -> h3/C:DEAD_SOCKET+told set_unusable
+LRS h3/C:DEAD_SOCKET+unusable -> h3/C:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS h3/C:ESTABLISHED -> h3/C:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS h3/C:ESTABLISHED -> h3/C:ESTABLISHED+unusable set_unusable
+LRS h3/C:ESTABLISHED -> h3/C:UNCONNECTED+failed set_transport ev=CONN_FAILED
+LRS h3/C:ESTABLISHED -> h3/C:UNCONNECTED+restarting set_transport ev=RETARGET
+LRS h3/C:ESTABLISHED+closing -> h3/C:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h3/C:ESTABLISHED+closing -> h3/C:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
+LRS h3/C:ESTABLISHED+closing+unusable -> h3/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/C:ESTABLISHED+unusable -> h3/C:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/C:FLUSHING_BEFORE_CLOSE -> h3/C:FLUSHING_BEFORE_CLOSE+unusable set_unusable
+LRS h3/C:FLUSHING_BEFORE_CLOSE+unusable -> h3/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/C:H2_WAITING_TO_SEND_HEADERS -> h3/C:ISSUE_HTTP_BODY set_state ev=REQ_HDRS_SENT_BODY
+LRS h3/C:H2_WAITING_TO_SEND_HEADERS -> h3/C:UNCONNECTED+failed set_transport ev=CONN_FAILED
+LRS h3/C:H2_WAITING_TO_SEND_HEADERS -> h3/C:WAITING_SERVER_REPLY set_state ev=REQ_HDRS_SENT
+LRS h3/C:ISSUE_HTTP_BODY -> h3/C:ESTABLISHED set_state ev=RESP_HDRS
+LRS h3/C:ISSUE_HTTP_BODY -> h3/C:WAITING_SERVER_REPLY set_state ev=REQ_BODY_SENT
+LRS h3/C:UNCONNECTED+failed -> h3/C:UNCONNECTED+failed+closing set_close ev=CLOSE_ENTERED
+LRS h3/C:UNCONNECTED+failed+closing -> h3/C:DEAD_SOCKET+failed set_close ev=SOCKET_GONE
+LRS h3/C:UNCONNECTED+failed+closing+unusable -> h3/C:DEAD_SOCKET+failed+unusable set_close ev=SOCKET_GONE
+LRS h3/C:UNCONNECTED+failed+unusable -> h3/C:UNCONNECTED+failed+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/C:UNCONNECTED+restarting -> h3/C:UNCONNECTED+restarting+closing set_close ev=CLOSE_ENTERED
+LRS h3/C:UNCONNECTED+restarting+closing -> h3/C:DEAD_SOCKET+restarting set_close ev=SOCKET_GONE
+LRS h3/C:WAITING_SERVER_REPLY -> h3/C:ESTABLISHED set_state ev=RESP_HDRS
+LRS h3/C:WAITING_SERVER_REPLY -> h3/C:UNCONNECTED+failed set_transport ev=CONN_FAILED
+LRS h3/C:WAITING_SERVER_REPLY -> h3/C:WAITING_SERVER_REPLY+unusable set_unusable
+LRS h3/C:WAITING_SERVER_REPLY -> ws/Ce:ESTABLISHED role_transition ev=WS_UPGRADED
+LRS h3/C:WAITING_SERVER_REPLY -> wt/C:ESTABLISHED role_transition ev=WT_SESSION
+LRS h3/C:WAITING_SERVER_REPLY+closing+unusable -> h3/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/C:WAITING_SERVER_REPLY+unusable -> h3/C:UNCONNECTED+failed+unusable set_transport ev=CONN_FAILED
+LRS h3/C:WAITING_SERVER_REPLY+unusable -> h3/C:WAITING_SERVER_REPLY+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:AWAITING_FILE_READ -> h3/S:AWAITING_FILE_READ+unusable set_unusable
+LRS h3/S:AWAITING_FILE_READ -> h3/S:ISSUING_FILE set_state ev=FILE_READ_DONE
+LRS h3/S:AWAITING_FILE_READ+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:AWAITING_FILE_READ+unusable -> h3/S:AWAITING_FILE_READ+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:BODY -> h3/S:BODY+unusable set_unusable
+LRS h3/S:BODY -> h3/S:ESTABLISHED set_state ev=BODY_COMPLETE
+LRS h3/S:BODY -> h3/S:ISSUING_FILE set_state ev=FILE_BEGIN
+LRS h3/S:BODY -> h3/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
+LRS h3/S:BODY+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:BODY+unusable -> h3/S:BODY+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:DEAD_SOCKET -> h3/S:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS h3/S:DEAD_SOCKET+told -> h3/S:DEAD_SOCKET+told+unusable set_unusable
+LRS h3/S:DEAD_SOCKET+told+unusable -> h3/S:DEAD_SOCKET+told set_unusable
+LRS h3/S:DEAD_SOCKET+unusable -> h3/S:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS h3/S:DEFERRING_ACTION -> h3/S:ESTABLISHED set_state ev=ACTION_DEFERRED_RUN
+LRS h3/S:DISCARD_BODY -> h3/S:DISCARD_BODY+closing set_close ev=CLOSE_ENTERED
+LRS h3/S:DISCARD_BODY+closing -> h3/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h3/S:DOING_TRANSACTION -> h3/S:BODY set_state ev=BODY_BEGIN
+LRS h3/S:DOING_TRANSACTION -> h3/S:DOING_TRANSACTION+closing set_close ev=CLOSE_ENTERED
+LRS h3/S:DOING_TRANSACTION -> h3/S:DOING_TRANSACTION+unusable set_unusable
+LRS h3/S:DOING_TRANSACTION -> h3/S:ISSUING_FILE set_state ev=FILE_BEGIN
+LRS h3/S:DOING_TRANSACTION -> h3/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
+LRS h3/S:DOING_TRANSACTION+closing -> h3/S:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
+LRS h3/S:DOING_TRANSACTION+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:DOING_TRANSACTION+unusable -> h3/S:DOING_TRANSACTION+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:ESTABLISHED -> h3/S:DOING_TRANSACTION set_state ev=ACTION_BEGIN
+LRS h3/S:ESTABLISHED -> h3/S:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS h3/S:ESTABLISHED -> h3/S:ESTABLISHED+unusable set_unusable
+LRS h3/S:ESTABLISHED -> h3/S:ISSUING_FILE set_state ev=FILE_BEGIN
+LRS h3/S:ESTABLISHED -> h3/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
+LRS h3/S:ESTABLISHED -> ws/Se:ESTABLISHED role_transition ev=WS_UPGRADED
+LRS h3/S:ESTABLISHED -> wt/S:ESTABLISHED role_transition ev=WT_SESSION
+LRS h3/S:ESTABLISHED+closing -> h3/S:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
+LRS h3/S:ESTABLISHED+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:ESTABLISHED+unusable -> h3/S:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:FLUSHING_BEFORE_CLOSE -> h3/S:FLUSHING_BEFORE_CLOSE+unusable set_unusable
+LRS h3/S:FLUSHING_BEFORE_CLOSE+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:HEADERS -> h3/S:DEFERRING_ACTION set_state ev=REQ_HDRS_COMPLETE
+LRS h3/S:HEADERS -> h3/S:HEADERS+closing set_close ev=CLOSE_ENTERED
+LRS h3/S:HEADERS -> h3/S:HEADERS+unusable set_unusable
+LRS h3/S:HEADERS -> wt/S:ESTABLISHED role_transition ev=WT_STREAM
+LRS h3/S:HEADERS+closing -> h3/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS h3/S:HEADERS+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:HEADERS+unusable -> h3/S:HEADERS+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:ISSUING_FILE -> h3/S:AWAITING_FILE_READ set_state ev=FILE_READ_QUEUED
+LRS h3/S:ISSUING_FILE -> h3/S:ESTABLISHED set_state ev=FILE_COMPLETE
+LRS h3/S:ISSUING_FILE -> h3/S:ISSUING_FILE+unusable set_unusable
+LRS h3/S:ISSUING_FILE -> h3/S:TXN_COMPLETING set_state ev=TXN_COMPLETING
+LRS h3/S:ISSUING_FILE+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:ISSUING_FILE+unusable -> h3/S:ISSUING_FILE+closing+unusable set_close ev=CLOSE_ENTERED
+LRS h3/S:TXN_COMPLETING -> h3/S:DISCARD_BODY set_state ev=BODY_DISCARD
+LRS h3/S:TXN_COMPLETING -> h3/S:TXN_COMPLETING+closing set_close ev=CLOSE_ENTERED
+LRS h3/S:TXN_COMPLETING -> h3/S:TXN_COMPLETING+unusable set_unusable
+LRS h3/S:TXN_COMPLETING+closing -> h3/S:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
+LRS h3/S:TXN_COMPLETING+closing+unusable -> h3/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS h3/S:TXN_COMPLETING+unusable -> h3/S:TXN_COMPLETING+closing+unusable set_close ev=CLOSE_ENTERED
 LRS listen/-:DEAD_SOCKET -> listen/-:DEAD_SOCKET+unusable set_unusable
 LRS listen/-:DEAD_SOCKET+unusable -> listen/-:DEAD_SOCKET set_unusable
 LRS listen/-:UNCONNECTED -> listen/-:UNCONNECTED+closing set_close ev=CLOSE_ENTERED
+LRS listen/-:UNCONNECTED -> listen/-:UNCONNECTED+unusable set_unusable
 LRS listen/-:UNCONNECTED+closing -> listen/-:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS listen/-:UNCONNECTED+closing+unusable -> listen/-:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS listen/-:UNCONNECTED+unusable -> listen/-:UNCONNECTED+closing+unusable set_close ev=CLOSE_ENTERED
 LRS mqtt/C:DEAD_SOCKET -> mqtt/C:DEAD_SOCKET+told set_close ev=USER_TOLD
 LRS mqtt/C:DEAD_SOCKET -> mqtt/C:DEAD_SOCKET+unusable set_unusable
 LRS mqtt/C:DEAD_SOCKET+told -> mqtt/C:DEAD_SOCKET+told+unusable set_unusable
@@ -336,6 +443,56 @@ LRS pipe/-:DEAD_SOCKET -> pipe/-:DEAD_SOCKET+unusable set_unusable
 LRS pipe/-:DEAD_SOCKET+unusable -> pipe/-:DEAD_SOCKET set_unusable
 LRS pipe/-:UNCONNECTED -> pipe/-:UNCONNECTED+closing set_close ev=CLOSE_ENTERED
 LRS pipe/-:UNCONNECTED+closing -> pipe/-:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS quic/C:DEAD_SOCKET -> quic/C:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS quic/C:DEAD_SOCKET+restarting -> quic/C:DEAD_SOCKET+restarting+unusable set_unusable
+LRS quic/C:DEAD_SOCKET+restarting+unusable -> h1/C:UNCONNECTED role_transition ev=RESTART
+LRS quic/C:DEAD_SOCKET+told -> quic/C:DEAD_SOCKET+told+unusable set_unusable
+LRS quic/C:DEAD_SOCKET+told+unusable -> quic/C:DEAD_SOCKET+told set_unusable
+LRS quic/C:DEAD_SOCKET+unusable -> quic/C:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS quic/C:ESTABLISHED -> h3/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=ALPN_DONE
+LRS quic/C:ESTABLISHED -> quic/C:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS quic/C:ESTABLISHED -> quic/C:ESTABLISHED+unusable set_unusable
+LRS quic/C:ESTABLISHED -> quic/C:IDLING set_state ev=LAST_STREAM_CLOSED
+LRS quic/C:ESTABLISHED+closing -> quic/C:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS quic/C:ESTABLISHED+closing+unusable -> quic/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS quic/C:ESTABLISHED+unusable -> quic/C:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
+LRS quic/C:H1C_ISSUE_HANDSHAKE2 -> h3/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=MUX_STREAM_ADOPTED
+LRS quic/C:H2_WAITING_TO_SEND_HEADERS -> quic/C:H1C_ISSUE_HANDSHAKE2 set_state ev=REQ_ISSUE
+LRS quic/C:IDLING -> quic/C:ESTABLISHED set_state ev=CONN_REUSED
+LRS quic/C:IDLING -> quic/C:IDLING+closing set_close ev=CLOSE_ENTERED
+LRS quic/C:IDLING+closing -> quic/C:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS quic/C:UNCONNECTED -> h3/C:ESTABLISHED role_transition ev=STREAM_OPENED
+LRS quic/C:UNCONNECTED -> h3/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=MUX_STREAM_ADOPTED
+LRS quic/C:UNCONNECTED -> quic/C:H2_WAITING_TO_SEND_HEADERS set_state ev=QUEUED
+LRS quic/C:UNCONNECTED -> quic/C:WAITING_DNS set_transport ev=DNS_START
+LRS quic/C:UNCONNECTED+restarting -> quic/C:UNCONNECTED+restarting+closing set_close ev=CLOSE_ENTERED
+LRS quic/C:UNCONNECTED+restarting+closing -> quic/C:DEAD_SOCKET+restarting set_close ev=SOCKET_GONE
+LRS quic/C:WAITING_CONNECT -> quic/C:WAITING_SSL set_transport ev=TLS_START
+LRS quic/C:WAITING_DNS -> quic/C:WAITING_CONNECT set_transport ev=CONNECT_START
+LRS quic/C:WAITING_SSL -> h3/C:H2_WAITING_TO_SEND_HEADERS role_transition ev=ALPN_DONE
+LRS quic/C:WAITING_SSL -> quic/C:ESTABLISHED set_state ev=TRANSPORT_UP
+LRS quic/C:WAITING_SSL -> quic/C:UNCONNECTED+restarting set_transport ev=RETARGET
+LRS quic/C:WAITING_SSL -> quic/C:WAITING_CONNECT set_transport ev=CONNECT_START
+LRS quic/S:DEAD_SOCKET -> quic/S:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS quic/S:DEAD_SOCKET -> quic/S:DEAD_SOCKET+unusable set_unusable
+LRS quic/S:DEAD_SOCKET+told -> quic/S:DEAD_SOCKET+told+unusable set_unusable
+LRS quic/S:DEAD_SOCKET+told+unusable -> quic/S:DEAD_SOCKET+told set_unusable
+LRS quic/S:DEAD_SOCKET+unusable -> quic/S:DEAD_SOCKET set_unusable
+LRS quic/S:DEAD_SOCKET+unusable -> quic/S:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS quic/S:ESTABLISHED -> h3/S:HEADERS role_transition ev=ALPN_DONE
+LRS quic/S:ESTABLISHED -> quic/S:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS quic/S:ESTABLISHED -> quic/S:ESTABLISHED+unusable set_unusable
+LRS quic/S:ESTABLISHED+closing -> quic/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS quic/S:ESTABLISHED+closing+unusable -> quic/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS quic/S:ESTABLISHED+unusable -> quic/S:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
+LRS quic/S:SSL_INIT -> h3/S:HEADERS role_transition ev=ALPN_DONE
+LRS quic/S:SSL_INIT -> quic/S:ESTABLISHED set_state ev=TRANSPORT_UP
+LRS quic/S:SSL_INIT -> quic/S:SSL_INIT+closing set_close ev=CLOSE_ENTERED
+LRS quic/S:SSL_INIT -> quic/S:SSL_INIT+unusable set_unusable
+LRS quic/S:SSL_INIT+closing -> quic/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS quic/S:SSL_INIT+closing+unusable -> quic/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS quic/S:SSL_INIT+unusable -> quic/S:SSL_INIT+closing+unusable set_close ev=CLOSE_ENTERED
+LRS quic/S:UNCONNECTED -> h3/S:HEADERS role_transition ev=STREAM_OPENED
 LRS raw-file/-:ESTABLISHED -> raw-file/-:ESTABLISHED+unusable set_unusable
 LRS raw-file/-:ESTABLISHED+unusable -> raw-file/-:ESTABLISHED set_unusable
 LRS raw-file/-:UNCONNECTED -> raw-file/-:ESTABLISHED role_transition ev=ADOPTED
@@ -407,9 +564,6 @@ LRS raw-skt/S:FLUSHING_BEFORE_CLOSE -> raw-skt/S:FLUSHING_BEFORE_CLOSE+unusable 
 LRS raw-skt/S:FLUSHING_BEFORE_CLOSE+unusable -> raw-skt/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS raw-skt/S:SSL_ACK_PENDING -> raw-skt/S:AWAITING_SSL_ACCEPT set_transport ev=TLS_ACCEPT_QUEUED
 LRS raw-skt/S:SSL_ACK_PENDING -> raw-skt/S:ESTABLISHED set_state ev=TRANSPORT_UP
-LRS raw-skt/S:SSL_ACK_PENDING -> raw-skt/S:SSL_ACK_PENDING+unusable set_unusable
-LRS raw-skt/S:SSL_ACK_PENDING+closing+unusable -> raw-skt/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
-LRS raw-skt/S:SSL_ACK_PENDING+unusable -> raw-skt/S:SSL_ACK_PENDING+closing+unusable set_close ev=CLOSE_ENTERED
 LRS raw-skt/S:SSL_INIT -> raw-skt/S:SSL_ACK_PENDING set_transport ev=TLS_ACCEPT_PENDING
 LRS ws/C:AWAITING_CLOSE_ACK -> ws/C:DEAD_SOCKET set_close ev=SOCKET_GONE
 LRS ws/C:DEAD_SOCKET -> ws/C:DEAD_SOCKET+told set_close ev=USER_TOLD
@@ -428,7 +582,9 @@ LRS ws/C:RETURNED_CLOSE -> ws/C:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
 LRS ws/C:WAITING_TO_SEND_CLOSE -> ws/C:AWAITING_CLOSE_ACK set_close ev=WS_CLOSE_SENT
 LRS ws/C:WAITING_TO_SEND_CLOSE -> ws/C:WAITING_TO_SEND_CLOSE+unusable set_unusable
 LRS ws/C:WAITING_TO_SEND_CLOSE+unusable -> ws/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS ws/Ce:AWAITING_CLOSE_ACK -> ws/Ce:AWAITING_CLOSE_ACK+unusable set_unusable
 LRS ws/Ce:AWAITING_CLOSE_ACK -> ws/Ce:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS ws/Ce:AWAITING_CLOSE_ACK+unusable -> ws/Ce:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS ws/Ce:DEAD_SOCKET -> ws/Ce:DEAD_SOCKET+told set_close ev=USER_TOLD
 LRS ws/Ce:DEAD_SOCKET+told -> ws/Ce:DEAD_SOCKET+told+unusable set_unusable
 LRS ws/Ce:DEAD_SOCKET+told+unusable -> ws/Ce:DEAD_SOCKET+told set_unusable
@@ -468,7 +624,9 @@ LRS ws/S:SHUTDOWN+unusable -> ws/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS ws/S:WAITING_TO_SEND_CLOSE -> ws/S:AWAITING_CLOSE_ACK set_close ev=WS_CLOSE_SENT
 LRS ws/S:WAITING_TO_SEND_CLOSE -> ws/S:WAITING_TO_SEND_CLOSE+unusable set_unusable
 LRS ws/S:WAITING_TO_SEND_CLOSE+unusable -> ws/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS ws/Se:AWAITING_CLOSE_ACK -> ws/Se:AWAITING_CLOSE_ACK+unusable set_unusable
 LRS ws/Se:AWAITING_CLOSE_ACK -> ws/Se:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS ws/Se:AWAITING_CLOSE_ACK+unusable -> ws/Se:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
 LRS ws/Se:DEAD_SOCKET -> ws/Se:DEAD_SOCKET+told set_close ev=USER_TOLD
 LRS ws/Se:DEAD_SOCKET+told -> ws/Se:DEAD_SOCKET+told+unusable set_unusable
 LRS ws/Se:DEAD_SOCKET+told+unusable -> ws/Se:DEAD_SOCKET+told set_unusable
@@ -485,3 +643,21 @@ LRS ws/Se:RETURNED_CLOSE -> ws/Se:DEAD_SOCKET set_close ev=SOCKET_GONE
 LRS ws/Se:RETURNED_CLOSE -> ws/Se:FLUSHING_BEFORE_CLOSE set_close ev=CLOSE_FLUSH
 LRS ws/Se:WAITING_TO_SEND_CLOSE -> ws/Se:AWAITING_CLOSE_ACK set_close ev=WS_CLOSE_SENT
 LRS ws/Se:WAITING_TO_SEND_CLOSE -> ws/Se:RETURNED_CLOSE set_close ev=WS_PEER_CLOSE
+LRS wt/C:DEAD_SOCKET -> wt/C:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS wt/C:DEAD_SOCKET+told -> wt/C:DEAD_SOCKET+told+unusable set_unusable
+LRS wt/C:DEAD_SOCKET+told+unusable -> wt/C:DEAD_SOCKET+told set_unusable
+LRS wt/C:DEAD_SOCKET+unusable -> wt/C:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS wt/C:ESTABLISHED -> wt/C:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS wt/C:ESTABLISHED -> wt/C:ESTABLISHED+unusable set_unusable
+LRS wt/C:ESTABLISHED+closing -> wt/C:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS wt/C:ESTABLISHED+closing+unusable -> wt/C:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS wt/C:ESTABLISHED+unusable -> wt/C:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
+LRS wt/S:DEAD_SOCKET -> wt/S:DEAD_SOCKET+told set_close ev=USER_TOLD
+LRS wt/S:DEAD_SOCKET+told -> wt/S:DEAD_SOCKET+told+unusable set_unusable
+LRS wt/S:DEAD_SOCKET+told+unusable -> wt/S:DEAD_SOCKET+told set_unusable
+LRS wt/S:DEAD_SOCKET+unusable -> wt/S:DEAD_SOCKET+told+unusable set_close ev=USER_TOLD
+LRS wt/S:ESTABLISHED -> wt/S:ESTABLISHED+closing set_close ev=CLOSE_ENTERED
+LRS wt/S:ESTABLISHED -> wt/S:ESTABLISHED+unusable set_unusable
+LRS wt/S:ESTABLISHED+closing -> wt/S:DEAD_SOCKET set_close ev=SOCKET_GONE
+LRS wt/S:ESTABLISHED+closing+unusable -> wt/S:DEAD_SOCKET+unusable set_close ev=SOCKET_GONE
+LRS wt/S:ESTABLISHED+unusable -> wt/S:ESTABLISHED+closing+unusable set_close ev=CLOSE_ENTERED
