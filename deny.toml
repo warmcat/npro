@@ -38,6 +38,7 @@ allow = [
 	# the workspace
 	"npro",
 	"npro-core",
+	"npro-h1",
 	"npro-fuzz",
 	"npro-test",
 
