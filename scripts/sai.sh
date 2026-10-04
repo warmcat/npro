@@ -96,7 +96,9 @@ miri)
 oracle)
 	# A C lws checkout of main-dev kept between jobs, built with what
 	# every transcript needs: fault injection for the seeded random,
-	# extensions and zlib for the permessage-deflate ones
+	# extensions and zlib for the permessage-deflate ones, and a tls
+	# library, whose genhash the digest auth ones need.  The tls is
+	# openssl, the default; h3 would need gnutls too, and records nothing.
 	c="${LWS_ORACLE:-$HOME/lws-oracle}"
 	require_cmd git "dnf install git"
 	require_cmd cmake "dnf install cmake"
@@ -104,6 +106,8 @@ oracle)
 	require_cmd cc "dnf install gcc"
 	require_run "zlib headers" "dnf install zlib-devel" \
 		sh -c 'echo "#include <zlib.h>" | cc -E - >/dev/null'
+	require_run "openssl headers" "dnf install openssl-devel" \
+		sh -c 'echo "#include <openssl/ssl.h>" | cc -E - >/dev/null'
 	require_done
 	if [ ! -d "$c/.git" ]; then
 		git clone --depth 50 -b main-dev \
@@ -114,7 +118,8 @@ oracle)
 	echo "== C lws $(git -C "$c" log -1 --format='%h %s')"
 
 	cmake -S "$c" -B "$c/build-oracle" -DCMAKE_BUILD_TYPE=DEBUG \
-		-DLWS_WITH_SSL=OFF -DLWS_WITH_MINIMAL_EXAMPLES=ON \
+		-DLWS_WITH_SSL=ON -DLWS_WITH_HTTP3=OFF \
+		-DLWS_WITH_MINIMAL_EXAMPLES=ON \
 		-DLWS_WITH_SYS_FAULT_INJECTION=ON -DLWS_WITHOUT_EXTENSIONS=OFF \
 		-DLWS_WITH_ZLIB=ON
 	cmake --build "$c/build-oracle" --target lws-api-test-sansio -j "$jobs"
@@ -129,8 +134,9 @@ oracle)
 		echo "== the transcripts match C $(git -C "$c" log -1 --format=%h)"
 		exit 0
 	fi
-	echo "C's transcripts moved since $(cut -c1-12 "$ours/C-COMMIT"):"
-	echo "sync them with scripts/sync-c-oracle.sh and say why in the commit"
+	echo "C's transcripts differ from those of $(cut -c1-12 "$ours/C-COMMIT"):"
+	echo "if C changed them, sync them with scripts/sync-c-oracle.sh and say"
+	echo "why in the commit; if C did not, this build lacks an option they need"
 	exit 1
 	;;
 

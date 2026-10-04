@@ -101,7 +101,7 @@ cargo +nightly miri setup --target i686-unknown-linux-gnu
 and, as root, for the C build `c-oracle` does:
 
 ```sh
-dnf install git cmake make gcc zlib-devel
+dnf install git cmake make gcc zlib-devel openssl-devel
 ```
 
 Miri builds a standard library for each target it interprets.
