@@ -24,7 +24,10 @@ The protocol crates' targets start from the C library's corpora
 - `h1-response` and `chunked`: some of `crates/npro-test/h1/responses/`
   and `chunked/`;
 - `ws-server`: C's `fuzz/fuzz-ws/seeds`, each behind a control byte of 0,
-  named as there.
+  named as there;
+- `ws-client`: C has no client corpus, so what the server sent after the
+  101 in each of the `ws-client-*` transcripts but the pmd ones, behind a
+  control byte of 0, named for the transcript.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

@@ -232,6 +232,11 @@ fn ws_server() {
 }
 
 #[test]
+fn ws_client() {
+    smoke(Target::WsClient, seeded).unwrap();
+}
+
+#[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
     let tested = [
@@ -243,6 +248,7 @@ fn every_target_has_a_smoke_test() {
         "h1-response",
         "chunked",
         "ws-server",
+        "ws-client",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

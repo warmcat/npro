@@ -26,6 +26,7 @@ Fuzzing runs in three places:
 | `h1-response` | `npro_h1::head` as a client | as `h1-request` |
 | `chunked` | `npro_h1::chunked::Dechunk` | a second reading of RFC 9112 7.1 with C's bounds, written apart from the decoder: the same data, ending at the same byte, or refused, in one piece and in pieces |
 | `ws-server` | `npro_ws::conn::Ws` as a server, after the upgrade, as C's `fuzz-ws` | in one piece and in pieces, the same messages, pongs and peer's close handed to the application, the same frames written and the same close; where text turns out not to be UTF-8, how much of its good start was handed over may differ with the split, the one only starting the other.  Every call takes something; a message's pieces say where it starts; nothing follows the peer's close; a whole text message is UTF-8 by `core::str`; what is written is whole, final, unmasked frames, a close last |
+| `ws-client` | `npro_ws::conn::Ws` as a client, after the upgrade | as `ws-server`, from the client's side: what it writes is masked, with a fixed mask from the harness |
 
 A target that splits its input to feed it in pieces takes the split from
 the input's first byte, so libFuzzer explores the split like the rest of

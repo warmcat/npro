@@ -75,6 +75,13 @@ test  = false
 doc   = false
 bench = false
 
+[[bin]]
+name  = "ws-client"
+path  = "fuzz_targets/ws_client.rs"
+test  = false
+doc   = false
+bench = false
+
 [lints.rust]
 unsafe_code     = "forbid"
 unexpected_cfgs = "deny"
