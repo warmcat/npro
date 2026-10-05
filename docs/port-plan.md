@@ -747,13 +747,43 @@ byte for byte, four bytes at a time, with C's echo app: all of
 `-huge-frame`.  The fuzz target `ws-server` is seeded from C's
 `fuzz/fuzz-ws/seeds`.
 
-Not yet: the client half (its handshake, masking with a mask drawn per
-frame, the client's side of the parser, and the `ws-client-*`
-transcripts) comes next; nothing here has time, so there are no close
-deadlines and no keepalive pings; the frame maximum is C's fixed 256 MiB,
+**The client half (done, 2026-10-05)**: `handshake::ClientKey` is C's
+`lws_generate_client_ws_handshake()` and `lws_client_ws_upgrade()`: a
+key of 16 bytes drawn in one draw, the request's upgrade lines in C's
+order, which the h1 client's request carries in place of `connection:
+close` (`npro_h1::client::Connection::Upgrade`, after which the final
+response is handed over unframed), and C's checks of the response in C's
+order: a 101, an accept, `Upgrade: websocket`, `upgrade` among the
+`Connection` tokens, a subprotocol, if named, that was offered, no
+extension, and the key's accept.  `conn::Ws` is now one parser for both
+ends, a client's `Ws::client` masking each frame with a mask drawn when
+the frame is begun, and checking each end's rules in its C parser's order
+("srv mask", "bad fin", the client taking 1012 to 1015 from a server).
+After a refusal, as C, the rest of the read is dropped, and once our close
+has gone, whatever comes ends the connection.
+`crates/npro-test/tests/ws_client_replay.rs` replays, byte for byte, with
+C's seeded random and C's `callback_client`, `ws-client`,
+`ws-client-interim`, `ws-client-ping-close`, `ws-client-huge-frame`,
+`ws-client-rsv1-no-ext` and `ws-client-rsv2`: the request, every masked
+frame, the app's messages and where C closed.  The fuzz target `ws-client`
+is seeded from those transcripts, C having no client corpus.
+
+Porting it found one difference kept from C: C's client takes any
+`Connection` token that starts `upgrade` (it compares only the token's
+length of it), so `Connection: up` passes; npro takes only `upgrade`.
+
+**Exit check, met**: `ws-client` (seeded) and `h1-ws-server` replay byte
+for byte, as do the new ws transcripts but the pmd ones (phase 1f) and
+`ws-client-digest-retry` (digest auth); the fuzz targets are seeded from
+`fuzz/fuzz-ws/seeds` and the client transcripts.
+
+Not yet: nothing here has time, so there are no close deadlines and no
+keepalive pings; the application cannot yet begin a close of its own with
+a code, only close once flushed; the frame maximum is C's fixed 256 MiB,
 not configured, and there is no message maximum; the h1 server does not
 yet answer an unknown `Upgrade` with C's 403, or an upgrade with a body
-with its 400; and a message's pieces are the application's to gather.
+with its 400; a message's pieces are the application's to gather; and an
+application's message goes as one final frame.
 
 ### Phase 1f: permessage-deflate (feature `pmd`)
 
