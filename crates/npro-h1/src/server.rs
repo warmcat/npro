@@ -25,16 +25,13 @@
 use crate::chunked::{Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
 use crate::head::{self, Answer, Head, Progress, Refused, Side, Version};
+use crate::own::Own;
 use crate::table::{CapacityTooLarge, HeaderTable};
 use crate::token::Token;
 
 /// The most a request body may be unless configured: C's default
 /// `max_http_body_size`.
 pub const DEFAULT_MAX_BODY: u64 = 100 * 1024 * 1024;
-
-/// The most bytes a response head the connection writes may have, its
-/// status line and headers, or a status page with them.
-pub const MAX_OWN: usize = 512;
 
 /// How a server takes its requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,87 +127,7 @@ pub struct Response<'a> {
     pub content_length: Option<u64>,
 }
 
-/// Why an answer cannot be given.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RespondError {
-    /// There is no request to answer, or it is answered already.
-    NotNow,
-    /// The head does not fit in [`MAX_OWN`].
-    TooLong,
-}
-
-impl core::fmt::Display for RespondError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::NotNow => "no request to answer",
-            Self::TooLong => "the response head is too long",
-        })
-    }
-}
-
-impl core::error::Error for RespondError {}
-
-/// Bytes the connection writes itself, and how many of them have gone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Own {
-    buf: [u8; MAX_OWN],
-    len: usize,
-    sent: usize,
-}
-
-impl Own {
-    const fn new() -> Self {
-        Self {
-            buf: [0; MAX_OWN],
-            len: 0,
-            sent: 0,
-        }
-    }
-
-    fn push(&mut self, b: &[u8]) -> Result<(), RespondError> {
-        let end = self.len.checked_add(b.len()).ok_or(RespondError::TooLong)?;
-        let dst = self
-            .buf
-            .get_mut(self.len..end)
-            .ok_or(RespondError::TooLong)?;
-        dst.copy_from_slice(b);
-        self.len = end;
-        Ok(())
-    }
-
-    fn push_u64(&mut self, v: u64) -> Result<(), RespondError> {
-        let mut d = [0u8; 20];
-        let mut n = d.len();
-        let mut v = v;
-        loop {
-            n = n.saturating_sub(1);
-            if let Some(slot) = d.get_mut(n) {
-                // v % 10 < 10
-                *slot = b'0'.saturating_add(u8::try_from(v % 10).unwrap_or(0));
-            }
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        self.push(d.get(n..).unwrap_or_default())
-    }
-
-    const fn pending(&self) -> bool {
-        self.sent < self.len
-    }
-
-    /// Writes what is left into `out`, returning how much.
-    fn drain(&mut self, out: &mut [u8]) -> usize {
-        let rest = self.buf.get(self.sent..self.len).unwrap_or_default();
-        let n = rest.len().min(out.len());
-        if let (Some(d), Some(s)) = (out.get_mut(..n), rest.get(..n)) {
-            d.copy_from_slice(s);
-        }
-        self.sent = self.sent.saturating_add(n);
-        n
-    }
-}
+pub use crate::own::{MAX_OWN, RespondError};
 
 /// How the request's body is framed, and how far it has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
