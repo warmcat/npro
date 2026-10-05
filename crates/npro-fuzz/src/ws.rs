@@ -1,14 +1,20 @@
 //! The ws targets: a server's frame parser, as C's `fuzz-ws` has it, after
-//! an upgrade, and a client's.
+//! an upgrade, and a client's, and a server's with permessage-deflate, as
+//! C's `fuzz-ws-pmd`.
 
 use npro_core::random::{Random, Unavailable};
 use npro_ws::conn::{Close, Event, Kind, Role, Side, Ws};
+use npro_ws::pmd::Params;
 
 use crate::targets::{Pieces, control, finding};
 
 /// The most a piece is unmasked into: the fuzzer's input is copied here,
 /// since the parser unmasks where the bytes lie.
 const MAX_INPUT: usize = 64 * 1024;
+
+/// The most a message may inflate to in `ws-pmd`: small, so a zip bomb is
+/// within the fuzzer's reach, where C's is 256MiB.
+const FUZZ_MAX_MESSAGE: u64 = 1 << 20;
 
 /// The mask a client's frames are written with: not zero, so masking is
 /// done, and fixed, so a run is its input's alone.
@@ -68,13 +74,26 @@ fn run<'a, P: Role>(
         buf.clear();
         buf.extend_from_slice(piece);
         let mut at = 0usize;
-        while let Some(input) = buf.get_mut(at..).filter(|i| !i.is_empty()) {
+        // calls with nothing to take that gave nothing, while it said it
+        // had more to give
+        let mut idle = 0u8;
+        while let Some(input) = buf.get_mut(at..) {
+            let draining = input.is_empty();
+            if draining && !ws.rx_pending() {
+                break;
+            }
+            let len = input.len();
             let rx = ws.rx(input);
-            if rx.consumed == 0 {
-                finding(
-                    target,
-                    format_args!("{how}: took none of {} bytes", input.len()),
-                );
+            if rx.consumed == 0 && rx.event.is_none() && !draining {
+                finding(target, format_args!("{how}: took none of {len} bytes"));
+            }
+            if draining && rx.event.is_none() {
+                idle = idle.saturating_add(1);
+                if idle > 2 {
+                    finding(target, format_args!("{how}: pending, but gives nothing"));
+                }
+            } else {
+                idle = 0;
             }
             at = at.saturating_add(rx.consumed);
             let Some(ev) = rx.event else { continue };
@@ -204,6 +223,14 @@ fn written(
     frames
 }
 
+/// Whether what was written is the close refusing text that is not UTF-8.
+fn refused_text(sent: &[(u8, Vec<u8>)]) -> bool {
+    matches!(
+        sent.first(),
+        Some((0x8, p)) if p.get(..2) == Some(&1007u16.to_be_bytes()[..])
+    )
+}
+
 /// The text message a run leaves open, empty if none; `None` for binary.
 fn open_text(r: &Run) -> Option<&[u8]> {
     match &r.open {
@@ -213,14 +240,31 @@ fn open_text(r: &Run) -> Option<&[u8]> {
     }
 }
 
-/// Whether two runs leave the same message open.  Text is handed over a
-/// piece at a time once each piece checks out, so where it turns out not to
-/// be UTF-8, `bad_utf8`, how much of its good start went first depends on
-/// the split: then, and only then, one run's open message need only start
-/// the other's.
-fn opens_agree(a: &Run, b: &Run, bad_utf8: bool) -> bool {
+/// How far two runs may differ in the message they leave open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// As it is handed over, a piece as it comes: the same.
+    Plain,
+    /// Inflated: how far the inflater gets with the input it has depends
+    /// on where that input stops, so one may only start the other.  The
+    /// messages that end are compared whole.
+    Deflated,
+}
+
+/// Whether two runs leave the same message open.  A message is handed
+/// over a piece at a time as it comes, so where it turns out not to be
+/// UTF-8, `bad_utf8`, or the connection is dropped partway, as a deflated
+/// message that does not inflate drops it, how much of its start went first
+/// depends on the split: then, and with `open` deflated, only then, one
+/// run's open message need only start the other's.
+fn opens_agree(a: &Run, b: &Run, bad_utf8: bool, open: Open) -> bool {
     if a.open == b.open {
         return true;
+    }
+    if a.close == Some(Close::Release) || open == Open::Deflated {
+        let bytes = |r: &Run| r.open.as_ref().map_or(Vec::new(), |(_, m)| m.clone());
+        let (x, y) = (bytes(a), bytes(b));
+        return x.starts_with(&y) || y.starts_with(&x);
     }
     match (open_text(a), open_text(b)) {
         (Some(x), Some(y)) => bad_utf8 && (x.starts_with(y) || y.starts_with(x)),
@@ -230,7 +274,7 @@ fn opens_agree(a: &Run, b: &Run, bad_utf8: bool) -> bool {
 
 /// Runs `frames` through `make()`'s connection whole and in pieces, and
 /// checks both: see [`ws_server`].
-fn frames<P: Role>(target: &str, data: &[u8], make: impl Fn() -> Ws<P>) {
+fn frames<P: Role>(target: &str, data: &[u8], open: Open, make: impl Fn() -> Ws<P>) {
     let (ctl, frames) = control(data);
     let frames = frames.get(..MAX_INPUT).unwrap_or(frames);
     let side = make().side();
@@ -242,15 +286,18 @@ fn frames<P: Role>(target: &str, data: &[u8], make: impl Fn() -> Ws<P>) {
         Given::Message(..) | Given::Pong(_) => None,
     });
     let sent = written(target, side, &whole.wrote, peer_close);
-    let bad_utf8 = matches!(
-        sent.first(),
-        Some((0x8, p)) if p.get(..2) == Some(&1007u16.to_be_bytes()[..])
-    );
-    if whole.given != pieces.given
-        || whole.wrote != pieces.wrote
-        || whole.close != pieces.close
-        || !opens_agree(&whole, &pieces, bad_utf8)
-    {
+    let sent_in_pieces = written(target, side, &pieces.wrote, peer_close);
+    let bad_utf8 = refused_text(&sent) || refused_text(&sent_in_pieces);
+    // a deflated message that does not inflate drops the connection; how
+    // much it inflates first, before the inflater sees what is wrong,
+    // depends on the split, so text it gives that is not UTF-8 may be seen
+    // first, or not: either way, it failed
+    let failed = |r: &Run, frames_sent: &[(u8, Vec<u8>)]| {
+        (r.close == Some(Close::Release) && r.wrote.is_empty()) || refused_text(frames_sent)
+    };
+    let ends_agree = (whole.wrote == pieces.wrote && whole.close == pieces.close)
+        || (open == Open::Deflated && failed(&whole, &sent) && failed(&pieces, &sent_in_pieces));
+    if whole.given != pieces.given || !ends_agree || !opens_agree(&whole, &pieces, bad_utf8, open) {
         finding(
             target,
             format_args!("whole {whole:?}, in pieces {pieces:?}"),
@@ -274,16 +321,33 @@ fn frames<P: Role>(target: &str, data: &[u8], make: impl Fn() -> Ws<P>) {
 /// pieces, the server must hand the application the same messages, pongs
 /// and close, write the same, and close the same, of a message it refuses
 /// as not UTF-8 having handed over a start of it that may differ (see
-/// `opens_agree`); every call must take something; a message's pieces must
+/// `opens_agree`); every call must take something or give something, and
+/// while it says it has more to give without input, give it; a message's
+/// pieces must
 /// say where it starts; nothing may follow the peer's close; a whole text
 /// message must be UTF-8 by `core::str`; and what the server writes must be
 /// frames a client reads.
 pub fn ws_server(data: &[u8]) {
-    frames("ws-server", data, || Ws::server(b""));
+    frames("ws-server", data, Open::Plain, || Ws::server(b""));
 }
 
 /// A server's frames as a client reads them after the upgrade: as
 /// [`ws_server`], from the client's side, which writes its frames masked.
 pub fn ws_client(data: &[u8]) {
-    frames("ws-client", data, || Ws::client(FixedMask));
+    frames("ws-client", data, Open::Plain, || Ws::client(FixedMask));
+}
+
+/// A client's frames as a server with permessage-deflate reads them: C's
+/// `fuzz-ws-pmd`, whose client offered it with no parameters the server
+/// takes.  As [`ws_server`], deflated messages inflating to at most 1MiB,
+/// so a zip bomb is within reach.  How far the inflater gets with the input
+/// it has depends on where that stops, so a message left unfinished, whole
+/// and in pieces, need only start the other; and where a message does not
+/// inflate, text in it that is not UTF-8 may be refused first, or not,
+/// both runs failing.
+pub fn ws_pmd(data: &[u8]) {
+    let params = Params::DEFAULT.with_max_message(FUZZ_MAX_MESSAGE);
+    frames("ws-pmd", data, Open::Deflated, || {
+        Ws::server(b"").with_pmd(params)
+    });
 }

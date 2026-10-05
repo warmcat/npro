@@ -39,6 +39,9 @@ allow = [
 	"npro-ws",
 	"npro-core",
 	"npro-test",
+	# permessage-deflate, as in the main workspace
+	"miniz_oxide",
+	"adler2",
 
 	# libFuzzer's runtime and the fuzz_target! macro
 	"libfuzzer-sys",

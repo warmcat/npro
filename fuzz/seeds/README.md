@@ -25,6 +25,8 @@ The protocol crates' targets start from the C library's corpora
   and `chunked/`;
 - `ws-server`: C's `fuzz/fuzz-ws/seeds`, each behind a control byte of 0,
   named as there;
+- `ws-pmd`: C's `fuzz/fuzz-ws-pmd/seeds`, each behind a control byte of
+  0, named as there, `bomb-2mb-zeros.ws` among them;
 - `ws-client`: C has no client corpus, so what the server sent after the
   101 in each of the `ws-client-*` transcripts but the pmd ones, behind a
   control byte of 0, named for the transcript.

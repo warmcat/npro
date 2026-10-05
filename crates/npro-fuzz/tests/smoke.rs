@@ -237,6 +237,11 @@ fn ws_client() {
 }
 
 #[test]
+fn ws_pmd() {
+    smoke(Target::WsPmd, seeded).unwrap();
+}
+
+#[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
     let tested = [
@@ -249,6 +254,7 @@ fn every_target_has_a_smoke_test() {
         "chunked",
         "ws-server",
         "ws-client",
+        "ws-pmd",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

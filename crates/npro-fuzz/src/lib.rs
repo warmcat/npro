@@ -26,7 +26,7 @@ mod ws;
 
 pub use h1::{chunked, h1_request, h1_response};
 pub use targets::{base64, sha1, transcript, utf8};
-pub use ws::{ws_client, ws_server};
+pub use ws::{ws_client, ws_pmd, ws_server};
 
 /// A fuzz target: its name is the libFuzzer target's, the seed directory's
 /// under `fuzz/seeds/`, and the corpus's under `corpus-<name>`.
@@ -59,11 +59,14 @@ pub enum Target {
     WsServer,
     /// [`ws_client`]: the ws frame parser, as a client.
     WsClient,
+    /// [`ws_pmd`]: the ws frame parser with permessage-deflate, as a
+    /// server.
+    WsPmd,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -73,6 +76,7 @@ impl Target {
         Self::Chunked,
         Self::WsServer,
         Self::WsClient,
+        Self::WsPmd,
     ];
 
     /// The target's name.
@@ -88,6 +92,7 @@ impl Target {
             Self::Chunked => "chunked",
             Self::WsServer => "ws-server",
             Self::WsClient => "ws-client",
+            Self::WsPmd => "ws-pmd",
         }
     }
 
@@ -108,6 +113,7 @@ impl Target {
             Self::Chunked => chunked(data),
             Self::WsServer => ws_server(data),
             Self::WsClient => ws_client(data),
+            Self::WsPmd => ws_pmd(data),
         }
     }
 }
