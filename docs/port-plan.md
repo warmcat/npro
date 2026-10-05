@@ -793,6 +793,62 @@ application's message goes as one final frame.
 - The fuzz target is seeded from `fuzz/fuzz-ws-pmd/seeds`, which includes
   `bomb-2mb-zeros`.
 
+**Done (2026-10-05)**, behind npro-ws's `pmd` feature, with `miniz_oxide`
+and `adler2` admitted as [dependencies.md](dependencies.md) has them.
+`npro_ws::pmd` negotiates: a server takes the first `permessage-deflate`
+offer it can keep to (`server_accept`), with `server_no_context_takeover`
+and `client_no_context_takeover` as C takes them, and says so in its 101;
+a client offers `permessage-deflate` and takes the server's answer if its
+parameters are RFC 7692's, each once, in C's ranges (`client_accept`).
+`Ws::with_pmd` then inflates a message whose first frame has RSV1, RSV1
+being refused anywhere else as C refuses it: its payload is held, unmasked,
+at most 1KiB at a time, inflated into at most 1KiB a call, the drain
+budget, with `rx_pending` saying when there is more to give without input;
+the trailer is put back at its end; data after a BFINAL that is not
+padding, data that does not inflate, and a message past its limit (C's
+256MiB, `Params::with_max_message`) drop the connection, as C marks its
+socket unusable, what inflated before the failure given first.  What the
+application sends is deflated into frames of at most 1KiB, RSV1 on the
+first, the flush's trailer removed, an empty message after a flush C's
+one octet.  Context is dropped per message as each side agreed: the
+deflater for our own `*_no_context_takeover`, the inflater for the peer's,
+or when its stream ended.
+
+The tests: all four pmd transcripts replay (`ws-client-pmd-rsv2`,
+`-rsv1-continuation`, `-rsv1-ping`, and `ws-server-pmd-rsv1-continuation`,
+through the `sansio-pmd` vhost); RFC 7692 7.2.3's example frames inflate,
+one piece at a time and in larger ones; messages of every size around the
+1KiB bounds, compressible and not, go client to server and back, written
+four bytes at a time and read a byte at a time, with and without context
+takeover; and the fuzz target `ws-pmd`, seeded from C's
+`fuzz/fuzz-ws-pmd/seeds`.  Fuzzing it found that a caller must be told to
+come back for what inflates without more input (`rx_pending`), and that
+what inflated before a failure must be given first, so the check of text
+sees the stream in order.  What npro deflates was also inflated by zlib
+(Python's), as C's peers would, by hand: that is how the window below was
+found, and is not yet a test.
+
+Differences from C, each where C does something RFC 7692 does not have:
+
+- `miniz_oxide`'s smaller windows refer further back than they say (zlib
+  finds distances too far back from a 9 bit window, and from any under
+  14), so npro's deflater always uses 32KiB.  A server declines an offer
+  asking for a smaller `server_max_window_bits`, and tries the next, as
+  RFC 7692 7.1.2.1 has it; C takes the offer and leaves the parameter
+  out, still deflating with 32KiB.  A client refuses a
+  `client_max_window_bits` under 15, which it did not offer; C takes it.
+- A client refuses the lws-private options C takes from a server
+  (`rx_buf_size` and the like), and a parameter given twice.
+- A server takes the first offer it can keep to; C takes the first
+  `permessage-deflate`, and drops the connection if it is offered twice
+  before an offer with parameters.
+
+Not yet: the deflater's compression level and the 1KiB chunks are C's
+defaults, not configurable; a client offers only `permessage-deflate`, with
+no parameters; no permanent test inflates npro's output with zlib (the C
+oracle's `sync-c-h1.sh` is where one would go); the `x-webkit-deflate-frame`
+and other extensions are not ported.
+
 ### Phase 1g: minimal `npro-io`
 
 - std TCP, plain poll-style loop, no tls yet.  Enough to run:
