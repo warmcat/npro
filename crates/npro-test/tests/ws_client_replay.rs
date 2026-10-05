@@ -7,7 +7,10 @@
 //! the response is checked as C checks it, and the connection is then
 //! npro-ws', masking from the same stream.  The app is C's
 //! `callback_client`: once established it sends `Hello`, unless the case
-//! has it quiet.
+//! has it quiet.  The `ws-client-pmd-*` cases also offer permessage-deflate,
+//! which the server takes; they are quiet, as C's are, since what the
+//! client would send is deflated, and those bytes are the deflater's
+//! business.
 //!
 //! What npro writes after each `rx` must be the transcript's `tx` bytes,
 //! the messages it hands the app its `app_rx` bytes, and it must ask to be
@@ -24,17 +27,36 @@ mod ws_client_replay {
     use npro_test::{StepKind, Transcript, vendored};
     use npro_ws::conn::{AsClient, Event, Kind, Ws};
     use npro_ws::handshake::{ClientKey, MAX_REQUEST_LINES};
+    use npro_ws::pmd;
 
-    /// The ws client transcripts this phase replays, and whether the app
-    /// is quiet: not the permessage-deflate ones, the next phase's, nor the
-    /// digest retry, which needs digest auth.
-    const CASES: [(&str, bool); 6] = [
-        ("ws-client", false),
-        ("ws-client-interim", false),
-        ("ws-client-ping-close", true),
-        ("ws-client-huge-frame", false),
-        ("ws-client-rsv1-no-ext", false),
-        ("ws-client-rsv2", false),
+    /// A case: its transcript, whether the app is quiet, and the
+    /// extensions offered.
+    struct Case {
+        name: &'static str,
+        quiet: bool,
+        extensions: Option<&'static [u8]>,
+    }
+
+    const fn case(name: &'static str, quiet: bool, extensions: Option<&'static [u8]>) -> Case {
+        Case {
+            name,
+            quiet,
+            extensions,
+        }
+    }
+
+    /// The ws client transcripts: all but the digest retry, which needs
+    /// digest auth.
+    const CASES: [Case; 9] = [
+        case("ws-client", false, None),
+        case("ws-client-interim", false, None),
+        case("ws-client-ping-close", true, None),
+        case("ws-client-huge-frame", false, None),
+        case("ws-client-rsv1-no-ext", false, None),
+        case("ws-client-rsv2", false, None),
+        case("ws-client-pmd-rsv2", true, Some(pmd::OFFER)),
+        case("ws-client-pmd-rsv1-continuation", true, Some(pmd::OFFER)),
+        case("ws-client-pmd-rsv1-ping", true, Some(pmd::OFFER)),
     ];
 
     /// The subprotocols offered.
@@ -82,6 +104,7 @@ mod ws_client_replay {
             client: Box<Client<Vec<u8>>>,
             key: ClientKey,
             random: Option<SeededRandom>,
+            extensions: Option<&'static [u8]>,
         },
         Ws(Box<Ws<AsClient<SeededRandom>>>),
     }
@@ -99,6 +122,7 @@ mod ws_client_replay {
                     client,
                     key,
                     random,
+                    extensions,
                 } => {
                     let rx = client.rx(&input[at..]).unwrap();
                     at = at.checked_add(rx.consumed).unwrap();
@@ -106,10 +130,18 @@ mod ws_client_replay {
                     if rx.event == Some(H1Event::Response) {
                         assert!(client.is_upgraded());
                         let checked = key
-                            .check(client.status(), client.response(), Some(OFFERED), None)
+                            .check(
+                                client.status(),
+                                client.response(),
+                                Some(OFFERED),
+                                *extensions,
+                            )
                             .unwrap();
                         assert_eq!(checked.protocol, Some(OFFERED));
                         let mut ws = Ws::client(random.take().unwrap());
+                        if let Some(said) = checked.extensions {
+                            ws = ws.with_pmd(pmd::client_accept(said).unwrap());
+                        }
                         app.established(&mut ws);
                         *conn = Conn::Ws(Box::new(ws));
                         continue;
@@ -139,13 +171,15 @@ mod ws_client_replay {
         }
     }
 
-    fn replay(t: &Transcript, quiet: bool) {
+    fn replay(t: &Transcript, c: &Case) {
         // C's run was seeded: its random is in the transcript
         let seed = t.seed.unwrap_or_else(|| panic!("{}: not seeded", t.case));
         let mut random = SeededRandom::new(seed.get());
         let key = ClientKey::new(&mut random).unwrap();
         let mut lines = [0u8; MAX_REQUEST_LINES + 32];
-        let lines_len = key.request_lines(Some(OFFERED), None, &mut lines).unwrap();
+        let lines_len = key
+            .request_lines(Some(OFFERED), c.extensions, &mut lines)
+            .unwrap();
         let mut client = Client::new(
             vec![0u8; DEFAULT_CAPACITY],
             Request {
@@ -177,9 +211,10 @@ mod ws_client_replay {
             client: Box::new(client),
             key,
             random: Some(random),
+            extensions: c.extensions,
         };
         let mut app = ClientApp {
-            quiet,
+            quiet: c.quiet,
             ..ClientApp::default()
         };
         while let Some(step) = steps.next() {
@@ -224,12 +259,12 @@ mod ws_client_replay {
     #[cfg_attr(miri, ignore = "reads the transcripts: native runs keep it")]
     fn cs_ws_client_transcripts_replay_byte_for_byte() {
         let all = vendored().unwrap();
-        for (case, quiet) in CASES {
+        for c in &CASES {
             let t = all
                 .iter()
-                .find(|t| t.case == case)
-                .unwrap_or_else(|| panic!("no transcript {case}"));
-            replay(t, quiet);
+                .find(|t| t.case == c.name)
+                .unwrap_or_else(|| panic!("no transcript {}", c.name));
+            replay(t, c);
         }
     }
 }

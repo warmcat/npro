@@ -1,7 +1,8 @@
 //! npro's ws server replays C's ws server transcripts byte for byte.
 //!
 //! Each transcript is one connection to C's `sansio` vhost, whose ws
-//! subprotocols are `http`, its default, and `echo`.  npro's h1 server takes
+//! subprotocols are `http`, its default, and `echo`, or to its `sansio-pmd`
+//! vhost, the same with permessage-deflate.  npro's h1 server takes
 //! the request; one asking for `Upgrade: websocket` goes to npro-ws's
 //! handshake, which answers a refusal with C's status page and an accepted
 //! upgrade with C's 101, after which the connection is npro-ws'.  The app is
@@ -28,10 +29,10 @@ mod ws_server_replay {
     use npro_test::{StepKind, Transcript, vendored};
     use npro_ws::conn::{Event, Kind, Ws};
     use npro_ws::handshake::{self, MAX_101};
+    use npro_ws::pmd;
 
-    /// The ws server transcripts this half of the phase replays: not the
-    /// permessage-deflate ones, which are the next phase's.
-    const CASES: [&str; 10] = [
+    /// The ws server transcripts.
+    const CASES: [&str; 11] = [
         "h1-ws-server",
         "ws-server-version-8",
         "ws-server-no-version",
@@ -42,6 +43,7 @@ mod ws_server_replay {
         "ws-server-close-partial",
         "ws-server-close-when-flushed",
         "ws-server-huge-frame",
+        "ws-server-pmd-rsv1-continuation",
     ];
 
     /// The `sansio` vhost's ws subprotocols, the first its default.
@@ -121,12 +123,23 @@ mod ws_server_replay {
             app.at = 0;
             return Answer::H1;
         }
+        // the vhost with permessage-deflate takes it if it is offered
+        let pmd = (t.first(Token::Host) == Some(b"sansio-pmd".as_slice()))
+            .then(|| pmd::server_accept(t).unwrap())
+            .flatten();
         match handshake::server(t, &PROTOCOLS, Some(0)) {
             Ok(a) => {
+                let lines = pmd
+                    .as_ref()
+                    .map_or(&[][..], pmd::ServerAccepted::header_lines);
                 let mut first = [0u8; MAX_101];
                 let n =
-                    handshake::response_101(&a, PROTOCOLS[a.protocol], b"", &mut first).unwrap();
-                Answer::Upgraded(Box::new(Ws::server(&first[..n])))
+                    handshake::response_101(&a, PROTOCOLS[a.protocol], lines, &mut first).unwrap();
+                let mut ws = Ws::server(&first[..n]);
+                if let Some(p) = pmd {
+                    ws = ws.with_pmd(p.params());
+                }
+                Answer::Upgraded(Box::new(ws))
             }
             Err(r) => {
                 s.refuse_upgrade(r.status(), r.header()).unwrap();
