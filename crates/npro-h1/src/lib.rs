@@ -1,6 +1,6 @@
 //! npro-h1: h1 for npro, sans-IO.
 //!
-//! The port of C libwebsockets' h1 parsing (`lib/sansio/http/parsers.c`):
+//! The port of C libwebsockets' h1 (`lib/sansio/http`):
 //!
 //! - [`head`]: a request or response head, parsed as it arrives, with C's
 //!   limits and refusals, into
@@ -10,14 +10,14 @@
 //! - [`chunked`]: the chunked transfer coding's framing, shared by client
 //!   and server;
 //! - [`fields`]: what a few header values mean, as C reads them;
-//! - [`server`]: an h1 server connection's transactions.
-//!
-//! The h1 client's transactions come next, in phase 1d of the port plan.
+//! - [`server`]: an h1 server connection's transactions;
+//! - [`client`]: an h1 client connection's transaction.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 pub mod chunked;
+pub mod client;
 pub mod fields;
 pub mod head;
 mod own;
