@@ -17,7 +17,7 @@
 // held to clippy's rules for tests
 #[cfg(test)]
 mod h1_client_replay {
-    use npro_h1::client::{Client, Event, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Event, Request, Scheme};
     use npro_h1::table::DEFAULT_CAPACITY;
     use npro_test::{StepKind, Transcript, vendored};
 
@@ -69,7 +69,7 @@ mod h1_client_replay {
                 origin: Some(b"sansio"),
                 scheme: Scheme::Http,
                 no_cache: true,
-                pipeline: false,
+                connection: Connection::Close,
             },
         )
         .unwrap();

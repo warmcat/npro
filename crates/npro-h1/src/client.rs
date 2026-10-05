@@ -4,8 +4,9 @@
 //!
 //! [`Client::tx`] writes the request's head, composed as C composes it, in
 //! C's order: the request line, `Pragma` and `Cache-Control` unless asked
-//! not to, `Host`, `Origin`, and `connection: close` unless the connection
-//! is to be pipelined.
+//! not to, `Host`, `Origin`, then `connection: close`, or nothing for a
+//! connection kept for another request, or the header lines asking for an
+//! upgrade ([`Connection`]).
 //!
 //! [`Client::rx`] takes the response, at most one thing each call: its head
 //! ([`Event::Response`]), a piece of its body, borrowed from the input
@@ -24,6 +25,11 @@
 //!
 //! A response that cannot be framed fails the connection, which asks to be
 //! released.
+//!
+//! The final response to a request for an upgrade is not framed at all:
+//! after its head, whatever its status, the connection is the upgraded
+//! protocol's ([`Client::is_upgraded`]), which judges the response, as C's
+//! `lws_client_ws_upgrade()` does for ws.
 
 use crate::chunked::{self, Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
@@ -62,9 +68,22 @@ pub struct Request<'a> {
     /// Send `Pragma: no-cache` and `Cache-Control: no-cache`, unless C's
     /// `LCCSCF_HTTP_NO_CACHE_CONTROL`.
     pub no_cache: bool,
-    /// The connection is kept for another request, rather than the
-    /// request saying `connection: close`.
-    pub pipeline: bool,
+    /// What becomes of the connection after this request.
+    pub connection: Connection<'a>,
+}
+
+/// What becomes of the connection after the request: the last of the
+/// request's headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Connection<'a> {
+    /// It ends with the transaction: `connection: close`.
+    Close,
+    /// It is kept for another request, C's pipelining: nothing is said.
+    KeepAlive,
+    /// It is upgraded, these header lines, each ending in CRLF, asking for
+    /// it: C's `do_ws`, whose lines `npro_ws::handshake::ClientKey`
+    /// composes.
+    Upgrade(&'a [u8]),
 }
 
 /// What the server's bytes were.
@@ -154,14 +173,24 @@ enum Phase {
     Body(Body),
     /// The transaction is over.
     Done,
+    /// The final response to a request for an upgrade has come: the
+    /// connection is the upgraded protocol's.
+    Upgraded,
     /// The connection failed.
     Failed(Failure),
+}
+
+/// What the request asked for: a transaction, or an upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    Transaction,
+    Upgrade,
 }
 
 /// One h1 client connection.
 ///
 /// ```
-/// use npro_h1::client::{Client, Event, Request, Scheme};
+/// use npro_h1::client::{Client, Connection, Event, Request, Scheme};
 ///
 /// let mut c = Client::new([0u8; 1024], Request {
 ///     method: b"GET",
@@ -170,7 +199,7 @@ enum Phase {
 ///     origin: None,
 ///     scheme: Scheme::Http,
 ///     no_cache: false,
-///     pipeline: false,
+///     connection: Connection::Close,
 /// })?;
 /// let mut out = [0u8; 256];
 /// let n = c.tx(&mut out);
@@ -187,6 +216,7 @@ enum Phase {
 #[derive(Clone, Debug)]
 pub struct Client<S> {
     head: Head<S>,
+    asked: Asked,
     phase: Phase,
     own: Own,
     status: Option<u16>,
@@ -241,6 +271,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         t.snapshot();
         Ok(Self {
             head: Head::with_table(t, Side::Client, head::Config::new()),
+            asked: match req.connection {
+                Connection::Close | Connection::KeepAlive => Asked::Transaction,
+                Connection::Upgrade(_) => Asked::Upgrade,
+            },
             phase: Phase::Asking,
             own: request_head(&req).map_err(NewError::Head)?,
             status: None,
@@ -270,7 +304,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn failed(&self) -> Option<Failure> {
         match self.phase {
             Phase::Failed(f) => Some(f),
-            Phase::Asking | Phase::Head(_) | Phase::Body(_) | Phase::Done => None,
+            Phase::Asking | Phase::Head(_) | Phase::Body(_) | Phase::Done | Phase::Upgraded => None,
         }
     }
 
@@ -278,6 +312,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     #[must_use]
     pub const fn is_done(&self) -> bool {
         matches!(self.phase, Phase::Done)
+    }
+
+    /// Whether the final response to a request for an upgrade has come:
+    /// from the byte after its head, the connection is the upgraded
+    /// protocol's, and this takes nothing more.
+    #[must_use]
+    pub const fn is_upgraded(&self) -> bool {
+        matches!(self.phase, Phase::Upgraded)
     }
 
     /// Writes the request's head, or what is left of it, into `out`,
@@ -308,7 +350,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         });
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Asking | Phase::Done => held,
+            Phase::Asking | Phase::Done | Phase::Upgraded => held,
             Phase::Head(interims) => self.rx_head(interims, input),
             Phase::Body(b) => self.rx_body(b, input),
         }
@@ -343,6 +385,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             return Ok(Rx {
                 consumed,
                 event: None,
+            });
+        }
+        if self.asked == Asked::Upgrade {
+            // not framed: the upgraded protocol judges it
+            self.status = u16::try_from(status).ok();
+            self.phase = Phase::Upgraded;
+            return Ok(Rx {
+                consumed,
+                event: Some(Event::Response),
             });
         }
         let body = match self.framing(status) {
@@ -441,7 +492,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn rx_closed<'a>(&mut self) -> Result<Option<Event<'a>>, Failure> {
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Done => Ok(None),
+            Phase::Done | Phase::Upgraded => Ok(None),
             Phase::Body(Body::ToClose | Body::EndDue) => {
                 self.phase = Phase::Done;
                 Ok(Some(Event::BodyEnd))
@@ -481,8 +532,10 @@ fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
         o.push(origin)?;
         o.push(b"\r\n")?;
     }
-    if !r.pipeline {
-        o.push(b"connection: close\r\n")?;
+    match r.connection {
+        Connection::Close => o.push(b"connection: close\r\n")?,
+        Connection::KeepAlive => {}
+        Connection::Upgrade(lines) => o.push(lines)?,
     }
     o.push(b"\r\n")?;
     Ok(o)
@@ -532,7 +585,7 @@ mod tests {
                 origin: Some(b"sansio"),
                 scheme: Scheme::Http,
                 no_cache: true,
-                pipeline: false,
+                connection: Connection::Close,
             },
         )
         .unwrap();
@@ -566,6 +619,40 @@ mod tests {
             }
         };
         assert_eq!(failed, Failure::TooManyInterims);
+    }
+
+    #[test]
+    fn an_upgrades_response_is_handed_over_unframed() {
+        let mut c = Client::new(
+            [0u8; 1024],
+            Request {
+                method: b"GET",
+                path: b"/x",
+                host: None,
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Upgrade(b"Upgrade: x\r\nConnection: Upgrade\r\n"),
+            },
+        )
+        .unwrap();
+        let mut out = [0u8; 512];
+        let n = c.tx(&mut out);
+        assert_eq!(
+            &out[..n],
+            b"GET /x HTTP/1.1\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\n"
+        );
+        // an interim is still dropped; the 101 is final, its frames are not
+        // a body, and nor would a 200's be
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 101 Go\r\n\r\n\x81\x00";
+        let first = c.rx(input).unwrap();
+        assert_eq!(first.event, None);
+        let rx = c.rx(&input[first.consumed..]).unwrap();
+        assert_eq!(rx.event, Some(Event::Response));
+        assert_eq!(&input[first.consumed + rx.consumed..], b"\x81\x00");
+        assert!(c.is_upgraded());
+        assert_eq!(c.status(), Some(101));
+        assert_eq!(c.rx(b"\x81\x00").unwrap().consumed, 0);
     }
 
     #[test]
