@@ -1,5 +1,9 @@
-//! A ws connection: C's `lws_ws_rx_sm()`, its writeable handling and its
-//! close, sans-IO.
+//! A ws connection: C's `lws_ws_rx_sm()` and `lws_ws_client_rx_sm()`, its
+//! writeable handling and its close, sans-IO.  One parser serves both ends,
+//! where C has two: a [`Ws`] is a server's ([`Ws::server`]) or a client's
+//! ([`Ws::client`]), which masks each frame it writes with four bytes drawn
+//! from its random source when the frame is begun, as C's `lws_write()`
+//! draws them.
 //!
 //! [`Ws::rx`] takes the peer's bytes, at most one thing each call, and
 //! unmasks a frame's payload where it lies in the input, so a message's
@@ -9,21 +13,28 @@
 //! Control frames, at most 125 bytes, are gathered here: a ping is answered
 //! with a pong, a pong is given to the application, and the peer's close
 //! is given to it and answered with the peer's own payload, its code made
-//! 1002 if it is one no peer may send.
+//! 1002 if it is one the peer may not send (a client, as C's, takes 1012 to
+//! 1015 from a server).
 //!
-//! What C refuses, this refuses, with C's close code and reason: a
-//! fragmented control frame ("frag ctl"), a reserved opcode ("bad opc"), a
-//! continuation out of place ("bad cont"), RSV bits ("rsv bits"), a server's
-//! unmasked frame ("client unmasked"), a long control frame ("ctl len"), a
-//! length with its top bit ("bad len"), all 1002; a frame longer than C's
-//! 256MiB, 1009 "huge frame"; text that is not UTF-8, 1007 "bad utf8" or
-//! "partial utf8".  After its close, the connection reads nothing more.
+//! What C refuses, this refuses, with C's close code and reason, each end
+//! in its C parser's order: a fragmented control frame ("frag ctl"), a
+//! reserved opcode ("bad opc"), a continuation out of place ("bad cont"),
+//! RSV bits ("rsv bits"), a client's message begun while one is open ("bad
+//! fin", which a server calls "bad cont"), a frame masked or not as the
+//! side forbids ("client unmasked", "srv mask"), a long control frame ("ctl
+//! len"), a length with its top bit ("bad len"), all 1002; a frame longer
+//! than C's 256MiB, 1009 "huge frame"; text that is not UTF-8, 1007 "bad
+//! utf8" or "partial utf8".  As C, the rest of that read is dropped; what
+//! comes after it is dropped until our close has gone, and then ends the
+//! connection, the peer's ack or not.  After the peer's close, nothing more
+//! is read.
 //!
 //! [`Ws::tx`] writes in C's order: what is in flight first (the 101, a frame
 //! begun), then our own close, then the pong, then the answer to the peer's
 //! close, then the application's next frame, whose payload it pulls.  A
 //! pong still owed when we begin a close is forgotten, as C forgets it.
 
+use npro_core::random::{Random, Unavailable};
 use npro_core::utf8::Utf8Validator;
 use npro_h1::server::TxSource;
 
@@ -38,6 +49,66 @@ const MAX_CTL: usize = 125;
 pub enum Side {
     /// A server: the client's frames must be masked, ours are not.
     Server,
+    /// A client: the server's frames must not be masked, ours are.
+    Client,
+}
+
+/// The sealed trait pattern: public, so it can bound [`Role`], and
+/// unnameable outside, so nothing else implements it.
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Which end a [`Ws`] is, and for a client, where its masks come from.
+/// Sealed: [`AsServer`] and [`AsClient`] are the two there are.
+pub trait Role: sealed::Sealed {
+    /// Which end this is.
+    fn side(&self) -> Side;
+
+    /// The mask for the next frame written: `None` for a server; for a
+    /// client, a draw of four bytes, as C's `lws_write()` draws one per
+    /// frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Unavailable`] if the random source has none to give.
+    fn next_mask(&mut self) -> Result<Option<[u8; 4]>, Unavailable>;
+}
+
+/// A server's end: [`Ws::server`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsServer;
+
+impl sealed::Sealed for AsServer {}
+
+impl Role for AsServer {
+    fn side(&self) -> Side {
+        Side::Server
+    }
+
+    fn next_mask(&mut self) -> Result<Option<[u8; 4]>, Unavailable> {
+        Ok(None)
+    }
+}
+
+/// A client's end, masking with what `R` draws: [`Ws::client`].
+#[derive(Clone, Debug)]
+pub struct AsClient<R> {
+    random: R,
+}
+
+impl<R> sealed::Sealed for AsClient<R> {}
+
+impl<R: Random> Role for AsClient<R> {
+    fn side(&self) -> Side {
+        Side::Client
+    }
+
+    fn next_mask(&mut self) -> Result<Option<[u8; 4]>, Unavailable> {
+        let mut mask = [0u8; 4];
+        self.random.fill(&mut mask)?;
+        Ok(Some(mask))
+    }
 }
 
 /// What a message is.
@@ -84,7 +155,8 @@ pub struct Rx<'a> {
 pub enum Close {
     /// Stop sending once what was written has gone.
     Shutdown,
-    /// Release it: the close handshake is over.
+    /// Release it now: the close handshake is over, or, for a client
+    /// whose random source failed it, the connection cannot go on.
     Release,
 }
 
@@ -93,11 +165,17 @@ pub enum Close {
 pub enum SendError {
     /// A frame is still going, or the connection is closing.
     Busy,
+    /// A client's random source had no mask to give: the connection is
+    /// failed, as C fails a short `lws_get_random()`.
+    NoMask,
 }
 
 impl core::fmt::Display for SendError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("a frame is still going, or the connection is closing")
+        f.write_str(match self {
+            Self::Busy => "a frame is still going, or the connection is closing",
+            Self::NoMask => "no random for the frame's mask",
+        })
     }
 }
 
@@ -155,6 +233,11 @@ enum Parse {
     Payload(Frame, u64),
     /// Nothing more is read.
     Stopped,
+    /// We refused the peer's frames.  What it sends is not read: until our
+    /// close has gone, it is dropped; after, anything ends the connection,
+    /// as in C, where the rest of the read is dropped and whatever comes
+    /// next, the ack or a frame refused again, closes it.
+    Refused,
 }
 
 /// Where a message is, between frames.
@@ -257,6 +340,22 @@ impl Out {
         }
     }
 
+    /// Adds `b` after what is there.
+    fn push(&mut self, b: &[u8]) {
+        let end = self.len.saturating_add(b.len());
+        if let Some(d) = self.buf.get_mut(self.len..end) {
+            d.copy_from_slice(b);
+            self.len = end;
+        }
+    }
+
+    /// Masks the last `n` bytes, a payload, with `mask`.
+    fn mask_tail(&mut self, n: usize, mask: [u8; 4]) {
+        if let Some(t) = self.buf.get_mut(self.len.saturating_sub(n)..self.len) {
+            apply_mask(t, mask, 0);
+        }
+    }
+
     fn drain(&mut self, out: &mut [u8]) -> usize {
         let rest = self.buf.get(self.sent..self.len).unwrap_or_default();
         let n = rest.len().min(out.len());
@@ -268,15 +367,29 @@ impl Out {
     }
 }
 
-/// The application's frame, its header written or not, its payload owed.
+/// The application's frame, its header written or not, its payload owed,
+/// and a client's mask with how far into the payload it has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum App {
     Idle,
-    Sending { owed: u64 },
+    Sending {
+        owed: u64,
+        mask: Option<[u8; 4]>,
+        at: u64,
+    },
 }
 
-/// A frame's header, unmasked, as a server writes it.
-fn frame_header(op: Op, len: u64, out: &mut Out) {
+/// Masks `b`, the bytes of a payload from `at` on, with `mask`.
+fn apply_mask(b: &mut [u8], mask: [u8; 4], at: u64) {
+    // the mask's index where `b` starts: `at` mod 4
+    let start = at.to_le_bytes().first().map_or(0, |l| usize::from(l & 3));
+    for (x, m) in b.iter_mut().zip(mask.iter().cycle().skip(start)) {
+        *x ^= m;
+    }
+}
+
+/// A final frame's header, with a client's mask after it.
+fn frame_header(op: Op, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
     // the length is 7 bits, or 126 and 16 bits, or 127 and 64 bits: the
     // last of its big endian bytes, after the marker
     let be = len.to_be_bytes();
@@ -285,31 +398,39 @@ fn frame_header(op: Op, len: u64, out: &mut Out) {
         Ok(_) | Err(_) if u16::try_from(len).is_ok() => (126, 2),
         Ok(_) | Err(_) => (127, 8),
     };
-    let mut header = [0x80 | op.code(), marker, 0, 0, 0, 0, 0, 0, 0, 0];
-    let used = 2usize.saturating_add(extra);
+    let masked = if mask.is_some() { 0x80 } else { 0 };
+    let mut header = [0u8; 14];
+    if let Some(h) = header.get_mut(..2) {
+        h.copy_from_slice(&[0x80 | op.code(), masked | marker]);
+    }
+    let mut used = 2usize.saturating_add(extra);
     if let (Some(d), Some(s)) = (
         header.get_mut(2..used),
         be.get(be.len().saturating_sub(extra)..),
     ) {
         d.copy_from_slice(s);
     }
+    if let Some(m) = mask {
+        let end = used.saturating_add(4);
+        if let Some(d) = header.get_mut(used..end) {
+            d.copy_from_slice(&m);
+        }
+        used = end;
+    }
     out.set(header.get(..used).unwrap_or_default());
 }
 
-/// A control frame, header and payload.
-fn control_frame(op: Op, c: &Ctl, out: &mut Out) {
-    let p = c.payload();
-    let mut b = [0u8; 2 + MAX_CTL];
-    if let Some(h) = b.get_mut(..2) {
-        h.copy_from_slice(&[0x80 | op.code(), c.len]);
+/// A control frame, header and payload, masked with a client's mask.
+fn control_frame(op: Op, c: &Ctl, mask: Option<[u8; 4]>, out: &mut Out) {
+    frame_header(op, u64::from(c.len), mask, out);
+    out.push(c.payload());
+    if let Some(m) = mask {
+        out.mask_tail(c.payload().len(), m);
     }
-    if let Some(d) = b.get_mut(2..2usize.saturating_add(p.len())) {
-        d.copy_from_slice(p);
-    }
-    out.set(b.get(..2usize.saturating_add(p.len())).unwrap_or_default());
 }
 
-/// One ws connection.
+/// One ws connection, its end `P`: [`AsServer`], or [`AsClient`] with its
+/// random source.
 ///
 /// ```
 /// use npro_ws::conn::{Event, Kind, Ws};
@@ -324,7 +445,8 @@ fn control_frame(op: Op, c: &Ctl, out: &mut Out) {
 /// );
 /// ```
 #[derive(Clone, Debug)]
-pub struct Ws {
+pub struct Ws<P = AsServer> {
+    role: P,
     parse: Parse,
     msg: Msg,
     utf8: Utf8Validator,
@@ -337,14 +459,34 @@ pub struct Ws {
     app: App,
 }
 
-impl Ws {
+impl Ws<AsServer> {
     /// A server's connection, `first` being what goes before its frames:
     /// the 101.
     #[must_use]
     pub fn server(first: &[u8]) -> Self {
+        Self::new(AsServer, first)
+    }
+}
+
+impl<R: Random> Ws<AsClient<R>> {
+    /// A client's connection, once the server's 101 has been checked
+    /// ([`crate::handshake::ClientKey::check`]), masking its frames with
+    /// what `random` draws.
+    ///
+    /// A real connection's source must be one the server cannot predict:
+    /// see [`npro_core::random::Random`].
+    #[must_use]
+    pub fn client(random: R) -> Self {
+        Self::new(AsClient { random }, b"")
+    }
+}
+
+impl<P: Role> Ws<P> {
+    fn new(role: P, first: &[u8]) -> Self {
         let mut out = Out::new();
         out.set(first);
         Self {
+            role,
             parse: Parse::First,
             msg: Msg::Idle,
             utf8: Utf8Validator::new(),
@@ -354,6 +496,12 @@ impl Ws {
             out,
             app: App::Idle,
         }
+    }
+
+    /// Which end this is.
+    #[must_use]
+    pub fn side(&self) -> Side {
+        self.role.side()
     }
 
     /// What the connection asks of its carrier, once it is done with.
@@ -381,9 +529,10 @@ impl Ws {
     }
 
     /// Fails the connection with our close: C's `lws_close_reason()` and
-    /// `LWS_HPI_RET_PLEASE_CLOSE_ME`.
+    /// `LWS_HPI_RET_PLEASE_CLOSE_ME`.  The caller takes all of its input,
+    /// the rest of the read, which C drops.
     fn refuse<'a>(&mut self, code: u16, reason: &[u8]) -> Rx<'a> {
-        self.parse = Parse::Stopped;
+        self.parse = Parse::Refused;
         if matches!(self.closing, Closing::None) {
             self.closing = Closing::WaitingToSend(Ctl::close(code, reason));
         }
@@ -406,6 +555,15 @@ impl Ws {
                         event: None,
                     };
                 }
+                Parse::Refused => {
+                    if !input.is_empty() && matches!(self.closing, Closing::AwaitingAck) {
+                        self.closing = Closing::Closed(Close::Release);
+                    }
+                    return Rx {
+                        consumed: input.len(),
+                        event: None,
+                    };
+                }
                 Parse::Payload(f, left) => return self.payload(f, left, input, used),
                 Parse::First | Parse::Len(_) | Parse::LenMore(..) | Parse::Mask(..) => {}
             }
@@ -417,8 +575,9 @@ impl Ws {
             };
             used = used.saturating_add(1);
             if let Some((code, reason)) = self.header(c) {
+                // as C, the rest of what was read goes unread
                 let mut r = self.refuse(code, reason);
-                r.consumed = used;
+                r.consumed = input.len();
                 return r;
             }
         }
@@ -429,6 +588,7 @@ impl Ws {
         match self.parse {
             Parse::First => {
                 let fin = c & 0x80 != 0;
+                let side = self.role.side();
                 let op = match c & 0x0f {
                     0 => Op::Continuation,
                     1 => Op::Text,
@@ -436,20 +596,17 @@ impl Ws {
                     8 => Op::Close,
                     9 => Op::Ping,
                     10 => Op::Pong,
-                    _ => {
-                        if c & 0x08 != 0 && !fin {
-                            return Some((1002, b"frag ctl"));
-                        }
-                        return Some((1002, b"bad opc"));
+                    // C's server calls a reserved control opcode without
+                    // FIN fragmented; its client, a bad opcode
+                    _ if side == Side::Server && c & 0x08 != 0 && !fin => {
+                        return Some((1002, b"frag ctl"));
                     }
+                    _ => return Some((1002, b"bad opc")),
                 };
-                if op.control() && !fin {
-                    return Some((1002, b"frag ctl"));
+                if let Some(refused) = Self::first_byte_order(side, op, fin, c, self.msg) {
+                    return Some(refused);
                 }
                 match (op, self.msg) {
-                    (Op::Text | Op::Binary, Msg::Open { .. }) | (Op::Continuation, Msg::Idle) => {
-                        return Some((1002, b"bad cont"));
-                    }
                     (Op::Text, Msg::Idle) => {
                         self.utf8 = Utf8Validator::new();
                         self.msg = Msg::Open {
@@ -463,11 +620,10 @@ impl Ws {
                             given: Given::Nothing,
                         };
                     }
-                    (Op::Continuation, Msg::Open { .. })
+                    // refused above, or nothing to do
+                    (Op::Text | Op::Binary, Msg::Open { .. })
+                    | (Op::Continuation, Msg::Idle | Msg::Open { .. })
                     | (Op::Close | Op::Ping | Op::Pong, Msg::Idle | Msg::Open { .. }) => {}
-                }
-                if c & 0x70 != 0 {
-                    return Some((1002, b"rsv bits"));
                 }
                 self.parse = Parse::Len(Frame {
                     op,
@@ -479,8 +635,10 @@ impl Ws {
             }
             Parse::Len(mut f) => {
                 f.masked = c & 0x80 != 0;
-                if !f.masked {
-                    return Some((1002, b"client unmasked"));
+                match (self.role.side(), f.masked) {
+                    (Side::Server, false) => return Some((1002, b"client unmasked")),
+                    (Side::Client, true) => return Some((1002, b"srv mask")),
+                    (Side::Server, true) | (Side::Client, false) => {}
                 }
                 match c & 0x7f {
                     126 | 127 if f.op.control() => return Some((1002, b"ctl len")),
@@ -488,7 +646,7 @@ impl Ws {
                     127 => self.parse = Parse::LenMore(f, 8),
                     n => {
                         f.len = u64::from(n);
-                        self.parse = Parse::Mask(f, 4);
+                        self.parse = Self::after_len(f);
                     }
                 }
             }
@@ -503,7 +661,7 @@ impl Ws {
                 } else if f.len > MAX_FRAME {
                     return Some((1009, b"huge frame"));
                 } else {
-                    self.parse = Parse::Mask(f, 4);
+                    self.parse = Self::after_len(f);
                 }
             }
             Parse::Mask(mut f, left) => {
@@ -515,17 +673,74 @@ impl Ws {
                 self.parse = if left > 0 {
                     Parse::Mask(f, left)
                 } else {
-                    self.ctl = Ctl::new();
                     Parse::Payload(f, f.len)
                 };
             }
-            Parse::Payload(..) | Parse::Stopped => {}
+            Parse::Payload(..) | Parse::Stopped | Parse::Refused => {}
+        }
+        if matches!(self.parse, Parse::Payload(..)) {
+            self.ctl = Ctl::new();
         }
         None
     }
 
+    /// After the length: the mask, if the frame has one, else the payload.
+    const fn after_len(f: Frame) -> Parse {
+        if f.masked {
+            Parse::Mask(f, 4)
+        } else {
+            Parse::Payload(f, f.len)
+        }
+    }
+
+    /// The first byte's checks after its opcode, each side's in its C
+    /// parser's order: the server's (`lws_ws_rx_sm()`) fragmented control,
+    /// continuation, then RSV; the client's (`lws_ws_client_rx_sm()`)
+    /// continuation, RSV, a message begun while one is open ("bad fin"),
+    /// then fragmented control.
+    const fn first_byte_order(
+        side: Side,
+        op: Op,
+        fin: bool,
+        c: u8,
+        msg: Msg,
+    ) -> Option<(u16, &'static [u8])> {
+        let frag_ctl = op.control() && !fin;
+        let rsv = c & 0x70 != 0;
+        let open = matches!(msg, Msg::Open { .. });
+        let stray_cont = matches!(op, Op::Continuation) && !open;
+        let new_in_open = matches!(op, Op::Text | Op::Binary) && open;
+        match side {
+            Side::Server => {
+                if frag_ctl {
+                    Some((1002, b"frag ctl"))
+                } else if stray_cont || new_in_open {
+                    Some((1002, b"bad cont"))
+                } else if rsv {
+                    Some((1002, b"rsv bits"))
+                } else {
+                    None
+                }
+            }
+            Side::Client => {
+                if stray_cont {
+                    Some((1002, b"bad cont"))
+                } else if rsv {
+                    Some((1002, b"rsv bits"))
+                } else if new_in_open {
+                    Some((1002, b"bad fin"))
+                } else if frag_ctl {
+                    Some((1002, b"frag ctl"))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// The payload of `f`, `left` of it still to come.
     fn payload<'a>(&'a mut self, f: Frame, left: u64, input: &'a mut [u8], used: usize) -> Rx<'a> {
+        let all = input.len();
         let rest = input.get_mut(used..).unwrap_or_default();
         let n = usize::try_from(left).unwrap_or(usize::MAX).min(rest.len());
         let at = f.len.saturating_sub(left);
@@ -575,12 +790,12 @@ impl Ws {
         if kind == Kind::Text {
             if self.utf8.feed(piece).is_err() {
                 let mut r = self.refuse(1007, b"bad utf8");
-                r.consumed = consumed;
+                r.consumed = all;
                 return r;
             }
             if last && !self.utf8.at_boundary() {
                 let mut r = self.refuse(1007, b"partial utf8");
-                r.consumed = consumed;
+                r.consumed = all;
                 return r;
             }
         }
@@ -644,11 +859,13 @@ impl Ws {
                         self.ctl.buf.first().copied().unwrap_or(0),
                         self.ctl.buf.get(1).copied().unwrap_or(0),
                     ]);
-                    // a code no peer may send is answered as a protocol error
-                    if code < 1000
-                        || matches!(code, 1004..=1006 | 1012..=1015)
-                        || (1016..3000).contains(&code)
-                    {
+                    // a code no peer may send is answered as a protocol
+                    // error; C's client takes 1012 to 1015 from a server
+                    let reserved = match self.role.side() {
+                        Side::Server => matches!(code, 1004..=1006 | 1012..=1015),
+                        Side::Client => matches!(code, 1004..=1006),
+                    };
+                    if code < 1000 || reserved || (1016..3000).contains(&code) {
                         if let Some(b) = self.ctl.buf.get_mut(..2) {
                             b.copy_from_slice(&1002u16.to_be_bytes());
                         }
@@ -665,10 +882,14 @@ impl Ws {
     /// Commits a whole message, `len` bytes, whose payload [`Ws::tx`] pulls:
     /// C's `lws_write()` of a final frame.
     ///
+    /// A client's frame is masked with a mask drawn now, as C draws it in
+    /// `lws_write()`.
+    ///
     /// # Errors
     ///
     /// [`SendError::Busy`] while a frame is still going, or the connection
-    /// is closing.
+    /// is closing; [`SendError::NoMask`] if a client's random source has no
+    /// mask to give, which fails the connection.
     pub fn send(&mut self, kind: Kind, len: u64) -> Result<(), SendError> {
         if self.app != App::Idle || self.out.pending() || !matches!(self.closing, Closing::None) {
             return Err(SendError::Busy);
@@ -677,9 +898,37 @@ impl Ws {
             Kind::Text => Op::Text,
             Kind::Binary => Op::Binary,
         };
-        frame_header(op, len, &mut self.out);
-        self.app = App::Sending { owed: len };
+        let Ok(mask) = self.role.next_mask() else {
+            self.fail();
+            return Err(SendError::NoMask);
+        };
+        frame_header(op, len, mask, &mut self.out);
+        self.app = App::Sending {
+            owed: len,
+            mask,
+            at: 0,
+        };
         Ok(())
+    }
+
+    /// A client's random source failed it: nothing more is read or
+    /// written, and it asks to be released.
+    const fn fail(&mut self) {
+        self.parse = Parse::Stopped;
+        self.pong = None;
+        self.app = App::Idle;
+        self.closing = Closing::Closed(Close::Release);
+    }
+
+    /// A control frame into what is in flight, masked as this end masks;
+    /// `false` if the mask could not be drawn, which fails the connection.
+    fn queue_control(&mut self, op: Op, c: &Ctl) -> bool {
+        let Ok(mask) = self.role.next_mask() else {
+            self.fail();
+            return false;
+        };
+        control_frame(op, c, mask, &mut self.out);
+        true
     }
 
     /// The application is done: the connection closes once what it sent
@@ -705,15 +954,24 @@ impl Ws {
                 written = written.saturating_add(self.out.drain(room));
                 continue;
             }
-            if let App::Sending { owed } = self.app {
+            if let App::Sending { owed, mask, at } = self.app {
                 let cap = usize::try_from(owed).unwrap_or(usize::MAX).min(room.len());
-                let n = src.fill(room.get_mut(..cap).unwrap_or_default()).min(cap);
+                let piece = room.get_mut(..cap).unwrap_or_default();
+                let n = src.fill(piece).min(cap);
+                if let (Some(m), Some(p)) = (mask, piece.get_mut(..n)) {
+                    apply_mask(p, m, at);
+                }
                 written = written.saturating_add(n);
-                let owed = owed.saturating_sub(u64::try_from(n).unwrap_or(owed));
+                let n = u64::try_from(n).unwrap_or(owed);
+                let owed = owed.saturating_sub(n);
                 self.app = if owed == 0 {
                     App::Idle
                 } else {
-                    App::Sending { owed }
+                    App::Sending {
+                        owed,
+                        mask,
+                        at: at.wrapping_add(n),
+                    }
                 };
                 if owed > 0 {
                     // the rest of the payload is not here yet
@@ -723,7 +981,9 @@ impl Ws {
             }
             match self.closing {
                 Closing::WaitingToSend(c) => {
-                    control_frame(Op::Close, &c, &mut self.out);
+                    if !self.queue_control(Op::Close, &c) {
+                        return written;
+                    }
                     self.closing = Closing::AwaitingAck;
                     continue;
                 }
@@ -742,7 +1002,9 @@ impl Ws {
             if let Some(p) = self.pong.take() {
                 match self.closing {
                     Closing::None | Closing::Returned(_) => {
-                        control_frame(Op::Pong, &p, &mut self.out);
+                        if !self.queue_control(Op::Pong, &p) {
+                            return written;
+                        }
                     }
                     Closing::WaitingToSend(_)
                     | Closing::AwaitingAck
@@ -752,7 +1014,9 @@ impl Ws {
                 continue;
             }
             if let Closing::Returned(c) = self.closing {
-                control_frame(Op::Close, &c, &mut self.out);
+                if !self.queue_control(Op::Close, &c) {
+                    return written;
+                }
                 self.closing = Closing::Closed(Close::Shutdown);
                 continue;
             }
@@ -854,9 +1118,101 @@ mod tests {
             (0x1_0000, b"\x82\x7f\0\0\0\0\0\x01\0\0"),
         ] {
             let mut out = Out::new();
-            frame_header(Op::Binary, len, &mut out);
+            frame_header(Op::Binary, len, None, &mut out);
             assert_eq!(&out.buf[..out.len], want, "{len}");
         }
+    }
+
+    /// Masks of zero, so a client's frames read plainly.
+    #[derive(Debug)]
+    struct Zeros;
+    impl Random for Zeros {
+        fn fill(&mut self, buf: &mut [u8]) -> Result<(), Unavailable> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    /// A source with nothing to give.
+    #[derive(Debug)]
+    struct Dry;
+    impl Random for Dry {
+        fn fill(&mut self, _: &mut [u8]) -> Result<(), Unavailable> {
+            Err(Unavailable)
+        }
+    }
+
+    /// What a client writes after taking `frames`.
+    fn client_answers(frames: &[u8]) -> ([u8; 64], usize) {
+        let mut ws = Ws::client(Zeros);
+        let mut input = [0u8; 16];
+        let input = &mut input[..frames.len()];
+        input.copy_from_slice(frames);
+        let mut at = 0;
+        while at < input.len() {
+            let rx = ws.rx(&mut input[at..]);
+            if rx.consumed == 0 {
+                break;
+            }
+            at = at.checked_add(rx.consumed).unwrap();
+        }
+        let mut out = [0u8; 64];
+        let n = ws.tx(&mut out, &mut Nothing);
+        (out, n)
+    }
+
+    #[test]
+    fn a_clients_refusals_are_cs_client_parsers() {
+        for (frames, close) in [
+            (&b"\x83\x00"[..], &b"\x88\x89\0\0\0\0\x03\xeabad opc"[..]),
+            // the server calls this one "frag ctl"
+            (b"\x0b\x00", b"\x88\x89\0\0\0\0\x03\xeabad opc"),
+            (b"\x80\x00", b"\x88\x8a\0\0\0\0\x03\xeabad cont"),
+            (b"\xc1\x00", b"\x88\x8a\0\0\0\0\x03\xearsv bits"),
+            (b"\x01\x00\x81\x00", b"\x88\x89\0\0\0\0\x03\xeabad fin"),
+            (b"\x09\x00", b"\x88\x8a\0\0\0\0\x03\xeafrag ctl"),
+            (b"\x81\x80", b"\x88\x8a\0\0\0\0\x03\xeasrv mask"),
+            (b"\x89\x7e", b"\x88\x89\0\0\0\0\x03\xeactl len"),
+            (b"\x82\x7f\x80", b"\x88\x89\0\0\0\0\x03\xeabad len"),
+        ] {
+            let (out, n) = client_answers(frames);
+            assert_eq!(&out[..n], close, "{}", frames.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn a_client_takes_1012_to_1015_from_a_server() {
+        let (client, n) = client_answers(b"\x88\x02\x03\xf4");
+        assert_eq!(&client[..n], b"\x88\x82\0\0\0\0\x03\xf4");
+        // a server makes it 1002
+        let (server, m) = answers(b"\x88\x82\0\0\0\0\x03\xf4");
+        assert_eq!(&server[..m], b"\x88\x02\x03\xea");
+    }
+
+    #[test]
+    fn after_our_close_has_gone_anything_ends_it() {
+        let mut ws = Ws::client(Zeros);
+        let mut bad = *b"\xc1\x05Hello";
+        assert_eq!(ws.rx(&mut bad).consumed, bad.len());
+        // until our close has gone, what comes is dropped
+        let mut more = *b"\x81\x00";
+        assert_eq!(ws.rx(&mut more).consumed, 2);
+        assert_eq!(ws.close(), None);
+        let mut out = [0u8; 64];
+        assert!(ws.tx(&mut out, &mut Nothing) > 0);
+        assert_eq!(ws.close(), None);
+        let mut ack = *b"\x88\x02\x03\xe8";
+        assert_eq!(ws.rx(&mut ack).consumed, 4);
+        assert_eq!(ws.close(), Some(Close::Release));
+    }
+
+    #[test]
+    fn a_client_with_no_random_fails() {
+        let mut ws = Ws::client(Dry);
+        assert_eq!(ws.send(Kind::Text, 1), Err(SendError::NoMask));
+        assert_eq!(ws.close(), Some(Close::Release));
+        let mut out = [0u8; 8];
+        assert_eq!(ws.tx(&mut out, &mut Nothing), 0);
     }
 
     #[test]

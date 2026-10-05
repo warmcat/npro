@@ -15,5 +15,8 @@ repository.workspace   = true
 npro-core.workspace = true
 npro-h1.workspace   = true
 
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+
 [lints]
 workspace = true
