@@ -721,6 +721,40 @@ state with its deadline; and neither side has a fuzz target of its own.
 byte, as do the new ws transcripts.  The fuzz target is seeded from
 `fuzz/fuzz-ws/seeds`.
 
+**The server half (done, 2026-10-05)**: the new crate `npro-ws`.
+`handshake::server` is C's `lws_process_ws_upgrade()` over the h1
+server's request: a GET, `upgrade` among the `Connection` tokens, a key
+under 128 bytes and a Host, version 13 (none is a 400, another a 426
+saying `sec-websocket-version: 13`), and the first subprotocol of the
+request's list the server has, or its default for none; a refusal is
+answered by the h1 server's new `refuse_upgrade`, with C's status page.
+`response_101` is C's 101, header for header.  `conn::Ws` is the
+connection after it, sans-IO as the h1 sides are: `rx` takes a thing at a
+time and unmasks a payload where it lies, handing the application each
+piece of a message as it arrives, with whether it starts and ends the
+message, rather than C's whole frame up to its rx buffer; control frames
+are gathered, a ping answered with C's one pending pong, the peer's close
+answered with its own payload, its code made 1002 as C's
+`answer_peer_close` makes it.  What C refuses is refused with C's close
+code and reason, and nothing is read after either close.  `tx` writes in
+C's order and pulls the application's payload, as the h1 server does;
+`close_when_flushed` is C's close with no close frame once the last
+message has gone.  `crates/npro-test/tests/ws_server_replay.rs` replays,
+byte for byte, four bytes at a time, with C's echo app: all of
+`h1-ws-server`; the refused upgrades `ws-server-version-8`, `-no-version`,
+`-conn-no-upgrade`, `-no-subprotocol` and `-not-get`; and
+`ws-server-ping-close`, `-close-partial`, `-close-when-flushed` and
+`-huge-frame`.  The fuzz target `ws-server` is seeded from C's
+`fuzz/fuzz-ws/seeds`.
+
+Not yet: the client half (its handshake, masking with a mask drawn per
+frame, the client's side of the parser, and the `ws-client-*`
+transcripts) comes next; nothing here has time, so there are no close
+deadlines and no keepalive pings; the frame maximum is C's fixed 256 MiB,
+not configured, and there is no message maximum; the h1 server does not
+yet answer an unknown `Upgrade` with C's 403, or an upgrade with a body
+with its 400; and a message's pieces are the application's to gather.
+
 ### Phase 1f: permessage-deflate (feature `pmd`)
 
 - Negotiation, the parameters with their C ranges, the zip-bomb cap of
