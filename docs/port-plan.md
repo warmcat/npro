@@ -1,6 +1,6 @@
 # npro: plan for the sansIO port
 
-Status: agreed, 2026-10-03.  Phases 0, 1a, 1b and 1c are done, and 1d's server half.  npro is the Rust port of
+Status: agreed, 2026-10-03.  Phases 0 to 1d are done.  npro is the Rust port of
 libwebsockets' sansIO half (https://npro.rs).
 
 This plan puts into practice the C tree's porting guide
@@ -612,7 +612,7 @@ and planted bugs in the
 parser and dechunker (a limit off by one, `+` left alone in the query, the
 continuation's SP dropped) each fail it.
 
-### Phase 1d: the h1 transaction, server and client
+### Phase 1d: the h1 transaction, server and client (done, 2026-10-05)
 
 - **Server** (`lws_http_action` rules, in C's order): CL with TE gives
   400; more than one Host gives 400; Expect gives 417 or a 100; TE other
@@ -658,10 +658,30 @@ server transcripts byte for byte with C's `sansio-uri` app: the `h1-uri-*`
 and `h1-reqline-*` ones, `h1-header-past-limit`, `h1-post-no-length`,
 `h1-short-answer` and `h1-body-done`.
 
-Not yet: the connection machines of phase 1b are not driven by it, `Expect:
-100-continue` is accepted but no 100 is sent, a fallback role is a
-shutdown, and there is no fuzz target for it.  The client half comes
-next.
+**The client half (done, 2026-10-05)**: `npro_h1::client::Client`, one
+connection's transaction.  `tx` writes the request head as C's
+`lws_generate_client_handshake()` composes it, in C's order (request line,
+`Pragma` and `Cache-Control`, `Host`, `Origin`, `connection: close`).
+`rx` takes the response a thing at a time, as the server does, so the body
+is pulled at the application's pace: a 1xx other than 101 is rewound out
+of the table, up to 8; a HEAD's answer, a 204 or a 304 has no body; a
+lone `chunked` wins over a Content-Length; a list of codings, or a second
+or malformed Content-Length, fails the connection; with neither, the body
+runs to the close, `rx_closed`.  The status is C's `atoi()` of the status
+line.  `tests/h1_client_replay.rs` replays the seven h1 client transcripts
+that need nothing more (not `h1-client-digest-retry`): the request byte
+for byte, the body the app is given, and the release exactly where C
+released, or else a complete transaction.
+
+**Exit check, met**: `h1-client-get` and the first exchange of
+`h1-ws-server` replay byte for byte, with the server and client
+transcripts above.
+
+Not yet, for later phases or when something needs them: the connection
+machines of phase 1b drive neither side; no 100 Continue is sent; a
+server's fallback role is a shutdown; a client sends no request body,
+follows no redirect, does no digest auth, and has no kept-warm `IDLING`
+state with its deadline; and neither side has a fuzz target of its own.
 
 ### Phase 1e: ws
 
