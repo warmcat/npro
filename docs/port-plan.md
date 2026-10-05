@@ -1,6 +1,6 @@
 # npro: plan for the sansIO port
 
-Status: agreed, 2026-10-03.  Phases 0, 1a, 1b and 1c are done.  npro is the Rust port of
+Status: agreed, 2026-10-03.  Phases 0, 1a, 1b and 1c are done, and 1d's server half.  npro is the Rust port of
 libwebsockets' sansIO half (https://npro.rs).
 
 This plan puts into practice the C tree's porting guide
@@ -639,6 +639,29 @@ continuation's SP dropped) each fail it.
 **Exit check**: `h1-client-get` and the first exchange of `h1-ws-server`
 replay byte for byte, plus the new C transcripts of section 1 that cover
 h1.
+
+**The server half (done, 2026-10-05)**: `npro_h1::server::Server`, one
+connection's transactions.  `rx` takes at most one thing per call, a
+request's head, a piece of its body borrowed from the input, or the body's
+end, and holds what it did not take, so pipelined requests wait and body
+bytes that came with a head are never lost.  `respond` composes C's status
+line and headers, `tx` writes what the connection owes and then pulls the
+payload from a `TxSource`, and `complete` is C's
+`lws_http_transaction_completed()`.  C's checks between head and app run
+in C's order (400 for both framings or two Hosts, 417, 501, 400 for a bad
+or second Content-Length, 413), a refusal is C's status page and a
+shutdown, an answer short of its length or without one shuts down, and
+keep-alive follows the version and `Connection`.  A request with neither
+Content-Length nor Transfer-Encoding has no body, as C now has it
+(`h1-post-no-length`).  `tests/h1_server_replay.rs` replays 19 of C's
+server transcripts byte for byte with C's `sansio-uri` app: the `h1-uri-*`
+and `h1-reqline-*` ones, `h1-header-past-limit`, `h1-post-no-length`,
+`h1-short-answer` and `h1-body-done`.
+
+Not yet: the connection machines of phase 1b are not driven by it, `Expect:
+100-continue` is accepted but no 100 is sent, a fallback role is a
+shutdown, and there is no fuzz target for it.  The client half comes
+next.
 
 ### Phase 1e: ws
 
