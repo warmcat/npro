@@ -340,10 +340,47 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         self.refuse(version, code, text);
     }
 
+    /// Refuses the request in hand's upgrade with C's status page, and
+    /// `extra` as a header of it, then shuts down: C's
+    /// `_lws_return_http_status()` as `ws_upgrade_refuse()` uses it, a 426
+    /// saying `sec-websocket-version: 13`.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError::NotNow`] if there is no request in hand, or it is
+    /// answered already.
+    pub fn refuse_upgrade(
+        &mut self,
+        code: u16,
+        extra: Option<(&[u8], &[u8])>,
+    ) -> Result<(), RespondError> {
+        match self.phase {
+            Phase::Request(Txn {
+                reply: Reply::Awaited,
+                ..
+            }) => {}
+            Phase::Request(_) | Phase::Head | Phase::Refusing | Phase::Closed(_) => {
+                return Err(RespondError::NotNow);
+            }
+        }
+        self.refuse_with(self.version, code, b"", extra);
+        Ok(())
+    }
+
     /// Queues C's status page, then the shutdown.
     fn refuse(&mut self, version: Version, code: u16, text: &[u8]) {
+        self.refuse_with(version, code, text, None);
+    }
+
+    fn refuse_with(
+        &mut self,
+        version: Version,
+        code: u16,
+        text: &[u8],
+        extra: Option<(&[u8], &[u8])>,
+    ) {
         self.own = Own::new();
-        if status_page(&mut self.own, version, code, text).is_err() {
+        if status_page(&mut self.own, version, code, text, extra).is_err() {
             self.own = Own::new();
         }
         self.phase = Phase::Refusing;
@@ -665,7 +702,13 @@ fn status_line(own: &mut Own, v: Version, code: u16) -> Result<(), RespondError>
 
 /// C's status page: `_lws_return_http_status()` and
 /// `lws_http_status_page_body()`.
-fn status_page(own: &mut Own, v: Version, code: u16, text: &[u8]) -> Result<(), RespondError> {
+fn status_page(
+    own: &mut Own,
+    v: Version,
+    code: u16,
+    text: &[u8],
+    extra: Option<(&[u8], &[u8])>,
+) -> Result<(), RespondError> {
     const PRE: &[u8] = b"<html><head><meta charset=utf-8 http-equiv=\"Content-Language\" \
 content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>\
 </head><body><h1>";
@@ -678,7 +721,14 @@ content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>
         .try_fold(0usize, |a, n| a.checked_add(*n))
         .ok_or(RespondError::TooLong)?;
     status_line(own, v, code)?;
-    own.push(b"content-type: text/html\r\ncontent-length: ")?;
+    own.push(b"content-type: text/html\r\n")?;
+    if let Some((name, value)) = extra {
+        own.push(name)?;
+        own.push(b": ")?;
+        own.push(value)?;
+        own.push(b"\r\n")?;
+    }
+    own.push(b"content-length: ")?;
     own.push_u64(u64::try_from(body_len).map_err(|_| RespondError::TooLong)?)?;
     own.push(b"\r\n\r\n")?;
     own.push(PRE)?;
