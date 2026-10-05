@@ -7,6 +7,7 @@
 //! with a length of 10 and 3 bytes (none to a HEAD); `/body-done` from the
 //! body's first piece, with `ok\n`.  Each `rx` is handed to npro's server,
 //! and what it writes before the next must be the transcript's `tx` bytes.
+//! So must `h1-ws-server`'s first exchange, a GET to the `sansio` vhost.
 
 #![expect(
     unused_crate_dependencies,
@@ -58,6 +59,8 @@ mod h1_server_replay {
         complete_when_sent: bool,
         /// `/body-done`: answer from the body.
         body_done: bool,
+        /// The `sansio` vhost's `http` instead: this, to any request.
+        fixed: Option<&'static [u8]>,
     }
 
     impl TxSource for UriApp {
@@ -84,6 +87,11 @@ mod h1_server_replay {
         }
 
         fn request(&mut self, s: &mut Server<Vec<u8>>) {
+            if let Some(f) = self.fixed {
+                let len = u64::try_from(f.len()).unwrap();
+                self.answer(s, len, f);
+                return;
+            }
             let t = s.request();
             let path = t
                 .first(Token::GetUri)
@@ -146,14 +154,15 @@ mod h1_server_replay {
         }
     }
 
-    fn replay(t: &Transcript) {
-        let cfg = head::Config::new()
-            .with_limit(Token::GetUri, NonZeroU16::new(33).unwrap())
-            .with_limit(Token::UserAgent, NonZeroU16::new(16).unwrap());
+    /// Replays `t`'s first `rxs` reads, with `app`, in a context limiting
+    /// what `cfg` limits.
+    fn replay(t: &Transcript, cfg: head::Config, mut app: UriApp, rxs: usize) {
         let mut s = Server::new(vec![0u8; DEFAULT_CAPACITY], Config::new(cfg)).unwrap();
-        let mut app = UriApp::default();
         let mut steps = t.steps.iter().peekable();
-        while let Some(step) = steps.next() {
+        for _ in 0..rxs {
+            let Some(step) = steps.next() else {
+                break;
+            };
             let StepKind::Rx(rx) = &step.kind else {
                 panic!("{}: {:?} with no rx before it", t.case, step.kind);
             };
@@ -188,7 +197,24 @@ mod h1_server_replay {
                 .iter()
                 .find(|t| t.case == case)
                 .unwrap_or_else(|| panic!("no transcript {case}"));
-            replay(t);
+            let cfg = head::Config::new()
+                .with_limit(Token::GetUri, NonZeroU16::new(33).unwrap())
+                .with_limit(Token::UserAgent, NonZeroU16::new(16).unwrap());
+            replay(t, cfg, UriApp::default(), usize::MAX);
         }
+    }
+
+    /// `h1-ws-server`'s first exchange, a GET to the `sansio` vhost, whose
+    /// `http` answers `sansio ok`; the rest of it is ws.
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the transcripts: native runs keep it")]
+    fn h1_ws_servers_first_exchange_replays() {
+        let all = vendored().unwrap();
+        let t = all.iter().find(|t| t.case == "h1-ws-server").unwrap();
+        let app = UriApp {
+            fixed: Some(b"sansio ok\n"),
+            ..UriApp::default()
+        };
+        replay(t, head::Config::new(), app, 1);
     }
 }
