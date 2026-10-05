@@ -30,3 +30,11 @@ dependencies = [
  "npro-core",
  "npro-h1",
 ]
+
+[[package]]
+name = "npro-ws"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-h1",
+]

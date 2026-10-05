@@ -32,7 +32,7 @@ export PATH
 jobs="${SAI_PARALLEL:-4}"
 
 # the sans-IO crates, which must build with no std at all
-nostd_crates="npro-core npro-h1"
+nostd_crates="npro-core npro-h1 npro-ws"
 nostd_targets="thumbv6m-none-eabi thumbv7em-none-eabihf riscv32imc-unknown-none-elf"
 
 . scripts/require.sh

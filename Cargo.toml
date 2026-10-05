@@ -10,6 +10,12 @@ license      = "MIT"
 homepage     = "https://npro.rs"
 repository   = "https://libwebsockets.org/git/npro"
 
+# The crates here that a published crate depends on: a published crate's
+# dependency needs a version beside its path, which crates.io resolves
+[workspace.dependencies]
+npro-core = { path = "crates/npro-core", version = "0.0.2" }
+npro-h1   = { path = "crates/npro-h1", version = "0.0.2" }
+
 [workspace.lints.rust]
 unsafe_code     = "forbid"
 missing_docs    = "deny"

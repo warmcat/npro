@@ -1,0 +1,19 @@
+[package]
+name        = "npro-ws"
+description = "The sans-IO websockets of npro: the handshake, framing and close"
+readme      = "../../README.md"
+keywords    = ["websocket", "sans-io", "no-std"]
+categories  = ["network-programming", "web-programming::websocket", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core.workspace = true
+npro-h1.workspace   = true
+
+[lints]
+workspace = true

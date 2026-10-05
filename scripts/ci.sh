@@ -43,7 +43,7 @@ cargo "+$msrv" check --workspace --all-targets --all-features --locked
 
 echo "== no_std"
 # the sans-IO crates must build for a target with no std at all
-for c in npro-core npro-h1; do
+for c in npro-core npro-h1 npro-ws; do
 	cargo build -p "$c" --all-features --target thumbv7em-none-eabihf --locked
 done
 
