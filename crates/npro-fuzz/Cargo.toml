@@ -13,6 +13,7 @@ repository.workspace   = true
 npro-core = { path = "../npro-core" }
 npro-h1   = { path = "../npro-h1" }
 npro-test = { path = "../npro-test" }
+npro-ws   = { path = "../npro-ws" }
 
 [dev-dependencies]
 npro-core = { path = "../npro-core", features = ["replay"] }

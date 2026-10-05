@@ -36,6 +36,7 @@ allow = [
 	"npro-fuzz-targets",
 	"npro-fuzz",
 	"npro-h1",
+	"npro-ws",
 	"npro-core",
 	"npro-test",
 

@@ -227,6 +227,11 @@ fn chunked() {
 }
 
 #[test]
+fn ws_server() {
+    smoke(Target::WsServer, seeded).unwrap();
+}
+
+#[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
     let tested = [
@@ -237,6 +242,7 @@ fn every_target_has_a_smoke_test() {
         "h1-request",
         "h1-response",
         "chunked",
+        "ws-server",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

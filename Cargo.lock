@@ -17,6 +17,7 @@ dependencies = [
  "npro-core",
  "npro-h1",
  "npro-test",
+ "npro-ws",
 ]
 
 [[package]]

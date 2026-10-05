@@ -22,9 +22,11 @@
 
 mod h1;
 mod targets;
+mod ws;
 
 pub use h1::{chunked, h1_request, h1_response};
 pub use targets::{base64, sha1, transcript, utf8};
+pub use ws::ws_server;
 
 /// A fuzz target: its name is the libFuzzer target's, the seed directory's
 /// under `fuzz/seeds/`, and the corpus's under `corpus-<name>`.
@@ -53,11 +55,13 @@ pub enum Target {
     H1Response,
     /// [`chunked`]: the chunked transfer coding's decoder.
     Chunked,
+    /// [`ws_server`]: the ws frame parser, as a server.
+    WsServer,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -65,6 +69,7 @@ impl Target {
         Self::H1Request,
         Self::H1Response,
         Self::Chunked,
+        Self::WsServer,
     ];
 
     /// The target's name.
@@ -78,6 +83,7 @@ impl Target {
             Self::H1Request => "h1-request",
             Self::H1Response => "h1-response",
             Self::Chunked => "chunked",
+            Self::WsServer => "ws-server",
         }
     }
 
@@ -96,6 +102,7 @@ impl Target {
             Self::H1Request => h1_request(data),
             Self::H1Response => h1_response(data),
             Self::Chunked => chunked(data),
+            Self::WsServer => ws_server(data),
         }
     }
 }

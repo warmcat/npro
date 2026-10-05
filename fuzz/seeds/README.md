@@ -22,7 +22,9 @@ The protocol crates' targets start from the C library's corpora
   0, named as there (`absuri.http`, `get.http`...), and some of
   `crates/npro-test/h1/requests/`, named as there;
 - `h1-response` and `chunked`: some of `crates/npro-test/h1/responses/`
-  and `chunked/`.
+  and `chunked/`;
+- `ws-server`: C's `fuzz/fuzz-ws/seeds`, each behind a control byte of 0,
+  named as there.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer
