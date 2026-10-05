@@ -6,14 +6,17 @@
 //!   and a client's key, its request's upgrade lines and its checks of the
 //!   server's response;
 //! - [`conn`]: a ws connection, either end, its frames in and out, and its
-//!   close.
+//!   close;
+//! - `pmd`, with the opt-in feature of that name: permessage-deflate, its
+//!   negotiation and its compression, which needs `alloc`.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "pmd")]
+extern crate alloc;
+
 pub mod conn;
 pub mod handshake;
-
-// admitted for permessage-deflate, which is to use it
 #[cfg(feature = "pmd")]
-use miniz_oxide as _;
+pub mod pmd;

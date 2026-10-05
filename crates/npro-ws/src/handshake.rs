@@ -257,14 +257,16 @@ fn accept_of(key: &[u8]) -> Option<[u8; ACCEPT_LEN]> {
 /// The most a 101 C writes may have here.
 pub const MAX_101: usize = 256;
 
-/// C's 101 for `a`, `name` being its subprotocol's: written into `out`,
+/// C's 101 for `a`, `name` being its subprotocol's, and `extensions` the
+/// header lines, each ending CRLF, saying what extensions it takes, as
+/// `pmd::ServerAccepted::header_lines` has them: written into `out`,
 /// returning how much of it.
 ///
 /// # Errors
 ///
 /// `None` if `out` is too small.
 #[must_use]
-pub fn response_101(a: &Accepted, name: &[u8], out: &mut [u8]) -> Option<usize> {
+pub fn response_101(a: &Accepted, name: &[u8], extensions: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut at = 0usize;
     let mut put = |b: &[u8]| -> Option<()> {
         let end = at.checked_add(b.len())?;
@@ -279,7 +281,9 @@ pub fn response_101(a: &Accepted, name: &[u8], out: &mut [u8]) -> Option<usize> 
         put(b"\r\nSec-WebSocket-Protocol: ")?;
         put(name)?;
     }
-    put(b"\r\n\r\n")?;
+    put(b"\r\n")?;
+    put(extensions)?;
+    put(b"\r\n")?;
     Some(at)
 }
 
@@ -287,7 +291,7 @@ pub fn response_101(a: &Accepted, name: &[u8], out: &mut [u8]) -> Option<usize> 
 pub const KEY_LEN: usize = 24;
 
 /// The most the lines [`ClientKey::request_lines`] writes may have, but
-/// for the subprotocols offered.
+/// for the subprotocols and extensions offered.
 pub const MAX_REQUEST_LINES: usize = 160;
 
 /// Why a client fails the server's response to its upgrade: each is C's
@@ -343,7 +347,7 @@ impl core::error::Error for ClientRefusal {}
 /// assert_eq!(key.key(), b"OvomtQpKCWUnZW7tMR6Gqw==");
 ///
 /// let mut lines = [0u8; MAX_REQUEST_LINES + 32];
-/// let n = key.request_lines(Some(b"echo"), &mut lines).unwrap();
+/// let n = key.request_lines(Some(b"echo"), None, &mut lines).unwrap();
 /// let mut c = Client::new([0u8; 1024], Request {
 ///     method: b"GET",
 ///     path: b"/echo",
@@ -361,8 +365,8 @@ impl core::error::Error for ClientRefusal {}
 ///                 Connection: Upgrade\r\nSec-WebSocket-Protocol: echo\r\n\
 ///                 Sec-WebSocket-Accept: rSsJf/ZKQdiul0BGIJ6uQGawdU8=\r\n\r\n")?;
 /// assert_eq!(rx.event, Some(Event::Response));
-/// let chosen = key.check(c.status(), c.response(), Some(b"echo"))?;
-/// assert_eq!(chosen, Some(&b"echo"[..]));
+/// let checked = key.check(c.status(), c.response(), Some(b"echo"), None)?;
+/// assert_eq!(checked.protocol, Some(&b"echo"[..]));
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -395,15 +399,23 @@ impl ClientKey {
     }
 
     /// The lines asking for the upgrade, in C's order, offering
-    /// `protocols`, a comma separated list, if any: for the request's
+    /// `protocols`, a comma separated list, and `extensions`, such as
+    /// `pmd::OFFER`, if any: for the request's
     /// [`npro_h1::client::Connection::Upgrade`].  Written into `out`,
     /// returning how much of it.
     ///
-    /// `None` if `out` is too small, or `protocols` would break the line:
-    /// it may not hold a CR, LF or NUL.
+    /// `None` if `out` is too small, or `protocols` or `extensions` would
+    /// break the line: they may not hold a CR, LF or NUL.
     #[must_use]
-    pub fn request_lines(&self, protocols: Option<&[u8]>, out: &mut [u8]) -> Option<usize> {
-        if protocols.is_some_and(|p| p.iter().any(|c| matches!(c, b'\r' | b'\n' | 0))) {
+    pub fn request_lines(
+        &self,
+        protocols: Option<&[u8]>,
+        extensions: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let breaks =
+            |v: Option<&[u8]>| v.is_some_and(|p| p.iter().any(|c| matches!(c, b'\r' | b'\n' | 0)));
+        if breaks(protocols) || breaks(extensions) {
             return None;
         }
         let mut at = 0usize;
@@ -421,23 +433,33 @@ impl ClientKey {
             put(p)?;
             put(b"\r\n")?;
         }
+        if let Some(e) = extensions {
+            put(b"Sec-WebSocket-Extensions: ")?;
+            put(e)?;
+            put(b"\r\n")?;
+        }
         put(b"Sec-WebSocket-Version: 13\r\n")?;
         Some(at)
     }
 
     /// Checks the server's final response, its status `status` and its
-    /// headers `t`, to a request that offered `offered`: C's checks, in C's
-    /// order.  Returns the subprotocol the server named, if it named one.
+    /// headers `t`, to a request that offered the subprotocols `offered`
+    /// and the extensions `extensions`: C's checks, in C's order.  Returns
+    /// the subprotocol the server named, and what it said of the
+    /// extensions, if anything, which the extension then reads, as
+    /// `pmd::client_accept` does.
     ///
     /// # Errors
     ///
-    /// The [`ClientRefusal`]: the connection fails.
+    /// The [`ClientRefusal`]: the connection fails.  Extensions, where none
+    /// were offered, or said in more than one header, are refused.
     pub fn check<'t, S: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
         status: Option<u16>,
         t: &'t HeaderTable<S>,
         offered: Option<&[u8]>,
-    ) -> Result<Option<&'t [u8]>, ClientRefusal> {
+        extensions: Option<&[u8]>,
+    ) -> Result<Checked<'t>, ClientRefusal> {
         if status != Some(101) {
             return Err(ClientRefusal::NotSwitching);
         }
@@ -490,14 +512,32 @@ impl ClientKey {
             Some(name)
         };
 
-        if t.total_len(Token::WsExtensions) > 0 {
-            return Err(ClientRefusal::Extension);
-        }
+        let said = if t.total_len(Token::WsExtensions) == 0 {
+            None
+        } else {
+            let mut f = t.fragments(Token::WsExtensions);
+            match (extensions, f.next(), f.next()) {
+                (Some(_), Some(value), None) => Some(value),
+                (None | Some(_), _, _) => return Err(ClientRefusal::Extension),
+            }
+        };
         if t.first(Token::WsAccept) != Some(self.accept.as_slice()) {
             return Err(ClientRefusal::Accept);
         }
-        Ok(chosen)
+        Ok(Checked {
+            protocol: chosen,
+            extensions: said,
+        })
     }
+}
+
+/// What a client's check of the server's 101 found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checked<'t> {
+    /// The subprotocol the server named, if it named one.
+    pub protocol: Option<&'t [u8]>,
+    /// What the server said of the extensions offered, if anything.
+    pub extensions: Option<&'t [u8]>,
 }
 
 #[cfg(test)]
@@ -532,7 +572,9 @@ mod tests {
     fn verdict(response: &str) -> Verdict {
         let key = ClientKey::new(&mut SeededRandom::new(1)).unwrap();
         let mut lines = [0u8; MAX_REQUEST_LINES];
-        let n = key.request_lines(Some(b"echo, chat"), &mut lines).unwrap();
+        let n = key
+            .request_lines(Some(b"echo, chat"), None, &mut lines)
+            .unwrap();
         let mut c = Client::new(
             [0u8; 1024],
             Request {
@@ -550,8 +592,8 @@ mod tests {
         let _ = c.tx(&mut out);
         let _ = c.rx(response.as_bytes()).unwrap();
         assert!(c.is_upgraded(), "{response}");
-        match key.check(c.status(), c.response(), Some(b"echo, chat")) {
-            Ok(p) => Verdict::Took(p.map(<[u8]>::len)),
+        match key.check(c.status(), c.response(), Some(b"echo, chat"), None) {
+            Ok(c) => Verdict::Took(c.protocol.map(<[u8]>::len)),
             Err(r) => Verdict::Refused(r),
         }
     }
@@ -621,9 +663,10 @@ mod tests {
     fn the_request_lines_refuse_a_protocol_list_that_breaks_the_line() {
         let key = ClientKey::new(&mut SeededRandom::new(1)).unwrap();
         let mut out = [0u8; MAX_REQUEST_LINES];
-        assert_eq!(key.request_lines(Some(b"a\r\nX: y"), &mut out), None);
-        assert_eq!(key.request_lines(None, &mut out[..10]), None);
-        let n = key.request_lines(None, &mut out).unwrap();
+        assert_eq!(key.request_lines(Some(b"a\r\nX: y"), None, &mut out), None);
+        assert_eq!(key.request_lines(None, Some(b"x\ny"), &mut out), None);
+        assert_eq!(key.request_lines(None, None, &mut out[..10]), None);
+        let n = key.request_lines(None, None, &mut out).unwrap();
         assert_eq!(
             &out[..n],
             b"Upgrade: websocket\r\nConnection: Upgrade\r\n\

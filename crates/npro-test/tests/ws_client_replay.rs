@@ -105,10 +105,10 @@ mod ws_client_replay {
                     progress |= rx.consumed > 0;
                     if rx.event == Some(H1Event::Response) {
                         assert!(client.is_upgraded());
-                        let chosen = key
-                            .check(client.status(), client.response(), Some(OFFERED))
+                        let checked = key
+                            .check(client.status(), client.response(), Some(OFFERED), None)
                             .unwrap();
-                        assert_eq!(chosen, Some(OFFERED));
+                        assert_eq!(checked.protocol, Some(OFFERED));
                         let mut ws = Ws::client(random.take().unwrap());
                         app.established(&mut ws);
                         *conn = Conn::Ws(Box::new(ws));
@@ -145,7 +145,7 @@ mod ws_client_replay {
         let mut random = SeededRandom::new(seed.get());
         let key = ClientKey::new(&mut random).unwrap();
         let mut lines = [0u8; MAX_REQUEST_LINES + 32];
-        let lines_len = key.request_lines(Some(OFFERED), &mut lines).unwrap();
+        let lines_len = key.request_lines(Some(OFFERED), None, &mut lines).unwrap();
         let mut client = Client::new(
             vec![0u8; DEFAULT_CAPACITY],
             Request {

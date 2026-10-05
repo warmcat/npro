@@ -124,7 +124,8 @@ mod ws_server_replay {
         match handshake::server(t, &PROTOCOLS, Some(0)) {
             Ok(a) => {
                 let mut first = [0u8; MAX_101];
-                let n = handshake::response_101(&a, PROTOCOLS[a.protocol], &mut first).unwrap();
+                let n =
+                    handshake::response_101(&a, PROTOCOLS[a.protocol], b"", &mut first).unwrap();
                 Answer::Upgraded(Box::new(Ws::server(&first[..n])))
             }
             Err(r) => {

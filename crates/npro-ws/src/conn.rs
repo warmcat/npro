@@ -33,6 +33,11 @@
 //! begun), then our own close, then the pong, then the answer to the peer's
 //! close, then the application's next frame, whose payload it pulls.  A
 //! pong still owed when we begin a close is forgotten, as C forgets it.
+//!
+//! With the `pmd` feature and `Ws::with_pmd`, messages are deflated as
+//! `crate::pmd` describes: a little input may then inflate to more than one
+//! call of [`Ws::rx`] gives, and [`Ws::rx_pending`] says when to call it
+//! again with no more.
 
 use npro_core::random::{Random, Unavailable};
 use npro_core::utf8::Utf8Validator;
@@ -192,6 +197,13 @@ enum Op {
 }
 
 impl Op {
+    const fn of(kind: Kind) -> Self {
+        match kind {
+            Kind::Text => Self::Text,
+            Kind::Binary => Self::Binary,
+        }
+    }
+
     const fn control(self) -> bool {
         matches!(self, Self::Close | Self::Ping | Self::Pong)
     }
@@ -246,7 +258,30 @@ enum Msg {
     /// Between messages.
     Idle,
     /// A message is under way, and its first piece has been given or not.
-    Open { kind: Kind, given: Given },
+    Open {
+        kind: Kind,
+        given: Given,
+        coding: Coding,
+    },
+}
+
+/// How a message's payload is coded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coding {
+    /// As it is.
+    Plain,
+    /// Deflated: its first frame had RSV1, with permessage-deflate.
+    #[cfg(feature = "pmd")]
+    Deflated,
+}
+
+/// The extension in use, if any.
+#[derive(Clone, Debug)]
+enum Ext {
+    None,
+    /// permessage-deflate.
+    #[cfg(feature = "pmd")]
+    Pmd(alloc::boxed::Box<crate::pmd::Codec>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,10 +412,55 @@ enum App {
         mask: Option<[u8; 4]>,
         at: u64,
     },
+    /// A message being deflated into frames, `owed` of it still to be
+    /// pulled, and a frame going, its payload `sent` so far.
+    #[cfg(feature = "pmd")]
+    Deflating {
+        kind: Kind,
+        owed: u64,
+        frame: Option<Going>,
+    },
+}
+
+/// What a step of a deflated message's payload came to.
+#[cfg(feature = "pmd")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deflated {
+    /// The frame is done with and gave nothing: parsing goes on, from
+    /// here.
+    Again(usize),
+    /// Nothing to give, having taken this much.
+    Nothing(usize),
+    /// A piece of the message.
+    Piece(Inflating),
+    /// Text that is not UTF-8, with C's reason.
+    Refused(&'static [u8]),
+    /// It does not inflate, or is a zip bomb: the connection is dropped.
+    Dropped,
+}
+
+/// A piece of a deflated message, in the codec's output.
+#[cfg(feature = "pmd")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Inflating {
+    consumed: usize,
+    kind: Kind,
+    produced: usize,
+    first: bool,
+    last: bool,
+}
+
+/// A deflated frame's payload going out.
+#[cfg(feature = "pmd")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Going {
+    sent: usize,
+    mask: Option<[u8; 4]>,
+    fin: bool,
 }
 
 /// Masks `b`, the bytes of a payload from `at` on, with `mask`.
-fn apply_mask(b: &mut [u8], mask: [u8; 4], at: u64) {
+pub(crate) fn apply_mask(b: &mut [u8], mask: [u8; 4], at: u64) {
     // the mask's index where `b` starts: `at` mod 4
     let start = at.to_le_bytes().first().map_or(0, |l| usize::from(l & 3));
     for (x, m) in b.iter_mut().zip(mask.iter().cycle().skip(start)) {
@@ -388,8 +468,9 @@ fn apply_mask(b: &mut [u8], mask: [u8; 4], at: u64) {
     }
 }
 
-/// A final frame's header, with a client's mask after it.
-fn frame_header(op: Op, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
+/// A frame's header, its first byte `first` (FIN, RSV and opcode), with a
+/// client's mask after it.
+fn frame_header(first: u8, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
     // the length is 7 bits, or 126 and 16 bits, or 127 and 64 bits: the
     // last of its big endian bytes, after the marker
     let be = len.to_be_bytes();
@@ -401,7 +482,7 @@ fn frame_header(op: Op, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
     let masked = if mask.is_some() { 0x80 } else { 0 };
     let mut header = [0u8; 14];
     if let Some(h) = header.get_mut(..2) {
-        h.copy_from_slice(&[0x80 | op.code(), masked | marker]);
+        h.copy_from_slice(&[first, masked | marker]);
     }
     let mut used = 2usize.saturating_add(extra);
     if let (Some(d), Some(s)) = (
@@ -422,7 +503,7 @@ fn frame_header(op: Op, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
 
 /// A control frame, header and payload, masked with a client's mask.
 fn control_frame(op: Op, c: &Ctl, mask: Option<[u8; 4]>, out: &mut Out) {
-    frame_header(op, u64::from(c.len), mask, out);
+    frame_header(0x80 | op.code(), u64::from(c.len), mask, out);
     out.push(c.payload());
     if let Some(m) = mask {
         out.mask_tail(c.payload().len(), m);
@@ -457,6 +538,7 @@ pub struct Ws<P = AsServer> {
     closing: Closing,
     out: Out,
     app: App,
+    ext: Ext,
 }
 
 impl Ws<AsServer> {
@@ -495,6 +577,28 @@ impl<P: Role> Ws<P> {
             closing: Closing::None,
             out,
             app: App::Idle,
+            ext: Ext::None,
+        }
+    }
+
+    /// The connection with permessage-deflate, as negotiated
+    /// ([`crate::pmd`]): a message whose first frame has RSV1 is inflated,
+    /// and what the application sends is deflated.
+    #[cfg(feature = "pmd")]
+    #[must_use]
+    pub fn with_pmd(mut self, params: crate::pmd::Params) -> Self {
+        let codec = crate::pmd::Codec::new(self.role.side(), params);
+        self.ext = Ext::Pmd(alloc::boxed::Box::new(codec));
+        self
+    }
+
+    /// Whether RSV1 may mark a data message's first frame: with
+    /// permessage-deflate, as C's `lws_ws_rsv_valid()` has it.
+    const fn rsv1_marks_deflate(&self) -> bool {
+        match self.ext {
+            Ext::None => false,
+            #[cfg(feature = "pmd")]
+            Ext::Pmd(_) => true,
         }
     }
 
@@ -515,6 +619,35 @@ impl<P: Role> Ws<P> {
             | Closing::Returned(_)
             | Closing::Flushing => None,
         }
+    }
+
+    /// Whether [`Ws::rx`] has more to give without more input: with
+    /// permessage-deflate, a little input may inflate to more than one
+    /// call gives, as C's `rx_draining_ext`.  While it is true, call
+    /// [`Ws::rx`] again, with no input if there is none.  Without
+    /// permessage-deflate, never.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "pmd"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "with pmd it asks the codec, which is not const at the MSRV; the API is one"
+        )
+    )]
+    pub fn rx_pending(&self) -> bool {
+        #[cfg(feature = "pmd")]
+        if let (
+            Ext::Pmd(codec),
+            Parse::Payload(f, left),
+            Msg::Open {
+                coding: Coding::Deflated,
+                ..
+            },
+        ) = (&self.ext, self.parse, self.msg)
+        {
+            return !f.op.control() && (left == 0 || codec.owes());
+        }
+        false
     }
 
     /// Whether the connection has something of its own to write.
@@ -564,7 +697,46 @@ impl<P: Role> Ws<P> {
                         event: None,
                     };
                 }
-                Parse::Payload(f, left) => return self.payload(f, left, input, used),
+                Parse::Payload(f, left) => {
+                    #[cfg(feature = "pmd")]
+                    if !f.op.control()
+                        && matches!(
+                            self.msg,
+                            Msg::Open {
+                                coding: Coding::Deflated,
+                                ..
+                            }
+                        )
+                    {
+                        match self.deflated(f, left, input, used) {
+                            // the frame is done with, and gave nothing:
+                            // on to the next
+                            Deflated::Again(consumed) => {
+                                used = consumed;
+                                continue;
+                            }
+                            Deflated::Nothing(consumed) => {
+                                return Rx {
+                                    consumed,
+                                    event: None,
+                                };
+                            }
+                            Deflated::Refused(reason) => {
+                                let mut r = self.refuse(1007, reason);
+                                r.consumed = input.len();
+                                return r;
+                            }
+                            Deflated::Dropped => {
+                                return Rx {
+                                    consumed: input.len(),
+                                    event: None,
+                                };
+                            }
+                            Deflated::Piece(p) => return self.deflated_piece(p),
+                        }
+                    }
+                    return self.payload(f, left, input, used);
+                }
                 Parse::First | Parse::Len(_) | Parse::LenMore(..) | Parse::Mask(..) => {}
             }
             let Some(&c) = input.get(used) else {
@@ -583,55 +755,72 @@ impl<P: Role> Ws<P> {
         }
     }
 
+    /// A frame's first byte: FIN, RSV and the opcode.  `Some` refuses
+    /// the frame.
+    fn first_byte(&mut self, c: u8) -> Option<(u16, &'static [u8])> {
+        let fin = c & 0x80 != 0;
+        let side = self.role.side();
+        let op = match c & 0x0f {
+            0 => Op::Continuation,
+            1 => Op::Text,
+            2 => Op::Binary,
+            8 => Op::Close,
+            9 => Op::Ping,
+            10 => Op::Pong,
+            // C's server calls a reserved control opcode without
+            // FIN fragmented; its client, a bad opcode
+            _ if side == Side::Server && c & 0x08 != 0 && !fin => {
+                return Some((1002, b"frag ctl"));
+            }
+            _ => return Some((1002, b"bad opc")),
+        };
+        // RSV1 alone, on a data message's first frame, says it is
+        // deflated, if that was agreed
+        let deflated =
+            self.rsv1_marks_deflate() && c & 0x70 == 0x40 && matches!(op, Op::Text | Op::Binary);
+        let rsv = c & 0x70 != 0 && !deflated;
+        if let Some(refused) = Self::first_byte_order(side, op, fin, rsv, self.msg) {
+            return Some(refused);
+        }
+        let coding = Self::coding(deflated);
+        match (op, self.msg) {
+            (Op::Text, Msg::Idle) => {
+                self.utf8 = Utf8Validator::new();
+                self.msg = Msg::Open {
+                    kind: Kind::Text,
+                    given: Given::Nothing,
+                    coding,
+                };
+            }
+            (Op::Binary, Msg::Idle) => {
+                self.msg = Msg::Open {
+                    kind: Kind::Binary,
+                    given: Given::Nothing,
+                    coding,
+                };
+            }
+            // refused above, or nothing to do
+            (Op::Text | Op::Binary, Msg::Open { .. })
+            | (Op::Continuation, Msg::Idle | Msg::Open { .. })
+            | (Op::Close | Op::Ping | Op::Pong, Msg::Idle | Msg::Open { .. }) => {}
+        }
+        self.parse = Parse::Len(Frame {
+            op,
+            fin,
+            masked: false,
+            len: 0,
+            mask: [0; 4],
+        });
+        None
+    }
+
     /// One byte of a frame's header; `Some` refuses the frame.
     fn header(&mut self, c: u8) -> Option<(u16, &'static [u8])> {
         match self.parse {
             Parse::First => {
-                let fin = c & 0x80 != 0;
-                let side = self.role.side();
-                let op = match c & 0x0f {
-                    0 => Op::Continuation,
-                    1 => Op::Text,
-                    2 => Op::Binary,
-                    8 => Op::Close,
-                    9 => Op::Ping,
-                    10 => Op::Pong,
-                    // C's server calls a reserved control opcode without
-                    // FIN fragmented; its client, a bad opcode
-                    _ if side == Side::Server && c & 0x08 != 0 && !fin => {
-                        return Some((1002, b"frag ctl"));
-                    }
-                    _ => return Some((1002, b"bad opc")),
-                };
-                if let Some(refused) = Self::first_byte_order(side, op, fin, c, self.msg) {
+                if let Some(refused) = self.first_byte(c) {
                     return Some(refused);
                 }
-                match (op, self.msg) {
-                    (Op::Text, Msg::Idle) => {
-                        self.utf8 = Utf8Validator::new();
-                        self.msg = Msg::Open {
-                            kind: Kind::Text,
-                            given: Given::Nothing,
-                        };
-                    }
-                    (Op::Binary, Msg::Idle) => {
-                        self.msg = Msg::Open {
-                            kind: Kind::Binary,
-                            given: Given::Nothing,
-                        };
-                    }
-                    // refused above, or nothing to do
-                    (Op::Text | Op::Binary, Msg::Open { .. })
-                    | (Op::Continuation, Msg::Idle | Msg::Open { .. })
-                    | (Op::Close | Op::Ping | Op::Pong, Msg::Idle | Msg::Open { .. }) => {}
-                }
-                self.parse = Parse::Len(Frame {
-                    op,
-                    fin,
-                    masked: false,
-                    len: 0,
-                    mask: [0; 4],
-                });
             }
             Parse::Len(mut f) => {
                 f.masked = c & 0x80 != 0;
@@ -684,6 +873,23 @@ impl<P: Role> Ws<P> {
         None
     }
 
+    /// How a message beginning is coded.
+    #[cfg(feature = "pmd")]
+    const fn coding(deflated: bool) -> Coding {
+        if deflated {
+            Coding::Deflated
+        } else {
+            Coding::Plain
+        }
+    }
+
+    /// How a message beginning is coded: without permessage-deflate, as
+    /// it is.
+    #[cfg(not(feature = "pmd"))]
+    const fn coding(_deflated: bool) -> Coding {
+        Coding::Plain
+    }
+
     /// After the length: the mask, if the frame has one, else the payload.
     const fn after_len(f: Frame) -> Parse {
         if f.masked {
@@ -702,11 +908,10 @@ impl<P: Role> Ws<P> {
         side: Side,
         op: Op,
         fin: bool,
-        c: u8,
+        rsv: bool,
         msg: Msg,
     ) -> Option<(u16, &'static [u8])> {
         let frag_ctl = op.control() && !fin;
-        let rsv = c & 0x70 != 0;
         let open = matches!(msg, Msg::Open { .. });
         let stray_cont = matches!(op, Op::Continuation) && !open;
         let new_in_open = matches!(op, Op::Text | Op::Binary) && open;
@@ -780,7 +985,12 @@ impl<P: Role> Ws<P> {
                 event: None,
             };
         }
-        let Msg::Open { kind, given } = self.msg else {
+        let Msg::Open {
+            kind,
+            given,
+            coding,
+        } = self.msg
+        else {
             return Rx {
                 consumed,
                 event: None,
@@ -805,6 +1015,7 @@ impl<P: Role> Ws<P> {
             Msg::Open {
                 kind,
                 given: Given::Some,
+                coding,
             }
         };
         // nothing for the app once a close is under way
@@ -821,6 +1032,114 @@ impl<P: Role> Ws<P> {
                 data: piece,
                 first: given == Given::Nothing,
                 last,
+            }),
+        }
+    }
+
+    /// The payload of `f`, `left` of it still to come, in a deflated
+    /// message: what fits is unmasked into the codec's hold, and inflated
+    /// from there, at most [`crate::pmd::RX_CHUNK`] bytes a call, so it is
+    /// taken from `input` only as it is held, and given the application
+    /// as it inflates.
+    #[cfg(feature = "pmd")]
+    fn deflated(&mut self, f: Frame, left: u64, input: &[u8], used: usize) -> Deflated {
+        let Msg::Open {
+            kind,
+            given,
+            coding,
+        } = self.msg
+        else {
+            return Deflated::Nothing(used);
+        };
+        let Ext::Pmd(codec) = &mut self.ext else {
+            return Deflated::Nothing(used);
+        };
+        let mut left = left;
+        let mut consumed = used;
+        let room = codec.room();
+        if room > 0 && left > 0 {
+            let rest = input.get(used..).unwrap_or_default();
+            let n = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(rest.len())
+                .min(room);
+            let at = f.len.saturating_sub(left);
+            codec.hold(
+                rest.get(..n).unwrap_or_default(),
+                f.masked.then_some(f.mask),
+                at,
+            );
+            left = left.saturating_sub(u64::try_from(n).unwrap_or(left));
+            consumed = consumed.saturating_add(n);
+        }
+        let end = f.fin && left == 0;
+        let Ok(inflated) = codec.inflate(end) else {
+            // C marks the socket unusable: no close goes
+            self.fail();
+            return Deflated::Dropped;
+        };
+        let more = left > 0 || codec.owes() || (end && !inflated.done);
+        let piece = codec.rx_out(inflated.produced);
+        let bad_text: Option<&'static [u8]> = if kind != Kind::Text {
+            None
+        } else if self.utf8.feed(piece).is_err() {
+            Some(b"bad utf8")
+        } else if inflated.done && !self.utf8.at_boundary() {
+            Some(b"partial utf8")
+        } else {
+            None
+        };
+        if let Some(reason) = bad_text {
+            return Deflated::Refused(reason);
+        }
+        self.parse = if more {
+            Parse::Payload(f, left)
+        } else {
+            Parse::First
+        };
+        if inflated.produced == 0 && !inflated.done {
+            return if more {
+                Deflated::Nothing(consumed)
+            } else {
+                Deflated::Again(consumed)
+            };
+        }
+        self.msg = if inflated.done {
+            Msg::Idle
+        } else {
+            Msg::Open {
+                kind,
+                given: Given::Some,
+                coding,
+            }
+        };
+        // nothing for the app once a close is under way
+        if !matches!(self.closing, Closing::None) {
+            return Deflated::Nothing(consumed);
+        }
+        Deflated::Piece(Inflating {
+            consumed,
+            kind,
+            produced: inflated.produced,
+            first: given == Given::Nothing,
+            last: inflated.done,
+        })
+    }
+
+    /// A piece of a deflated message, as the application is given it.
+    #[cfg(feature = "pmd")]
+    fn deflated_piece(&self, p: Inflating) -> Rx<'_> {
+        let data = match &self.ext {
+            Ext::Pmd(codec) => codec.rx_out(p.produced),
+            Ext::None => &[],
+        };
+        Rx {
+            consumed: p.consumed,
+            event: Some(Event::Message {
+                kind: p.kind,
+                data,
+                first: p.first,
+                last: p.last,
             }),
         }
     }
@@ -883,7 +1202,9 @@ impl<P: Role> Ws<P> {
     /// C's `lws_write()` of a final frame.
     ///
     /// A client's frame is masked with a mask drawn now, as C draws it in
-    /// `lws_write()`.
+    /// `lws_write()`.  With permessage-deflate, the message is deflated as
+    /// it is pulled, into frames of at most `pmd::TX_CHUNK` bytes,
+    /// each masked with a mask drawn as it is begun.
     ///
     /// # Errors
     ///
@@ -894,15 +1215,21 @@ impl<P: Role> Ws<P> {
         if self.app != App::Idle || self.out.pending() || !matches!(self.closing, Closing::None) {
             return Err(SendError::Busy);
         }
-        let op = match kind {
-            Kind::Text => Op::Text,
-            Kind::Binary => Op::Binary,
-        };
+        #[cfg(feature = "pmd")]
+        if let Ext::Pmd(codec) = &mut self.ext {
+            codec.begin_message();
+            self.app = App::Deflating {
+                kind,
+                owed: len,
+                frame: None,
+            };
+            return Ok(());
+        }
         let Ok(mask) = self.role.next_mask() else {
             self.fail();
             return Err(SendError::NoMask);
         };
-        frame_header(op, len, mask, &mut self.out);
+        frame_header(0x80 | Op::of(kind).code(), len, mask, &mut self.out);
         self.app = App::Sending {
             owed: len,
             mask,
@@ -911,8 +1238,9 @@ impl<P: Role> Ws<P> {
         Ok(())
     }
 
-    /// A client's random source failed it: nothing more is read or
-    /// written, and it asks to be released.
+    /// The connection cannot go on: a client's random source failed it,
+    /// or permessage-deflate did.  Nothing more is read or written, and it
+    /// asks to be released.
     const fn fail(&mut self) {
         self.parse = Parse::Stopped;
         self.pong = None;
@@ -929,6 +1257,91 @@ impl<P: Role> Ws<P> {
         };
         control_frame(op, c, mask, &mut self.out);
         true
+    }
+
+    /// The deflated message's next step: a frame's payload, or its
+    /// header, put in flight.  How much went into `room`, or `None` if
+    /// the application must give more first, or the connection failed.
+    #[cfg(feature = "pmd")]
+    fn tx_deflated(&mut self, room: &mut [u8], src: &mut dyn TxSource) -> Option<usize> {
+        let App::Deflating {
+            kind,
+            mut owed,
+            frame,
+        } = self.app
+        else {
+            return Some(0);
+        };
+        let Ext::Pmd(codec) = &mut self.ext else {
+            self.app = App::Idle;
+            return Some(0);
+        };
+        if let Some(mut g) = frame {
+            let payload = codec.tx_frame();
+            let rest = payload.get(g.sent..).unwrap_or_default();
+            let n = rest.len().min(room.len());
+            if let (Some(d), Some(s)) = (room.get_mut(..n), rest.get(..n)) {
+                d.copy_from_slice(s);
+                if let Some(m) = g.mask {
+                    apply_mask(d, m, u64::try_from(g.sent).unwrap_or(0));
+                }
+            }
+            g.sent = g.sent.saturating_add(n);
+            self.app = match (g.sent >= payload.len(), g.fin) {
+                (true, true) => App::Idle,
+                (true, false) => App::Deflating {
+                    kind,
+                    owed,
+                    frame: None,
+                },
+                (false, _) => App::Deflating {
+                    kind,
+                    owed,
+                    frame: Some(g),
+                },
+            };
+            return Some(n);
+        }
+        let next = codec.next_frame(&mut owed, &mut |b| src.fill(b));
+        let made = match next {
+            Ok(Some(made)) => made,
+            Ok(None) => {
+                self.app = App::Deflating {
+                    kind,
+                    owed,
+                    frame: None,
+                };
+                return None;
+            }
+            Err(_) => {
+                self.fail();
+                return None;
+            }
+        };
+        let Ok(mask) = self.role.next_mask() else {
+            self.fail();
+            return None;
+        };
+        // FIN on the last; RSV1 and the opcode on the first, the rest
+        // continuations
+        let fin = if made.fin { 0x80 } else { 0 };
+        let first = if made.first {
+            0x40 | Op::of(kind).code()
+        } else {
+            Op::Continuation.code()
+        };
+        let len = u64::try_from(made.len).unwrap_or(u64::MAX);
+        frame_header(fin | first, len, mask, &mut self.out);
+        self.app = App::Deflating {
+            kind,
+            owed,
+            frame: Some(Going {
+                sent: 0,
+                mask,
+                fin: made.fin,
+            }),
+        };
+        Some(0)
     }
 
     /// The application is done: the connection closes once what it sent
@@ -953,6 +1366,17 @@ impl<P: Role> Ws<P> {
             if self.out.pending() {
                 written = written.saturating_add(self.out.drain(room));
                 continue;
+            }
+            #[cfg(feature = "pmd")]
+            if matches!(self.app, App::Deflating { .. }) {
+                match self.tx_deflated(room, src) {
+                    Some(n) => {
+                        written = written.saturating_add(n);
+                        continue;
+                    }
+                    // the application has more to give first
+                    None => return written,
+                }
             }
             if let App::Sending { owed, mask, at } = self.app {
                 let cap = usize::try_from(owed).unwrap_or(usize::MAX).min(room.len());
@@ -1118,7 +1542,7 @@ mod tests {
             (0x1_0000, b"\x82\x7f\0\0\0\0\0\x01\0\0"),
         ] {
             let mut out = Out::new();
-            frame_header(Op::Binary, len, None, &mut out);
+            frame_header(0x82, len, None, &mut out);
             assert_eq!(&out.buf[..out.len], want, "{len}");
         }
     }
