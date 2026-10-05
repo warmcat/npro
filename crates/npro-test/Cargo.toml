@@ -10,7 +10,7 @@ homepage.workspace     = true
 repository.workspace   = true
 
 [dev-dependencies]
-npro-core = { path = "../npro-core" }
+npro-core = { path = "../npro-core", features = ["replay"] }
 npro-h1   = { path = "../npro-h1" }
 npro-ws   = { path = "../npro-ws" }
 
