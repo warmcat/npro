@@ -13,3 +13,7 @@
 
 pub mod conn;
 pub mod handshake;
+
+// admitted for permessage-deflate, which is to use it
+#[cfg(feature = "pmd")]
+use miniz_oxide as _;

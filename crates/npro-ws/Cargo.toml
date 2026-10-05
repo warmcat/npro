@@ -14,6 +14,12 @@ repository.workspace   = true
 [dependencies]
 npro-core.workspace = true
 npro-h1.workspace   = true
+# permessage-deflate's inflater and deflater: docs/dependencies.md
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"], optional = true }
+
+[features]
+# permessage-deflate (RFC 7692): needs alloc, for the inflater and deflater
+pmd = ["dep:miniz_oxide"]
 
 [dev-dependencies]
 npro-core = { workspace = true, features = ["replay"] }

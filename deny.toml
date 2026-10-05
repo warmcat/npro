@@ -44,7 +44,9 @@ allow = [
 	"npro-test",
 
 	# admitted dependencies, each with its entry in docs/dependencies.md:
-	# (none)
+	# permessage-deflate, npro-ws's opt-in pmd feature
+	"miniz_oxide",
+	"adler2",
 ]
 
 # A build script runs arbitrary code on the build machine at compile time,

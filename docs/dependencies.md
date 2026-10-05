@@ -98,12 +98,17 @@ Removing a dependency is the same in reverse: take it out of
 
 ### The main workspace
 
-Admitted: **none**.  npro builds from its own sources and the Rust
-toolchain alone.
+Without the opt-in features below, npro builds from its own sources and
+the Rust toolchain alone.
 
 | crate | used by | feature | why | build script | unsafe | admitted in |
 |---|---|---|---|---|---|---|
-| (none yet) | | | | | | |
+| `miniz_oxide` 0.9 | npro-ws | `pmd` | permessage-deflate's inflater and deflater (RFC 1951 raw deflate), where C uses zlib.  An inflater of our own was the alternative, judged not worth it for a first pass; a deflater as well would be more again.  Maintained by oyvindln under the Frommi organisation, actively, and used by Rust's own standard library (its `rustc-dep-of-std` feature), so it is well exercised.  `no_std`, needing `alloc` (`with-alloc`); edition 2021, building at npro's `rust-version` | none | none: `#![forbid(unsafe_code)]` | the commit adding permessage-deflate's dependency |
+| `adler2` 2.0 | `miniz_oxide` | (`pmd`) | the Adler-32 checksum, which `miniz_oxide` needs for zlib streams; ws uses raw deflate, so it is only carried.  The same maintainer, a maintained fork of `adler` | none | none: `#![forbid(unsafe_code)]` | the same |
+
+Both are licensed MIT among alternatives (`miniz_oxide` MIT OR Zlib OR
+Apache-2.0, `adler2` 0BSD OR MIT OR Apache-2.0), and bring nothing else:
+their other dependencies are optional, and not enabled.
 
 ### The fuzz workspace
 
@@ -133,13 +138,6 @@ Apart from `libfuzzer-sys` and `arbitrary`, which are linked into the
 targets, they are build-time only: they run on the fuzz builder while the
 targets build.  All were admitted
 in the commit adding the libFuzzer targets.
-
-## Decided, not yet admitted
-
-- **`miniz_oxide`**, with its dependency `adler2`, for permessage-deflate,
-  behind npro-ws's opt-in `pmd` feature.  Pure Rust, `no_std` with
-  `alloc`.  It is admitted, with its register entry, in the commit that
-  adds permessage-deflate.
 
 ## Decided against
 
