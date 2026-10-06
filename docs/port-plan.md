@@ -852,9 +852,19 @@ and other extensions are not ported.
 ### Phase 1g: minimal `npro-io`
 
 - std TCP, plain poll-style loop, no tls yet.  Enough to run:
-  - **autobahn's fuzzingclient** against the ws server.  This is a
-    conformance gate.  It needs a Python tool, so Andy must say where it
-    may run;
+  - **autobahn**, both ways: `wstest -m fuzzingclient` against npro-io's
+    ws echo server, and `-m fuzzingserver` against its echo client.  This
+    is a conformance gate.  Where it runs is decided (2026-10-06): a sai
+    task on the Debian 13 builder that already runs Docker (for qir),
+    using upstream's `crossbario/autobahn-testsuite` image pinned by
+    digest, since `wstest` is Python 2 only and that image is upstream's
+    supported way to run it.  The task fails on any case not OK, but for
+    exclusions written down with their reasons, starting from C's two
+    (2.10, 2.11: several pings in flight, which neither keeps).  C's
+    `scripts/autobahn-test-server.sh` and `-client.sh`, run by hand, had
+    rotted from disuse, which is the reason for a builder.  The same
+    harness against C's minimal ws echo examples gives a baseline to
+    compare with;
   - **a differential run** of the port's client against C's
     `minimal-http-server` and ws echo, and the reverse.
 - tls: rustls is the obvious candidate.  It is a large dependency tree,
