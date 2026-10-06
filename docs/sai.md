@@ -239,8 +239,9 @@ through with a cargo error.
   `fuzz/Cargo.lock` pins them (`cargo fetch --locked`), once per builder.
   The pool is synced by sai-builder itself, not the job.
 
-Nothing else fetches.  The main workspace has no dependencies, and every
-build is `--locked`.
+Nothing else fetches but cargo itself: the main workspace's only
+dependencies, `miniz_oxide` and `adler2` for npro-ws's `pmd` feature, come
+from crates.io as `Cargo.lock` pins them, and every build is `--locked`.
 
 ### When a job fails on setup
 
@@ -260,6 +261,57 @@ build is `--locked`.
   board's silicon does not.  rustup supports it as it is.
 - **esp32**, later: xtensa needs Espressif's Rust fork, installed with
   `espup`, once there is something to run on the device.
+
+## The autobahn builder
+
+Autobahn|Testsuite is the ws conformance gate (phase 1g of
+[port-plan.md](port-plan.md)).  Its `wstest` is Python 2 only, so it runs
+in upstream's Docker image, `crossbario/autobahn-testsuite`, on a builder
+of its own: a Debian 13 VM with Docker, like the one qir uses.
+`scripts/autobahn.sh` runs it, both ways, against any echo server or
+client.
+
+Setting one up:
+
+1. **The VM.** Debian 13 (trixie), x86_64; 2 vCPUs, 4GiB and 20GiB of
+   disk are plenty.  Make it as you make the other builders, with the
+   user sai runs jobs as.  If it is a sai-virt image, everything below goes
+   into the base image, not an overlay.
+2. **Docker.**  Debian's own package is enough:
+
+       apt install docker.io
+       systemctl enable --now docker
+       usermod -aG docker sai     # the user jobs run as
+
+   Membership of `docker` is as good as root on that VM, which is a reason
+   for it to be a VM of its own.  Rootless Podman, with the
+   `podman-docker` package giving a `docker` command, is the alternative
+   if that matters.
+3. **The image, pinned.**  As that user:
+
+       docker pull crossbario/autobahn-testsuite
+       docker inspect --format '{{index .RepoDigests 0}}' crossbario/autobahn-testsuite
+
+   The second prints `crossbario/autobahn-testsuite@sha256:…`; that goes
+   in `scripts/autobahn.sh` as its `image`, in a commit, so every run uses
+   exactly that image.  Once it is pulled, jobs need no network for it.
+4. **Rust,** as for every builder (above): rustup as that user.
+5. **A first run against C,** to know the builder works before npro has
+   anything to test.  As that user, in a libwebsockets checkout:
+
+       apt install build-essential cmake git libssl-dev
+       mkdir build && cd build
+       cmake .. -DLWS_WITH_MINIMAL_EXAMPLES=1 && make -j4
+       /path/to/npro/scripts/autobahn.sh server bin/lws-minimal-ws-server-echo -p 9001
+       /path/to/npro/scripts/autobahn.sh client bin/lws-minimal-ws-client-echo -s 127.0.0.1 -p 9001 -u
+
+   Each says how many cases ran and how many failed, and leaves the
+   reports in `./autobahn/reports`, `index.html` among them.  Whatever C
+   fails is worth knowing in itself, and is the baseline npro is held to.
+6. **Into sai,** as the other builders are, with a platform name such as
+   `linux-debian13/x86_64-amd/gcc`.  The `.sai.json` configuration that
+   runs autobahn there comes with npro-io's echo server and client, in
+   phase 1g: until then there is nothing of npro's to run.
 
 ## A possible sai change
 
