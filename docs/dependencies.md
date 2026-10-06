@@ -54,7 +54,7 @@ else is on it.  A new workspace crate is added to it when it is created.
 | crates | may depend on |
 |---|---|
 | the protocol crates: npro-core, -h1, -ws, -h2, -h3, -quic, -wt, -mqtt, -http | nothing, except crates agreed below, each behind an opt-in feature, `no_std`, and with no build script |
-| npro-io, the IO adapter | std, and what its tls decision admits |
+| npro-io, the driver and the IO adapters | nothing without features; std, and the crates of each adapter's feature and of its tls decision ([io-model.md](io-model.md)) |
 | integrations with a runtime or framework, such as tokio | that runtime, in its own opt-in crate or feature, never a default |
 | npro-test, npro-fuzz, tools | what testing needs, admitted like anything else |
 | the libFuzzer targets in `fuzz/` | libFuzzer and what builds it, in a workspace of their own with its own `Cargo.lock` and `deny.toml`, so none of it enters the main workspace's graph |
@@ -154,9 +154,15 @@ in the commit adding the libFuzzer targets.
 
 ## Open
 
-- **tls**, for npro-io.  rustls is the obvious candidate, but it needs a
-  crypto backend, and its usual ones (`ring`, `aws-lc-rs`) carry C and
-  assembly with build scripts.  The alternatives are adapters to the
-  platform's tls or to OpenSSL.  This is decided when npro-io needs it
-  (phase 1g and after, in [port-plan.md](port-plan.md)), and recorded
-  here.
+- **tls**, for npro-io.  rustls goes inside the driver, behind a
+  record-layer trait.  rustls itself is `#![forbid(unsafe_code)]`; its
+  crypto provider is where the unsafe code is, and is the decision.  What
+  was found about `aws-lc-rs`, `ring`, `rustls-rustcrypto` and `graviola`
+  is in [io-model.md](io-model.md).  graviola leads for desktop and
+  server, but its licence (`Apache-2.0 OR ISC OR MIT-0`) is not MIT, and
+  it covers neither older CPUs nor microcontrollers.  Decided when the tls
+  commit comes, and recorded here.
+- **`mio`**, for npro-io's one-thread readiness loop (agreed in principle
+  2026-10-06), with `libc`, which has a build script, and `windows-sys`.
+  Admitted, with what `cargo deny` shows they bring, when that adapter is
+  written.

@@ -364,15 +364,16 @@ page and the refusals the transcripts pin.
   - `npro-h1`: the h1 parser, chunked coding, and the h1 client and server
     transaction.
   - `npro-ws`: framing, handshake, close, and optional pmd.
-  - `npro-io`: std, sockets, the loop.  It comes later, and tls later
-    still.
+  - `npro-io`: the driver, `no_std`, and the adapters (threads, mio,
+    tokio, embassy), each an additive feature, `std` among them.  It
+    comes later, and tls later still ([io-model.md](io-model.md)).
   - `npro`: the facade.
   - `crates/npro-test` (`publish = false`): the transcript reader, the
     in-memory two-sided transport, the replay driver and the property-test
     helpers.
 - **Crate roots**:
   - every one carries `#![forbid(unsafe_code)]` and `#![no_std]`,
-    except `npro-io` and `npro-test`;
+    except `npro-test`, and `npro-io` when its `std` feature is on;
   - `alloc` only behind a feature;
   - `unexpected_cfgs` is denied in `[workspace.lints]`, along with
     `missing_docs` and the clippy set from AGENTS.md.
@@ -851,7 +852,16 @@ and other extensions are not ported.
 
 ### Phase 1g: minimal `npro-io`
 
-- std TCP, plain poll-style loop, no tls yet.  Enough to run:
+[io-model.md](io-model.md) is how npro meets sockets, tls and schedulers,
+agreed 2026-10-06.  For this phase:
+
+- the driver, `no_std`, replaying the transcripts over the in-memory
+  transport before any socket;
+- the threads adapter (`std`), std TCP, no tls yet.  The first form of
+  this plan said a poll-style loop, but std has no `poll()`; that is the
+  `mio` adapter, which waits for its dependency decision.  The minimal
+  examples (ws echo server and client, http server and client) come with
+  it.  Enough to run:
   - **autobahn**, both ways: `wstest -m fuzzingclient` against npro-io's
     ws echo server, and `-m fuzzingserver` against its echo client.  This
     is a conformance gate.  Where it runs is decided (2026-10-06): a sai
@@ -867,8 +877,11 @@ and other extensions are not ported.
     compare with;
   - **a differential run** of the port's client against C's
     `minimal-http-server` and ws echo, and the reverse.
-- tls: rustls is the obvious candidate.  It is a large dependency tree,
-  so it is a separate decision, not taken here.
+- the tests against C run locally until they pass, then become sai
+  tasks;
+- tls: rustls inside the driver, behind a record-layer trait, once plain
+  TCP passes against C; the same tests again over tls.  The crypto
+  provider is open: [io-model.md](io-model.md) has what was found.
 
 ### Later stages
 
@@ -896,5 +909,6 @@ not pending output; mux parked rx; the kept-warm joiner's status.
   lists the stage-1 set only.
 - Whether `Random` is `&mut dyn` or a generic parameter.  Generic avoids
   the vtable, but spreads a type parameter through every connection.
-- tls in `npro-io`.
+- tls in `npro-io`: the crypto provider, and tls on esp32
+  ([io-model.md](io-model.md), "Open").
 - Where autobahn runs in CI, and whether the C oracles are measured there (`sync-c-states.sh` and `sync-c-h1.sh` are run by hand).
