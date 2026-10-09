@@ -345,6 +345,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         }
     }
 
+    /// Gives back the storage the connection's header table was made in,
+    /// as [`crate::server::Server::into_storage`] does.
+    #[must_use]
+    pub fn into_storage(self) -> S {
+        self.head.into_table().into_storage()
+    }
+
     /// The response's headers, after the request's own tokens.
     #[must_use]
     pub const fn response(&self) -> &HeaderTable<S> {

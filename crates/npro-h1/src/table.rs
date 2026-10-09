@@ -174,6 +174,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> HeaderTable<S> {
         })
     }
 
+    /// Gives back the storage the table was made in, as C's
+    /// `lws_header_table_detach()` gives its ah back to the pool.
+    #[must_use]
+    pub fn into_storage(self) -> S {
+        self.data
+    }
+
     /// Empties the table, as C's `_lws_header_table_reset()`.
     pub fn reset(&mut self) {
         self.pos = 0;

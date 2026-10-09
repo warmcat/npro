@@ -429,6 +429,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Head<S> {
         }
     }
 
+    /// Gives back the table, with what it holds.
+    #[must_use]
+    pub fn into_table(self) -> HeaderTable<S> {
+        self.table
+    }
+
     /// Readies the head for the next one, with the table emptied: C's
     /// `lws_header_table_reset()`.
     pub fn reset(&mut self) {

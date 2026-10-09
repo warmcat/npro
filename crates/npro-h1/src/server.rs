@@ -317,6 +317,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         })
     }
 
+    /// Gives back the storage the connection's header table was made in.
+    /// It is done with the connection: as C drops the ah when the user
+    /// returns from ESTABLISHED, a server upgraded to ws gives it back
+    /// once the request event, the last time the headers are seen, is
+    /// over.
+    #[must_use]
+    pub fn into_storage(self) -> S {
+        self.head.into_table().into_storage()
+    }
+
     /// The request in hand's headers.
     #[must_use]
     pub const fn request(&self) -> &HeaderTable<S> {
@@ -1249,5 +1259,14 @@ mod tests {
         let tx = s.tx(T0, &mut out, &mut Text(b"ok"));
         assert!(out[..tx.written].ends_with(b"\r\n\r\n"));
         assert!(!tx.more);
+    }
+
+    #[test]
+    fn the_storage_comes_back() {
+        let mut s = Server::new([7u8; 64], Config::default(), T0).unwrap();
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        // the same storage, holding what the request's head was parsed into
+        let storage: [u8; 64] = s.into_storage();
+        assert!(storage.windows(2).any(|w| w == b"/\0"));
     }
 }
