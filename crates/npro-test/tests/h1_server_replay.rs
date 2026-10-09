@@ -5,13 +5,15 @@
 //! whose app is ported below as C's `api-test-sansio` has it: it answers
 //! 200 `text/plain` with the path, a newline and the urlargs; `/short`
 //! with a length of 10 and 3 bytes (none to a HEAD); `/body-done` from the
-//! body's first piece, with `ok\n`.  Each `rx` is handed to npro's server,
-//! and what it writes before the next must be the transcript's `tx` bytes.
-//! So must `h1-ws-server`'s first exchange, a GET to the `sansio` vhost.
+//! body's first piece, with `ok\n`.  Each `rx` is handed to npro's server
+//! at its time, the connection starting at the first, and nothing may fall
+//! due between them, as nothing did in C's run; what it writes before the
+//! next must be the transcript's `tx` bytes.  So must `h1-ws-server`'s
+//! first exchange, a GET to the `sansio` vhost.
 
 #![expect(
     unused_crate_dependencies,
-    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test and npro-h1"
+    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-core and npro-h1"
 )]
 
 // held to clippy's rules for tests
@@ -19,6 +21,7 @@
 mod h1_server_replay {
     use core::num::NonZeroU16;
 
+    use npro_core::time::Instant;
     use npro_h1::head;
     use npro_h1::server::{Config, Event, Response, Server, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -121,13 +124,13 @@ mod h1_server_replay {
         }
     }
 
-    /// Hands `input` to the server, with the app answering, until neither
-    /// takes or writes anything more; returns what was written.
-    fn feed(s: &mut Server<Vec<u8>>, app: &mut UriApp, mut input: &[u8]) -> Vec<u8> {
+    /// Hands `input` to the server at `now`, with the app answering, until
+    /// neither takes or writes anything more; returns what was written.
+    fn feed(s: &mut Server<Vec<u8>>, app: &mut UriApp, mut input: &[u8], now: Instant) -> Vec<u8> {
         let mut wrote = Vec::new();
         let mut buf = [0u8; 1024];
         loop {
-            let rx = s.rx(input);
+            let rx = s.rx(now, input);
             let mut progress = rx.consumed > 0 || rx.event.is_some();
             input = &input[rx.consumed..];
             match rx.event {
@@ -136,11 +139,11 @@ mod h1_server_replay {
                 Some(Event::BodyEnd) | None => {}
             }
             loop {
-                let tx = s.tx(&mut buf, app);
+                let tx = s.tx(now, &mut buf, app);
                 wrote.extend_from_slice(&buf[..tx.written]);
                 if app.complete_when_sent && app.at == app.out.len() && !s.wants_write() {
                     app.complete_when_sent = false;
-                    s.complete();
+                    s.complete(now);
                     progress = true;
                 }
                 if tx.written == 0 {
@@ -157,7 +160,10 @@ mod h1_server_replay {
     /// Replays `t`'s first `rxs` reads, with `app`, in a context limiting
     /// what `cfg` limits.
     fn replay(t: &Transcript, cfg: head::Config, mut app: UriApp, rxs: usize) {
-        let mut s = Server::new(vec![0u8; DEFAULT_CAPACITY], Config::new(cfg)).unwrap();
+        let start = t.steps.first().map_or(0, |s| s.t_us);
+        let time = |t_us: u64| Instant::from_micros(t.t0_us.checked_add(t_us).unwrap());
+        let mut s =
+            Server::new(vec![0u8; DEFAULT_CAPACITY], Config::new(cfg), time(start)).unwrap();
         let mut steps = t.steps.iter().peekable();
         for _ in 0..rxs {
             let Some(step) = steps.next() else {
@@ -177,7 +183,15 @@ mod h1_server_replay {
                 }
                 steps.next();
             }
-            let got = feed(&mut s, &mut app, rx);
+            // C's run had nothing fall due: nor may npro's
+            let now = time(step.t_us);
+            assert!(
+                s.next_deadline().is_none_or(|d| d > now),
+                "{} at {}us: a deadline passed",
+                t.case,
+                step.t_us
+            );
+            let got = feed(&mut s, &mut app, rx, now);
             assert_eq!(
                 got.escape_ascii().to_string(),
                 want.escape_ascii().to_string(),

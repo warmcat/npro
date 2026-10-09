@@ -15,12 +15,21 @@
 //! the peer first: C's status line and headers, or a status page.  It says
 //! it is done with the transaction with [`Server::complete`].
 //!
+//! Time is an input: the calls that can start a timer take `now`,
+//! [`Server::next_deadline`] says when the connection next needs telling
+//! the time, and [`Server::deadline_passed`] tells it.  The timers are C's,
+//! [`Timeouts`] says how long each is, and nothing reads a clock.
+//!
 //! What C checks between a head and the application is checked here, in
 //! C's order: Content-Length with Transfer-Encoding, a second Host, an
 //! Expect other than `100-continue`, a Transfer-Encoding other than a lone
 //! `chunked`, a second or malformed Content-Length, one past the body limit.
 //! A refused request is answered with C's status page and the connection
 //! shut down, as a head the parser refused is.
+
+use core::time::Duration;
+
+use npro_core::time::Instant;
 
 use crate::chunked::{Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
@@ -33,11 +42,49 @@ use crate::token::Token;
 /// `max_http_body_size`.
 pub const DEFAULT_MAX_BODY: u64 = 100 * 1024 * 1024;
 
+/// How long a server waits on each part of a connection's life: C's
+/// pending timeouts for an h1 server, with C's defaults.
+///
+/// Past `head`, `content` or `response`, the connection is dropped with
+/// nothing more written, as C's timeouts mark the socket unusable; past
+/// `keepalive`, it is shut down in good order, as C closes an idle
+/// keep-alive connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// A request's head must be whole within this of the connection's
+    /// start, or of its first byte after an idle connection's: C's
+    /// `PENDING_TIMEOUT_HOLDING_AH`, the vhost's `timeout_secs_ah_idle`,
+    /// 10s.  A deadline, not renewed as bytes come.
+    pub head: Duration,
+    /// The request's body may pause this long, and the application take
+    /// this long to begin its answer to a request without one: C's
+    /// `PENDING_TIMEOUT_HTTP_CONTENT`, the context's `timeout_secs`, 15s.
+    pub content: Duration,
+    /// The answer, once begun, may stall this long: C's
+    /// `PENDING_TIMEOUT_HTTP_RESPONSE`, `timeout_secs` but at least 30s.
+    pub response: Duration,
+    /// A kept-alive connection may sit idle between requests this long,
+    /// or for ever with `None`: C's `PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE`,
+    /// the vhost's `keepalive_timeout`, 5s, where 0 is `None`.
+    pub keepalive: Option<Duration>,
+}
+
+impl Timeouts {
+    /// C's defaults.
+    pub const DEFAULT: Self = Self {
+        head: Duration::from_secs(10),
+        content: Duration::from_secs(15),
+        response: Duration::from_secs(30),
+        keepalive: Some(Duration::from_secs(5)),
+    };
+}
+
 /// How a server takes its requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     head: head::Config,
     max_body: u64,
+    timeouts: Timeouts,
 }
 
 impl Default for Config {
@@ -53,7 +100,15 @@ impl Config {
         Self {
             head,
             max_body: DEFAULT_MAX_BODY,
+            timeouts: Timeouts::DEFAULT,
         }
+    }
+
+    /// Waits as long as `t` says, rather than [`Timeouts::DEFAULT`].
+    #[must_use]
+    pub const fn with_timeouts(mut self, t: Timeouts) -> Self {
+        self.timeouts = t;
+        self
     }
 
     /// Bodies longer than `max` are refused 413: C's vhost
@@ -103,6 +158,9 @@ pub enum Close {
     /// Stop sending, once what was written has gone, and wait for the
     /// peer to close: C's `LWS_IOCLOSE_SHUTDOWN`.
     Shutdown,
+    /// Release it now, with nothing more written: a deadline passed, and
+    /// as C's timeouts mark the socket unusable, nothing more goes.
+    Release,
 }
 
 /// Where the application's payload comes from: [`Server::tx`] pulls it
@@ -151,11 +209,37 @@ enum Reply {
     Payload(Option<u64>),
 }
 
+/// What the transaction in hand is waiting on, and until when: C's
+/// pending timeout while it lasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watch {
+    /// The body's next bytes, or the answer's start:
+    /// `PENDING_TIMEOUT_HTTP_CONTENT`.
+    Content(Instant),
+    /// The body that came is over, and the application has as long as it
+    /// takes to begin its answer: C clears the timeout there
+    /// (`lws_h1_body_timeout()`).
+    App,
+    /// The answer, begun, going on: `PENDING_TIMEOUT_HTTP_RESPONSE`.
+    Response(Instant),
+}
+
+/// What an idle connection waits for, and until when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// A request's first byte, idle between requests:
+    /// `PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE`, or for ever.
+    Idle(Option<Instant>),
+    /// The rest of a request's head: `PENDING_TIMEOUT_HOLDING_AH`.
+    Head(Instant),
+}
+
 /// The transaction in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Txn {
     body: Body,
     reply: Reply,
+    watch: Watch,
     /// The application said it is done.
     completed: bool,
     head_request: bool,
@@ -166,11 +250,12 @@ struct Txn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Taking a request's head.
-    Head,
+    Head(Wait),
     /// A request is in hand.
     Request(Txn),
-    /// Writing a refusal, then shutting down.
-    Refusing,
+    /// Writing a refusal, which must have gone by the deadline, then
+    /// shutting down.
+    Refusing(Instant),
     /// The connection is done with.
     Closed(Close),
 }
@@ -178,6 +263,7 @@ enum Phase {
 /// One h1 server connection.
 ///
 /// ```
+/// use npro_core::time::Instant;
 /// use npro_h1::server::{Config, Event, Response, Server, TxSource};
 ///
 /// struct Text(&'static [u8]);
@@ -190,8 +276,9 @@ enum Phase {
 ///     }
 /// }
 ///
-/// let mut s = Server::new([0u8; 1024], Config::default())?;
-/// let rx = s.rx(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+/// let now = Instant::from_micros(1_000_000);
+/// let mut s = Server::new([0u8; 1024], Config::default(), now)?;
+/// let rx = s.rx(now, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
 /// assert_eq!(rx.event, Some(Event::Request));
 /// s.respond(Response {
 ///     status: 200,
@@ -199,8 +286,8 @@ enum Phase {
 ///     content_length: Some(2),
 /// })?;
 /// let mut out = [0u8; 256];
-/// let tx = s.tx(&mut out, &mut Text(b"ok"));
-/// s.complete();
+/// let tx = s.tx(now, &mut out, &mut Text(b"ok"));
+/// s.complete(now);
 /// assert_eq!(
 ///     &out[..tx.written],
 ///     b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok"
@@ -224,11 +311,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     /// # Errors
     ///
     /// [`CapacityTooLarge`] if `storage` is longer than a table may be.
-    pub fn new(storage: S, config: Config) -> Result<Self, CapacityTooLarge> {
+    /// The connection starts at `now`, and its first request's head must
+    /// be whole within [`Timeouts::head`] of it.
+    pub fn new(storage: S, config: Config, now: Instant) -> Result<Self, CapacityTooLarge> {
         Ok(Self {
             head: Head::new(storage, Side::Server, config.head)?,
             config,
-            phase: Phase::Head,
+            phase: Phase::Head(Wait::Head(now.saturating_add(config.timeouts.head))),
             own: Own::new(),
             version: Version::Http10,
         })
@@ -251,24 +340,62 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     pub const fn close(&self) -> Option<Close> {
         match self.phase {
             Phase::Closed(c) => Some(c),
-            Phase::Head | Phase::Request(_) | Phase::Refusing => None,
+            Phase::Head(_) | Phase::Request(_) | Phase::Refusing(_) => None,
         }
     }
 
-    /// Takes bytes from the peer: see [`Event`].
-    pub fn rx<'a>(&mut self, input: &'a [u8]) -> Rx<'a> {
+    /// When the connection next needs [`Server::deadline_passed`], if it
+    /// is waiting on anything: see [`Timeouts`].
+    #[must_use]
+    pub const fn next_deadline(&self) -> Option<Instant> {
+        match self.phase {
+            Phase::Head(Wait::Idle(until)) => until,
+            Phase::Head(Wait::Head(until)) | Phase::Refusing(until) => Some(until),
+            Phase::Request(t) => match t.watch {
+                Watch::Content(until) | Watch::Response(until) => Some(until),
+                Watch::App => None,
+            },
+            Phase::Closed(_) => None,
+        }
+    }
+
+    /// Tells the connection it is `now`, which may be past its
+    /// [`Server::next_deadline`]: then an idle connection asks to be shut
+    /// down, and any other to be released with nothing more written, as
+    /// C's timeouts close them.
+    pub fn deadline_passed(&mut self, now: Instant) {
+        if self.next_deadline().is_none_or(|d| now < d) {
+            return;
+        }
+        let close = match self.phase {
+            Phase::Head(Wait::Idle(_)) => Close::Shutdown,
+            Phase::Head(Wait::Head(_)) | Phase::Request(_) | Phase::Refusing(_) => Close::Release,
+            Phase::Closed(c) => c,
+        };
+        self.own = Own::new();
+        self.phase = Phase::Closed(close);
+    }
+
+    /// Takes bytes from the peer, at `now`: see [`Event`].
+    pub fn rx<'a>(&mut self, now: Instant, input: &'a [u8]) -> Rx<'a> {
         let held = Rx {
             consumed: 0,
             event: None,
         };
         match self.phase {
-            Phase::Head => self.rx_head(input),
-            Phase::Request(t) => self.rx_body(t, input),
-            Phase::Refusing | Phase::Closed(_) => held,
+            Phase::Head(w) => self.rx_head(now, w, input),
+            Phase::Request(t) => self.rx_body(now, t, input),
+            Phase::Refusing(_) | Phase::Closed(_) => held,
         }
     }
 
-    fn rx_head<'a>(&mut self, input: &'a [u8]) -> Rx<'a> {
+    fn rx_head<'a>(&mut self, now: Instant, w: Wait, input: &'a [u8]) -> Rx<'a> {
+        // an idle connection's next request has begun: C attaches a table
+        // to it, under PENDING_TIMEOUT_HOLDING_AH
+        if matches!(w, Wait::Idle(_)) && !input.is_empty() {
+            let until = now.saturating_add(self.config.timeouts.head);
+            self.phase = Phase::Head(Wait::Head(until));
+        }
         match self.head.rx(input) {
             Ok(Progress::More) => Rx {
                 consumed: input.len(),
@@ -276,7 +403,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             },
             Ok(Progress::Complete { consumed }) => Rx {
                 consumed,
-                event: self.request_complete(),
+                event: self.request_complete(now),
             },
             // the server has no fallback role: a head that would go to
             // one is no request it can answer
@@ -288,7 +415,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 }
             }
             Err(r) => {
-                self.refused_head(r);
+                self.refused_head(now, r);
                 Rx {
                     consumed: 0,
                     event: None,
@@ -299,7 +426,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
 
     /// The parser refused the head: C answers it, if it says to, in the
     /// version it can, and shuts down.
-    fn refused_head(&mut self, r: Refused) {
+    fn refused_head(&mut self, now: Instant, r: Refused) {
         let Some(a) = r.answer() else {
             self.phase = Phase::Closed(Close::Shutdown);
             return;
@@ -337,13 +464,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             | head::Cause::DuplicateMethod
             | head::Cause::NotAFieldName(_) => self.version,
         };
-        self.refuse(version, code, text);
+        self.refuse(now, version, code, text);
     }
 
     /// Refuses the request in hand's upgrade with C's status page, and
     /// `extra` as a header of it, then shuts down: C's
     /// `_lws_return_http_status()` as `ws_upgrade_refuse()` uses it, a 426
-    /// saying `sec-websocket-version: 13`.
+    /// saying `sec-websocket-version: 13`.  It is an answer, and must have
+    /// gone within [`Timeouts::response`] of `now`.
     ///
     /// # Errors
     ///
@@ -351,6 +479,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     /// answered already.
     pub fn refuse_upgrade(
         &mut self,
+        now: Instant,
         code: u16,
         extra: Option<(&[u8], &[u8])>,
     ) -> Result<(), RespondError> {
@@ -359,21 +488,24 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 reply: Reply::Awaited,
                 ..
             }) => {}
-            Phase::Request(_) | Phase::Head | Phase::Refusing | Phase::Closed(_) => {
+            Phase::Request(_) | Phase::Head(_) | Phase::Refusing(_) | Phase::Closed(_) => {
                 return Err(RespondError::NotNow);
             }
         }
-        self.refuse_with(self.version, code, b"", extra);
+        self.refuse_with(now, self.version, code, b"", extra);
         Ok(())
     }
 
     /// Queues C's status page, then the shutdown.
-    fn refuse(&mut self, version: Version, code: u16, text: &[u8]) {
-        self.refuse_with(version, code, text, None);
+    fn refuse(&mut self, now: Instant, version: Version, code: u16, text: &[u8]) {
+        self.refuse_with(now, version, code, text, None);
     }
 
+    /// The status page is an answer: it goes under the response's
+    /// watchdog.
     fn refuse_with(
         &mut self,
+        now: Instant,
         version: Version,
         code: u16,
         text: &[u8],
@@ -383,11 +515,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         if status_page(&mut self.own, version, code, text, extra).is_err() {
             self.own = Own::new();
         }
-        self.phase = Phase::Refusing;
+        self.phase = Phase::Refusing(now.saturating_add(self.config.timeouts.response));
     }
 
     /// The head is whole: C's checks, in C's order, then the request.
-    fn request_complete(&mut self) -> Option<Event<'static>> {
+    fn request_complete(&mut self, now: Instant) -> Option<Event<'static>> {
         let version = self.head.request_version();
         self.version = version;
         let t = self.head.table();
@@ -406,7 +538,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             None
         };
         if let Some(code) = refusal {
-            self.refuse(version, code, b"");
+            self.refuse(now, version, code, b"");
             return None;
         }
         let body = if present(Token::TransferEncoding) {
@@ -419,11 +551,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             };
             match len {
                 None => {
-                    self.refuse(version, 400, b"");
+                    self.refuse(now, version, 400, b"");
                     return None;
                 }
                 Some(n) if n > self.config.max_body => {
-                    self.refuse(version, 413, b"");
+                    self.refuse(now, version, 413, b"");
                     return None;
                 }
                 Some(0) => Body::EndDue,
@@ -438,9 +570,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         } else {
             Body::Over
         };
+        // C's lws_http_action(): content is due, or the answer
         self.phase = Phase::Request(Txn {
             body,
             reply: Reply::Awaited,
+            watch: Watch::Content(now.saturating_add(self.config.timeouts.content)),
             completed: false,
             head_request: present(Token::HeadUri),
             keep_alive,
@@ -448,7 +582,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         Some(Event::Request)
     }
 
-    fn rx_body<'a>(&mut self, mut t: Txn, input: &'a [u8]) -> Rx<'a> {
+    fn rx_body<'a>(&mut self, now: Instant, mut t: Txn, input: &'a [u8]) -> Rx<'a> {
+        let was = t.body;
         let (consumed, event) = match t.body {
             Body::Over => (0, None),
             Body::EndDue => {
@@ -486,8 +621,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 (s.consumed, event)
             }
         };
+        // C's lws_h1_body_timeout(): the body's bytes renew its timeout,
+        // and its end clears it, but not under an answer begun, unless the
+        // body is being discarded after the transaction
+        let ended = matches!(was, Body::Length(_) | Body::Chunked(_)) && t.body == Body::EndDue;
+        if t.completed || !matches!(t.watch, Watch::Response(_)) {
+            if ended {
+                t.watch = Watch::App;
+            } else if consumed > 0 {
+                t.watch = Watch::Content(now.saturating_add(self.config.timeouts.content));
+            }
+        }
         self.phase = Phase::Request(t);
-        self.settle();
+        self.settle(now);
         Rx { consumed, event }
     }
 
@@ -532,22 +678,24 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         Ok(())
     }
 
-    /// The application is done with the transaction: C's
+    /// The application is done with the transaction, at `now`: C's
     /// `lws_http_transaction_completed()`.  The rest of the request's body
     /// is taken without it, and once the answer has gone, the connection
     /// takes the next request, or, if the answer was short of its length,
     /// or the request did not keep the connection, shuts down.
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self, now: Instant) {
         if let Phase::Request(mut t) = self.phase {
             t.completed = true;
             self.phase = Phase::Request(t);
-            self.settle();
+            self.settle(now);
         }
     }
 
-    /// Writes what is owed the peer into `out`: the connection's own bytes,
-    /// then the payload, pulled from `src`.
-    pub fn tx(&mut self, out: &mut [u8], src: &mut dyn TxSource) -> Tx {
+    /// Writes what is owed the peer into `out`, at `now`: the connection's
+    /// own bytes, then the payload, pulled from `src`.  An answer begun is
+    /// watched from then, and whatever more of it goes renews the watch:
+    /// C's `lws_http_response_started()` and `_progress()`.
+    pub fn tx(&mut self, now: Instant, out: &mut [u8], src: &mut dyn TxSource) -> Tx {
         let mut written = self.own.drain(out);
         if let Phase::Request(mut t) = self.phase {
             if !self.own.pending() {
@@ -560,12 +708,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                     written = written.saturating_add(n);
                     let n64 = u64::try_from(n).unwrap_or(u64::MAX);
                     t.reply = Reply::Payload(owed.map(|o| o.saturating_sub(n64)));
-                    self.phase = Phase::Request(t);
                 }
             }
-            self.settle();
+            if written > 0 && matches!(t.reply, Reply::Payload(_)) {
+                t.watch = Watch::Response(now.saturating_add(self.config.timeouts.response));
+            }
+            self.phase = Phase::Request(t);
+            self.settle(now);
         }
-        if self.phase == Phase::Refusing && !self.own.pending() {
+        if matches!(self.phase, Phase::Refusing(_)) && !self.own.pending() {
             self.phase = Phase::Closed(Close::Shutdown);
         }
         Tx {
@@ -576,7 +727,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
 
     /// Ends the transaction if it is over: the application completed it,
     /// its answer has gone, and its body has been taken.
-    fn settle(&mut self) {
+    fn settle(&mut self, now: Instant) {
         let Phase::Request(t) = self.phase else {
             return;
         };
@@ -597,7 +748,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         match t.body {
             Body::Over | Body::EndDue => {
                 self.head.reset();
-                self.phase = Phase::Head;
+                // C's PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE
+                let until = self
+                    .config
+                    .timeouts
+                    .keepalive
+                    .map(|k| now.saturating_add(k));
+                self.phase = Phase::Head(Wait::Idle(until));
             }
             Body::Length(_) | Body::Chunked(_) => {}
         }
@@ -745,6 +902,9 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
 
+    /// When the tests' connections are made, and all they do happens.
+    const T0: Instant = Instant::from_micros(1_000_000);
+
     struct Nothing;
     impl TxSource for Nothing {
         fn fill(&mut self, _: &mut [u8]) -> usize {
@@ -753,16 +913,16 @@ mod tests {
     }
 
     fn server() -> Server<[u8; 1024]> {
-        Server::new([0u8; 1024], Config::default().with_max_body(100)).unwrap()
+        Server::new([0u8; 1024], Config::default().with_max_body(100), T0).unwrap()
     }
 
     /// What the server writes for `head` before it shuts down.
     fn refused(head: &[u8]) -> Vec<u8> {
         let mut s = server();
-        let rx = s.rx(head);
+        let rx = s.rx(T0, head);
         assert_eq!(rx.event, None, "{}", head.escape_ascii());
         let mut out = [0u8; 1024];
-        let tx = s.tx(&mut out, &mut Nothing);
+        let tx = s.tx(T0, &mut out, &mut Nothing);
         assert_eq!(s.close(), Some(Close::Shutdown));
         out[..tx.written].to_vec()
     }
@@ -814,7 +974,7 @@ mod tests {
             &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"[..];
         let mut seen = Vec::new();
         loop {
-            let rx = s.rx(input);
+            let rx = s.rx(T0, input);
             input = &input[rx.consumed..];
             match rx.event {
                 Some(Event::Body(b)) => seen.extend_from_slice(b),
@@ -831,7 +991,7 @@ mod tests {
     fn a_body_after_completion_is_taken_without_the_app() {
         let mut s = server();
         let req = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /n HTTP/1.1\r\n\r\n";
-        let rx = s.rx(req);
+        let rx = s.rx(T0, req);
         assert_eq!(rx.event, Some(Event::Request));
         let rest = &req[rx.consumed..];
         s.respond(Response {
@@ -841,11 +1001,11 @@ mod tests {
         })
         .unwrap();
         let mut out = [0u8; 256];
-        let _ = s.tx(&mut out, &mut Nothing);
-        s.complete();
-        let discarded = s.rx(rest);
+        let _ = s.tx(T0, &mut out, &mut Nothing);
+        s.complete(T0);
+        let discarded = s.rx(T0, rest);
         assert_eq!((discarded.consumed, discarded.event), (3, None));
-        let next = s.rx(&rest[3..]);
+        let next = s.rx(T0, &rest[3..]);
         assert_eq!(next.event, Some(Event::Request));
         assert_eq!(s.request().first(Token::GetUri), Some(&b"/n"[..]));
     }
@@ -858,7 +1018,7 @@ mod tests {
             (b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false),
         ] {
             let mut s = server();
-            assert_eq!(s.rx(head).event, Some(Event::Request));
+            assert_eq!(s.rx(T0, head).event, Some(Event::Request));
             s.respond(Response {
                 status: 200,
                 content_type: None,
@@ -866,8 +1026,8 @@ mod tests {
             })
             .unwrap();
             let mut out = [0u8; 256];
-            let _ = s.tx(&mut out, &mut Nothing);
-            s.complete();
+            let _ = s.tx(T0, &mut out, &mut Nothing);
+            s.complete(T0);
             assert_eq!(s.close().is_none(), keeps, "{}", head.escape_ascii());
         }
     }
@@ -875,7 +1035,10 @@ mod tests {
     #[test]
     fn an_answer_without_a_length_closes() {
         let mut s = server();
-        assert_eq!(s.rx(b"GET / HTTP/1.1\r\n\r\n").event, Some(Event::Request));
+        assert_eq!(
+            s.rx(T0, b"GET / HTTP/1.1\r\n\r\n").event,
+            Some(Event::Request)
+        );
         s.respond(Response {
             status: 200,
             content_type: None,
@@ -883,12 +1046,12 @@ mod tests {
         })
         .unwrap();
         let mut out = [0u8; 256];
-        let tx = s.tx(&mut out, &mut Nothing);
+        let tx = s.tx(T0, &mut out, &mut Nothing);
         assert_eq!(
             &out[..tx.written],
             b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n"
         );
-        s.complete();
+        s.complete(T0);
         assert_eq!(s.close(), Some(Close::Shutdown));
         assert_eq!(
             s.respond(Response {
@@ -898,5 +1061,171 @@ mod tests {
             }),
             Err(RespondError::NotNow)
         );
+    }
+
+    /// `T0` and `secs` seconds.
+    fn at(secs: u64) -> Instant {
+        T0.checked_add(Duration::from_secs(secs)).unwrap()
+    }
+
+    /// The application's payload, a piece at a time.
+    struct Text<'a>(&'a [u8]);
+    impl TxSource for Text<'_> {
+        fn fill(&mut self, buf: &mut [u8]) -> usize {
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            n
+        }
+    }
+
+    const OK2: Response<'static> = Response {
+        status: 200,
+        content_type: None,
+        content_length: Some(2),
+    };
+
+    #[test]
+    fn a_head_must_be_whole_by_its_deadline_however_it_trickles() {
+        let mut s = server();
+        assert_eq!(s.next_deadline(), Some(at(10)));
+        assert_eq!(s.rx(at(9), b"GET / HT").consumed, 8);
+        assert_eq!(s.next_deadline(), Some(at(10)));
+        s.deadline_passed(at(9));
+        assert_eq!(s.close(), None);
+        s.deadline_passed(at(10));
+        assert_eq!(s.close(), Some(Close::Release));
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn the_answer_is_due_then_watched_while_it_goes() {
+        let mut s = server();
+        assert_eq!(
+            s.rx(at(1), b"GET / HTTP/1.1\r\n\r\n").event,
+            Some(Event::Request)
+        );
+        // the answer must begin within the content timeout
+        assert_eq!(s.next_deadline(), Some(at(16)));
+        s.respond(OK2).unwrap();
+        // its head going starts the response's watchdog
+        let mut out = [0u8; 256];
+        let mut text = Text(b"ok");
+        assert_eq!(s.tx(at(2), &mut out[..8], &mut Text(b"")).written, 8);
+        assert_eq!(s.next_deadline(), Some(at(32)));
+        let tx = s.tx(at(20), &mut out, &mut text);
+        assert!(tx.written > 0);
+        assert_eq!(s.next_deadline(), Some(at(50)));
+        // writing nothing renews nothing
+        assert_eq!(s.tx(at(25), &mut out, &mut text).written, 0);
+        assert_eq!(s.next_deadline(), Some(at(50)));
+    }
+
+    #[test]
+    fn a_stalled_answer_is_dropped() {
+        let mut s = server();
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        s.respond(OK2).unwrap();
+        let mut out = [0u8; 8];
+        s.tx(T0, &mut out, &mut Text(b""));
+        assert!(s.wants_write());
+        s.deadline_passed(at(30));
+        assert_eq!(s.close(), Some(Close::Release));
+        assert!(!s.wants_write());
+        assert_eq!(s.tx(at(30), &mut out, &mut Text(b"ok")).written, 0);
+    }
+
+    #[test]
+    fn a_bodys_bytes_renew_its_timeout_and_its_end_clears_it() {
+        let mut s = server();
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(s.rx(T0, head).event, Some(Event::Request));
+        assert_eq!(s.next_deadline(), Some(at(15)));
+        assert_eq!(s.rx(at(10), b"ab").event, Some(Event::Body(b"ab")));
+        assert_eq!(s.next_deadline(), Some(at(25)));
+        assert_eq!(s.rx(at(20), b"cd").event, Some(Event::Body(b"cd")));
+        // C's lws_h1_body_timeout(wsi, 0): the app has as long as it takes
+        assert_eq!(s.next_deadline(), None);
+        assert_eq!(s.rx(at(20), b"").event, Some(Event::BodyEnd));
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_body_does_not_take_the_answers_watchdog_away() {
+        let mut s = server();
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        s.rx(T0, head);
+        s.respond(OK2).unwrap();
+        let mut out = [0u8; 8];
+        s.tx(T0, &mut out, &mut Text(b""));
+        assert_eq!(s.next_deadline(), Some(at(30)));
+        s.rx(at(10), b"ab");
+        assert_eq!(s.next_deadline(), Some(at(30)));
+        s.rx(at(11), b"cd");
+        assert_eq!(s.next_deadline(), Some(at(30)));
+    }
+
+    #[test]
+    fn a_body_discarded_after_completion_has_its_timeout_again() {
+        let mut s = server();
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        s.rx(T0, head);
+        s.respond(OK2).unwrap();
+        let mut out = [0u8; 256];
+        s.tx(T0, &mut out, &mut Text(b"ok"));
+        s.complete(T0);
+        s.rx(at(10), b"ab");
+        assert_eq!(s.next_deadline(), Some(at(25)));
+    }
+
+    /// A server that has answered one request, at `T0`, and keeps the
+    /// connection.
+    fn kept(t: Timeouts) -> Server<[u8; 1024]> {
+        let mut s = Server::new([0u8; 1024], Config::default().with_timeouts(t), T0).unwrap();
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        s.respond(OK2).unwrap();
+        let mut out = [0u8; 256];
+        s.tx(T0, &mut out, &mut Text(b"ok"));
+        s.complete(T0);
+        assert_eq!(s.close(), None);
+        s
+    }
+
+    #[test]
+    fn an_idle_connection_is_shut_down_after_its_keepalive() {
+        let mut s = kept(Timeouts::DEFAULT);
+        assert_eq!(s.next_deadline(), Some(at(5)));
+        s.deadline_passed(at(5));
+        assert_eq!(s.close(), Some(Close::Shutdown));
+    }
+
+    #[test]
+    fn the_next_requests_first_byte_starts_its_heads_deadline() {
+        let mut s = kept(Timeouts::DEFAULT);
+        s.rx(at(3), b"G");
+        assert_eq!(s.next_deadline(), Some(at(13)));
+        s.deadline_passed(at(13));
+        assert_eq!(s.close(), Some(Close::Release));
+    }
+
+    #[test]
+    fn without_a_keepalive_an_idle_connection_waits() {
+        let t = Timeouts {
+            keepalive: None,
+            ..Timeouts::DEFAULT
+        };
+        let s = kept(t);
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_refusal_must_go_within_the_response_timeout() {
+        let mut s = server();
+        s.rx(T0, b"GET /%zz HTTP/1.1\r\n\r\n");
+        assert!(s.wants_write());
+        assert_eq!(s.next_deadline(), Some(at(30)));
+        s.deadline_passed(at(30));
+        assert_eq!(s.close(), Some(Close::Release));
+        assert!(!s.wants_write());
     }
 }

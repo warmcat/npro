@@ -139,7 +139,7 @@ mod ws_server_replay {
                 Answer::Upgraded(Box::new(ws))
             }
             Err(r) => {
-                s.refuse_upgrade(r.status(), r.header()).unwrap();
+                s.refuse_upgrade(now, r.status(), r.header()).unwrap();
                 Answer::H1
             }
         }
@@ -156,7 +156,7 @@ mod ws_server_replay {
             let mut progress = false;
             match conn {
                 Conn::H1(s) => {
-                    let rx = s.rx(&input[at..]);
+                    let rx = s.rx(now, &input[at..]);
                     at = at.checked_add(rx.consumed).unwrap();
                     progress |= rx.consumed > 0;
                     if let Some(H1Event::Request) = rx.event {
@@ -167,12 +167,12 @@ mod ws_server_replay {
                         }
                     }
                     loop {
-                        let tx = s.tx(&mut buf, app);
+                        let tx = s.tx(now, &mut buf, app);
                         wrote.extend_from_slice(&buf[..tx.written]);
                         if !app.out.is_empty() && app.at == app.out.len() && !s.wants_write() {
                             // the answer has gone: the transaction is done
                             app.out.clear();
-                            s.complete();
+                            s.complete(now);
                             progress = true;
                         }
                         if tx.written == 0 {
@@ -210,9 +210,11 @@ mod ws_server_replay {
     }
 
     fn replay(t: &Transcript) {
+        let start = t.steps.first().map_or(0, |s| s.t_us);
         let server = Server::new(
             vec![0u8; DEFAULT_CAPACITY],
             Config::new(head::Config::new()),
+            Instant::from_micros(t.t0_us.checked_add(start).unwrap()),
         );
         let mut conn = Conn::H1(Box::new(server.unwrap()));
         let mut app = EchoApp::default();
@@ -233,14 +235,16 @@ mod ws_server_replay {
             }
             // C's run had nothing fall due: nor may npro's
             let now = Instant::from_micros(t.t0_us.checked_add(step.t_us).unwrap());
-            if let Conn::Ws(ws) = &conn {
-                assert!(
-                    ws.next_deadline().is_none_or(|d| d > now),
-                    "{} at {}us: a deadline passed",
-                    t.case,
-                    step.t_us
-                );
-            }
+            let deadline = match &conn {
+                Conn::H1(s) => s.next_deadline(),
+                Conn::Ws(ws) => ws.next_deadline(),
+            };
+            assert!(
+                deadline.is_none_or(|d| d > now),
+                "{} at {}us: a deadline passed",
+                t.case,
+                step.t_us
+            );
             let mut input = rx.clone();
             let got = feed(&mut conn, &mut app, &mut input, now);
             assert_eq!(

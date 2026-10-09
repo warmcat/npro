@@ -11,5 +11,8 @@ license.workspace      = true
 homepage.workspace     = true
 repository.workspace   = true
 
+[dependencies]
+npro-core.workspace = true
+
 [lints]
 workspace = true
