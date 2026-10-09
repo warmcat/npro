@@ -7,12 +7,15 @@
 //!
 //! - [`conn`]: the connection, whichever its role, h1 server or client, ws
 //!   either end, and its changes of role, h1 to ws;
+//! - [`driver`]: what carries it, keeping its buffers, close stages and
+//!   deadlines, and saying what IO it wants;
 //!
-//! with the driver, which keeps its buffers and tls and says what it
-//! wants, and the adapters for threads, mio, tokio and embassy, to come.
+//! with tls in the driver, and the adapters for threads, mio, tokio and
+//! embassy, to come.
 //! Without features it is `no_std`, and does no IO itself.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 pub mod conn;
+pub mod driver;
