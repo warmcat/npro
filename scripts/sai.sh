@@ -70,8 +70,14 @@ nostd)
 	require_done
 	for t in $nostd_targets; do
 		for c in $nostd_crates; do
-			echo "== $c for $t"
-			cargo build -p "$c" --all-features --target "$t" --locked \
+			features=--all-features
+			# npro-io's rustls needs atomic compare-and-swap, for its
+			# Arc, which the M0 and riscv32imc have not
+			if [ "$c" = npro-io ] && [ "$t" != thumbv7em-none-eabihf ]; then
+				features="--features pmd"
+			fi
+			echo "== $c ($features) for $t"
+			cargo build -p "$c" $features --target "$t" --locked \
 				-j "$jobs"
 		done
 	done

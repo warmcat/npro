@@ -17,7 +17,10 @@ all-features = true
 yanked = "deny"
 
 [licenses]
-allow = ["MIT"]
+# MIT, npro's own.  ISC and BSD-3-Clause for npro-io's opt-in rustls:
+# rustls-webpki and untrusted are ISC, subtle BSD-3-Clause, both permissive
+# licences as MIT is (docs/dependencies.md).
+allow = ["MIT", "ISC", "BSD-3-Clause"]
 confidence-threshold = 0.9
 
 [bans]
@@ -48,6 +51,15 @@ allow = [
 	# permessage-deflate, npro-ws's opt-in pmd feature
 	"miniz_oxide",
 	"adler2",
+
+	# tls, npro-io's opt-in rustls feature, with no crypto provider
+	"rustls",
+	"rustls-pki-types",
+	"rustls-webpki",
+	"untrusted",
+	"subtle",
+	"zeroize",
+	"once_cell",
 ]
 
 # A build script runs arbitrary code on the build machine at compile time,
@@ -56,13 +68,26 @@ allow = [
 # crate may ship prebuilt executables or scripts.
 [bans.build]
 allow-build-scripts = [
-	# (none)
+	# rustls': a no-op but on nightly with its read_buf feature, which
+	# npro does not enable (docs/dependencies.md)
+	"rustls",
 ]
 executables = "deny"
 interpreted = "deny"
 include-dependencies = true
 include-workspace = true
 include-archives = true
+
+# untrusted's package carries its maintainer's CI scripts (mk/), which a
+# build never runs.  Admitted by checksum, so a changed script is looked at
+# again.
+[[bans.build.bypass]]
+crate = "untrusted"
+allow = [
+	{ path = "mk/cargo.sh", checksum = "766c00df2767ac0998000e9b55d076b6dbbeb05ecf4c4d9b317df8551fae1bbe" },
+	{ path = "mk/install-build-tools.sh", checksum = "90ec3cce41b1660b5103a37803e537ff167bae17badaca2d89f492116555919d" },
+	{ path = "mk/runner", checksum = "471602c60f4243f87ebf952f8e69c07dfa29d8c69f2ef3885a4c61a2d6bf3b33" },
+]
 
 [sources]
 unknown-registry = "deny"

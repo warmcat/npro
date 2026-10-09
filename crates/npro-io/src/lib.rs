@@ -21,3 +21,7 @@
 pub mod conn;
 pub mod driver;
 pub mod tls;
+
+// admitted for the rustls record layer, which the next commit adds
+#[cfg(feature = "rustls")]
+use rustls as _;

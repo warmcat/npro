@@ -15,6 +15,9 @@ repository.workspace   = true
 npro-core.workspace = true
 npro-h1.workspace   = true
 npro-ws.workspace   = true
+# tls, with no crypto provider: the application gives rustls its own.
+# docs/dependencies.md
+rustls = { version = "0.23.45", default-features = false, features = ["tls12"], optional = true }
 
 [dev-dependencies]
 npro-core = { workspace = true, features = ["replay"] }
@@ -22,6 +25,8 @@ npro-core = { workspace = true, features = ["replay"] }
 [features]
 # permessage-deflate on ws connections: needs alloc, as npro-ws' pmd does
 pmd = ["npro-ws/pmd"]
+# tls by rustls, through its unbuffered API: needs alloc, as rustls does
+rustls = ["dep:rustls"]
 
 [lints]
 workspace = true

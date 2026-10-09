@@ -110,6 +110,26 @@ Both are licensed MIT among alternatives (`miniz_oxide` MIT OR Zlib OR
 Apache-2.0, `adler2` 0BSD OR MIT OR Apache-2.0), and bring nothing else:
 their other dependencies are optional, and not enabled.
 
+tls, npro-io's opt-in `rustls` feature: rustls with no crypto provider,
+the application giving it one (decided with Andy, 2026-10-09,
+[io-model.md](io-model.md), "tls").  A provider, aws-lc-rs or another,
+is never npro's dependency.  All of these are `no_std` with `alloc`, and
+build at npro's `rust-version`; rustls needs atomic compare-and-swap for
+its `Arc`, so not on the M0 or riscv32imc that sai builds for.
+
+| crate | used by | feature | why | build script | unsafe | admitted in |
+|---|---|---|---|---|---|---|
+| `rustls` 0.23 | npro-io | `rustls` | tls 1.2 and 1.3, sans-IO through its unbuffered API, so it sits behind the driver's record layer with no IO of its own.  The Rust tls stack, maintained by the rustls project, actively, with funding (ISRG's Prossimo), and audited.  With `tls12` only: no `std`, no `log`, no provider.  Apache-2.0 OR ISC OR MIT | a no-op unless on nightly with its `read_buf` feature, which is not enabled | none: `#![forbid(unsafe_code)]` | the commit admitting rustls |
+| `rustls-pki-types` 1 | `rustls` | (`rustls`) | the types of certificates, keys and server names.  The rustls project.  MIT OR Apache-2.0 | none | one: a transmute of an IPv6 address's sixteen bytes | the same |
+| `rustls-webpki` 0.103 | `rustls` | (`rustls`) | certificate path validation, the provider's signature algorithms doing the crypto.  The rustls project's fork of Brian Smith's webpki.  **ISC** | none | none | the same |
+| `untrusted` 0.9 | `rustls-webpki` | (`rustls`) | safe parsing of untrusted input, for webpki's DER.  Brian Smith's.  **ISC**.  It ships its CI scripts (`mk/`), never run by a build, admitted by checksum in `deny.toml` | none | none | the same |
+| `subtle` 2.6 | `rustls` | (`rustls`) | constant-time comparisons.  dalek-cryptography's, widely used.  **BSD-3-Clause** | none | two: the optimisation barrier that keeps a comparison constant-time | the same |
+| `zeroize` 1 | `rustls`, `rustls-pki-types` | (`rustls`) | wiping keys from memory.  RustCrypto's.  Apache-2.0 OR MIT | none | volatile writes (18), so the compiler cannot drop a wipe | the same |
+| `once_cell` 1 | `rustls` | (`rustls`) | lazily made statics, with its `alloc` and `race` features.  Widely used; std now has most of it.  MIT OR Apache-2.0 | none | its cells' primitives (about 50) | the same |
+
+ISC and BSD-3-Clause were admitted with them: both are permissive, as
+MIT is, and ask only that the notice is kept.
+
 ### The fuzz workspace
 
 `fuzz/` builds the libFuzzer targets ([fuzzing.md](fuzzing.md)) and
