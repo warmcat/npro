@@ -1038,6 +1038,23 @@ mod tests {
         assert_eq!(close, Some(Close::Release));
     }
 
+    #[test]
+    fn a_dropped_connection_writes_nothing_more() {
+        // a ping, its pong half written, then a message that does not
+        // inflate
+        let mut ws = Ws::server(b"").with_pmd(Params::DEFAULT);
+        let mut ping = *b"\x89\x84\0\0\0\0ping";
+        ws.rx(&mut ping);
+        let mut out = [0u8; 3];
+        let mut src = Src { data: b"", at: 0 };
+        assert_eq!(ws.tx(&mut out, &mut src), 3);
+        let mut bad = *b"\xc1\x82\0\0\0\0\x07\x00";
+        ws.rx(&mut bad);
+        assert_eq!(ws.close(), Some(Close::Release));
+        assert!(!ws.wants_write());
+        assert_eq!(ws.tx(&mut out, &mut src), 0);
+    }
+
     /// Bytes from a fixed stream, which do not compress.
     fn noise(n: usize) -> Vec<u8> {
         let mut r = SeededRandom::new(3);

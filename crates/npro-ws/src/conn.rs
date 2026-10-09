@@ -1239,10 +1239,12 @@ impl<P: Role> Ws<P> {
     }
 
     /// The connection cannot go on: a client's random source failed it,
-    /// or permessage-deflate did.  Nothing more is read or written, and it
-    /// asks to be released.
+    /// or permessage-deflate did.  Nothing more is read or written, not
+    /// even the rest of a frame already going, as C marks the socket
+    /// unusable, and it asks to be released.
     const fn fail(&mut self) {
         self.parse = Parse::Stopped;
+        self.out = Out::new();
         self.pong = None;
         self.app = App::Idle;
         self.closing = Closing::Closed(Close::Release);
