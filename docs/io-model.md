@@ -131,6 +131,184 @@ over the driver.  Macro crates that generate both versions from one
 source (`maybe_async` and others) are proc-macro dependencies, and are
 not used; the duplication is kept small and visible instead.
 
+## The driver's interface: a sketch
+
+**Draft, 2026-10-09, for Andy to review before any of it is built.**  The
+first sketch above is filled in here, and checked by writing each
+adapter's loop against it.
+
+### What the roles need first
+
+The driver holds one connection whatever its role, and what it holds has
+to answer the same questions.  Four changes to the protocol crates come
+before the driver, each its own commit:
+
+1. **One `Close`.**  The h1 server's and ws' `Close` are the same two
+   asks, `Shutdown` (stop sending once what was written has gone, then
+   wait for the peer's FIN) and `Release` (now, nothing more written).
+   They move to `npro-core`, and the h1 client says them too: `Release`,
+   failed or done, since C stages a shutdown only for a server's close
+   (`close.c`, `!lwsi_role_client(wsi)`).  By that, a ws client's
+   `Shutdown` today should be `Release` too, once what it wrote has gone.
+2. **The peer's close as an input on every role.**  Only the h1 client
+   has `rx_closed`.  The server and ws need `peer_closed(now)`: C's
+   zero-length rx, at any point (agent-context, "Hangup").
+3. **A ws event borrows the input, not the connection.**  Today a
+   `Pong` or `PeerClose` payload is in the connection's control buffer,
+   and with pmd a message's piece is in the codec's output, so the event
+   holds `&mut Ws`, and the application cannot answer while it has the
+   message.  The replays get round it by copying, which a device without
+   `alloc` cannot do.  The control payloads, at most 125 bytes, go into
+   the event by value; the codec's 1KiB output becomes a buffer the
+   caller passes to `rx`, as the rest of npro writes into caller-owned
+   buffers.  Then an event and `&mut` the connection can be held
+   together.
+4. **"The application has payload" is the driver's, not the role's.**
+   `wants_write()` covers what the connection owes itself.  Whether the
+   application has more is C's `lws_callback_on_writable()`: the driver
+   keeps it, set by the application and cleared when a pull gives
+   nothing.
+
+### The connection
+
+An enum over the roles, in `npro-io`, where every role crate is a
+dependency.  It is the h1-then-ws `Conn` the replay tests each write by
+hand:
+
+```rust
+pub enum Conn<S, R> {
+    H1Server(npro_h1::server::Server<S>),
+    H1Client(npro_h1::client::Client<S>),
+    WsServer(npro_ws::conn::Ws<AsServer>),
+    WsClient(npro_ws::conn::Ws<AsClient<R>>),
+}
+```
+
+It has the operations every role has (`rx`, `tx`, `wants_write`, `close`,
+`next_deadline`, `deadline_passed`, `peer_closed`, `rx_pending`), each a
+`match` with no wildcard, and `Event<'a>`, an enum of the roles' events.
+
+A role change is a method that replaces the variant: `accept_ws(now,
+&Accepted, pmd)` on an `H1Server` whose request the application accepts,
+and `upgraded_ws(random, now, pmd)` on an `H1Client` whose 101 checked.
+The bytes after the head stay in the driver's buffer and go to the new
+role, as a SOCKS reply's tail goes to the next protocol.  What belongs to
+the connection rather than the role (the peer's address, tls, ALPN, the
+tag) lives in the driver, so a role change cannot lose it.
+
+The h1 roles' header table storage `S` is dropped with the h1 variant.  A
+device that pools tables wants it back: `accept_ws` can return it.
+
+### The driver
+
+```rust
+pub struct Driver<B, S, R, T = Plain> {
+    conn: Conn<S, R>,
+    rx: B,          // caller's storage: bytes read, not yet taken
+    tx: B,          // caller's storage: bytes pulled, not yet written
+    tls: T,         // the record layer; Plain passes bytes through
+    // positions in rx and tx, the application's write interest, the
+    // close stage
+}
+
+pub enum Want<'d> {
+    /// Any of: read into `read`, write `write`, call timer() at `until`.
+    Io { read: Option<&'d mut [u8]>, write: Option<&'d [u8]>, until: Option<Instant> },
+    /// Half-close the write side, then go on with Io for the peer's FIN.
+    ShutdownWrite,
+    /// Done: release the socket.  Whether output was delivered or dropped.
+    Release(Outcome),
+}
+
+impl Driver {
+    fn want(&mut self, now: Instant) -> Want<'_>;
+    fn read_done(&mut self, now: Instant, n: usize);   // n == 0: the peer's FIN
+    fn write_done(&mut self, now: Instant, n: usize);
+    fn timer(&mut self, now: Instant);
+    fn hangup(&mut self, now: Instant);                // POLLHUP, an error
+    fn received(&mut self, now: Instant, bytes: &[u8]) -> usize; // copy-in form of read
+    fn poll_event(&mut self, now: Instant) -> Option<Delivery<'_, S, R>>;
+}
+
+pub struct Delivery<'d, S, R> {
+    pub event: Event<'d>,        // borrows the rx buffer
+    pub conn: &'d mut Conn<S, R>, // to answer with, while holding it
+}
+```
+
+- **Events are returned, not called back.**  The adapter loops `while
+  let Some(d) = driver.poll_event(now)` and hands each to the
+  application.  No callback re-enters the library, which caused trouble
+  in C.  The bytes an event took are let go when the next `poll_event` or
+  IO call comes, so the event can borrow them until then.
+- **The driver owns the buffers**, in storage the caller gives, so the
+  rules on held bytes, back-pressure and short writes are written once.
+  A connection that takes nothing (a pipelined request while one is in
+  hand) fills the rx buffer, and `want()` stops offering `read`: the TCP
+  window is the back-pressure, as in C.
+- **tls sits between the socket and those buffers**, decrypting in place
+  in `rx` and encrypting into `tx`, so no adapter sees it.
+- **The close is staged here**: `Shutdown` drains `tx`, gives
+  `ShutdownWrite`, then reads until the FIN or C's `SHUTDOWN_FLUSH`
+  (15s); `Release` drops what is unwritten and says so in `Outcome`.
+
+### The four loops against it
+
+**threads** (std): a reader and a writer thread, the driver in a `Mutex`.
+Neither can hold a slice of the driver while it blocks, so both copy:
+
+```rust
+// reader
+loop {
+    let until = match lock(&d).want(now()) { Want::Release(_) => break, w => w.until() };
+    sock.set_read_timeout(until.map(|u| u - now()));
+    match sock.read(&mut local) {
+        Ok(0) => lock(&d).read_done(now(), 0),
+        Ok(n) => { lock(&d).received(now(), &local[..n]); /* poll_event loop */ }
+        Err(e) if timed_out(&e) => lock(&d).timer(now()),
+        Err(_) => lock(&d).hangup(now()),
+    }
+    cv.notify_one();
+}
+// writer: wait on cv for want() to offer `write`, copy it out, unlock,
+// write_all, lock, write_done
+```
+
+`received()` stops short when the rx buffer is full; the reader keeps the
+rest and offers it again, which is the back-pressure here.
+
+**mio**: one thread, many drivers.  `want()` gives the interest to
+register and the next timer; on readiness, read into `read` and write
+from `write` while `want`'s borrow lives, end it, then `read_done(n)` and
+`write_done(n)`.  Only `usize`s cross the borrow.
+
+**tokio**: per connection task.  Take `want()`'s interest as booleans and
+`until`, end the borrow, `select!` on `readable()`, `writable()` and
+`sleep_until`; then `want()` again and `try_read` / `try_write` into the
+slices, which are never held across an `.await`.
+
+**embassy**: as tokio, with `embassy-time` for `until`.  Buffers are
+`&'static mut`, given to the driver, not inside the future.  Still to
+check, as above: whether `TcpSocket::read_with` hands a closure the
+socket's own ring.  If it does, `received()` could take from it and say
+how much it took, with no copy, though only without tls, which decrypts
+in the driver's buffer.
+
+**Your own loop**: what mio's loop does, with your poll.
+
+### Open, for Andy
+
+- `Conn` as an enum in `npro-io`, as agreed, or in a crate of its own
+  that `npro-io` and a user's own loop both use without the driver.
+- Events returned (`poll_event`) rather than an `App` trait called by
+  the driver.  A trait could be a thin layer over it.
+- The driver owning the rx and tx buffers, against handing the adapter
+  the bytes and asking how many were taken, which would save embassy a
+  copy without tls.
+- Whether `accept_ws` gives the header table's storage back.
+- The four protocol changes above, change 3 especially: it moves the pmd
+  output buffer out of the codec and changes `Ws::rx`.
+
 ## tls
 
 rustls is itself sans-IO.  It needs nothing from an event loop: its
@@ -218,8 +396,8 @@ then become sai tasks.
 - The tls provider on desktop: graviola is the leading candidate, which
   needs its licence admitted.  What covers CPUs it does not, if anything.
 - tls on esp32, which follows from which world and which chip.
-- The driver's interface, designed by sketching all four adapter loops
-  against it, embassy's included, before it is fixed.
+- The driver's interface: sketched above, with its own open questions,
+  for review before it is built.
 - Admitting `mio`, `libc` and `windows-sys` (and whatever `cargo deny`
   shows they bring) when the `mio` adapter is written.  `libc` has a
   build script.
