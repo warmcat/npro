@@ -347,6 +347,23 @@ rustls is one implementation behind a small record-layer trait in the
 driver, not a fixed dependency, because the right tls differs by target.
 rustls needs `alloc`, and around 16 KiB of record buffer per direction.
 
+### Decided with Andy, 2026-10-09
+
+- **rustls is supported, as an opt-in feature of `npro-io`**, which
+  depends on rustls alone, with no crypto provider: 7 crates, all Rust,
+  no FFI, building `no_std` with `alloc`.  rustls takes its provider as a
+  value (`CryptoProvider`) when its config is built, so the application
+  chooses it.
+- **npro depends on no provider's C.**  aws-lc-rs, Andy's choice of
+  provider, wraps `aws-lc-sys`, AWS-LC's C compiled by a build script,
+  which AGENTS.md keeps out of npro's graph.  It comes in where npro is
+  consumed: a crate such as `npro-aws-lc`, npro bound to aws-lc for tls,
+  used in turn by a server built on it (an `lwsws` of npro's), each
+  depending on npro and on aws-lc, not npro on them.  npro being useful
+  is npro being consumed like that.
+- So graviola, below, is no longer the lead: what is found about
+  providers is for whoever binds one.
+
 ### The crypto provider
 
 rustls itself carries no unsafe code; the providers are where it lives,
@@ -366,8 +383,8 @@ what rustls-rustcrypto's README warns about.  The RustCrypto crates
 underneath are widely used on their own, and on a microcontroller they
 are likely to be in the tree anyway (`embedded-tls` uses them too).
 
-graviola is the best fit on desktop and server: no C, and verified
-assembly where the arithmetic is.  Its licence, `Apache-2.0 OR ISC OR
+graviola was the best fit on desktop and server found: no C, and
+verified assembly where the arithmetic is.  Its licence, `Apache-2.0 OR ISC OR
 MIT-0`, is not MIT, and `deny.toml` admits only MIT, so it needs a
 licence admitted as well as the crate.  It does not cover CPUs without
 those features, or any microcontroller.
@@ -417,8 +434,11 @@ then become sai tasks.
 
 ## Open
 
-- The tls provider on desktop: graviola is the leading candidate, which
-  needs its licence admitted.  What covers CPUs it does not, if anything.
+- Where the binding to aws-lc lives (`npro-aws-lc` or so): in this
+  repository as a workspace of its own, as `fuzz/` is, with its own
+  `Cargo.lock` and `deny.toml` so none of it enters npro's graph, or a
+  repository of its own.  It is where tls is tested against C with a
+  real provider, and its name needs reserving.
 - tls on esp32, which follows from which world and which chip.
 - Admitting `mio`, `libc` and `windows-sys` (and whatever `cargo deny`
   shows they bring) when the `mio` adapter is written.  `libc` has a

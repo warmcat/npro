@@ -879,9 +879,11 @@ agreed 2026-10-06.  For this phase:
     `minimal-http-server` and ws echo, and the reverse.
 - the tests against C run locally until they pass, then become sai
   tasks;
-- tls: rustls inside the driver, behind a record-layer trait, once plain
-  TCP passes against C; the same tests again over tls.  The crypto
-  provider is open: [io-model.md](io-model.md) has what was found.
+- tls: rustls inside the driver, behind a record-layer trait, an opt-in
+  feature with no crypto provider; the application gives rustls its
+  provider.  aws-lc-rs, the provider chosen, comes in where npro is
+  consumed, never as npro's dependency (decided 2026-10-09,
+  [io-model.md](io-model.md)); the same tests again over tls, from there.
 
 **Time in the protocol crates (done, 2026-10-09)**, ahead of the driver,
 which needs every role's deadlines.  Each role takes `now` where a timer
@@ -967,6 +969,6 @@ not pending output; mux parked rx; the kept-warm joiner's status.
   lists the stage-1 set only.
 - Whether `Random` is `&mut dyn` or a generic parameter.  Generic avoids
   the vtable, but spreads a type parameter through every connection.
-- tls in `npro-io`: the crypto provider, and tls on esp32
-  ([io-model.md](io-model.md), "Open").
+- tls on esp32, and where the aws-lc binding that tests tls against C
+  lives ([io-model.md](io-model.md), "Open").
 - Where autobahn runs in CI, and whether the C oracles are measured there (`sync-c-states.sh` and `sync-c-h1.sh` are run by hand).
