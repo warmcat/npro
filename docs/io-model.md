@@ -40,9 +40,14 @@ is a value, not a service.
 
 ## Three layers
 
-1. **The protocol crates** (`npro-core`, `npro-h1`, `npro-ws`, ...):
-   `rx`, the `tx` pull, `deadline_passed`, `poll_request`, `poll_event`.
-   These exist.
+1. **The protocol crates** (`npro-core`, `npro-h1`, `npro-ws`, ...).
+   Each role (the h1 server and client, ws either end) has `rx(now, ..)`,
+   the `tx(now, ..)` pull, `next_deadline()` and `deadline_passed(now)`,
+   and says what it wants by queries: `wants_write()`, and `close()` (ws,
+   h1 server) or `failed()` and `is_done()` (h1 client).  There is no
+   common `poll_request()` yet, and no role takes "peer closed" but the h1
+   client (`rx_closed`): a common interface over the roles is the
+   driver's first need, below.
 
 2. **The driver**, in `npro-io`, `no_std` without its `std` feature.  It
    holds a connection, its buffers and its tls, and keeps the rules

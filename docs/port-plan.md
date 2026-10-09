@@ -778,13 +778,13 @@ for byte, as do the new ws transcripts but the pmd ones (phase 1f) and
 `ws-client-digest-retry` (digest auth); the fuzz targets are seeded from
 `fuzz/fuzz-ws/seeds` and the client transcripts.
 
-Not yet: nothing here has time, so there are no close deadlines and no
-keepalive pings; the application cannot yet begin a close of its own with
-a code, only close once flushed; the frame maximum is C's fixed 256 MiB,
-not configured, and there is no message maximum; the h1 server does not
-yet answer an unknown `Upgrade` with C's 403, or an upgrade with a body
-with its 400; a message's pieces are the application's to gather; and an
-application's message goes as one final frame.
+Not yet: the application cannot begin a close of its own with a code,
+only close once flushed; the frame maximum is C's fixed 256 MiB, not
+configured, and there is no message maximum; the h1 server does not yet
+answer an unknown `Upgrade` with C's 403, or an upgrade with a body with
+its 400; a message's pieces are the application's to gather; and an
+application's message goes as one final frame.  (Time, the close's
+deadlines and the validity ping came with phase 1g.)
 
 ### Phase 1f: permessage-deflate (feature `pmd`)
 
@@ -882,6 +882,51 @@ agreed 2026-10-06.  For this phase:
 - tls: rustls inside the driver, behind a record-layer trait, once plain
   TCP passes against C; the same tests again over tls.  The crypto
   provider is open: [io-model.md](io-model.md) has what was found.
+
+**Time in the protocol crates (done, 2026-10-09)**, ahead of the driver,
+which needs every role's deadlines.  Each role takes `now` where a timer
+can start and has `next_deadline()` and `deadline_passed(now)`, with C's
+timeouts, each kept in the state it belongs to:
+
+- **h1 server** (`server::Timeouts`): the head, 10s from the connection
+  or an idle connection's next byte, not renewed as bytes trickle
+  (`HOLDING_AH`); content, 15s, renewed by body bytes, cleared at the
+  body's end (`HTTP_CONTENT`); the answer, 30s from its head going,
+  renewed as more goes (`HTTP_RESPONSE`); keep-alive idle, 5s
+  (`KEEPALIVE_IDLE`).  Past idle the connection is shut down; past any
+  other it asks for the new `Close::Release`, nothing more written.
+- **h1 client**: the server's answer, 15s from when the request begins
+  to go, again after each interim (`AWAITING_SERVER_RESPONSE`); past it,
+  `Failure::TimedOut`.
+- **ws**: 5s for each step of a close (`CLOSE_SEND`, `CLOSE_ACK`,
+  `FLUSH_STORED_SEND_BEFORE_CLOSE`), then dropped; the validity check
+  (`conn::Validity`, C's 40s and 50s), pinging a quiet peer with `now`
+  and closing with 1000 if no pong comes.
+
+C's transcripts have no case where a timeout falls due, so these are
+held to C's source by unit tests, each checked by planting a bug; the
+replays run at transcript time and require that nothing fell due.
+Transcripts in which C's timeouts fire (a head that trickles, an idle
+keep-alive, a ws close with no ack, a quiet ws peer) would hold them to
+C's behaviour.
+
+Where npro does not follow C, each in its commit: C renews a request's
+content timeout on any rx, pipelined bytes included, npro on body bytes;
+C gives an already buffered pipelined head the keep-alive time, npro the
+head's; the ws ping's time is written little-endian, where C copies it
+in host order; the ws validity check stops once a close begins.
+
+Found in C, for C to decide: `lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0)`
+removes the timer but leaves `wsi->pending_timeout`, and `rops_rx_h1()`
+rearms whatever reason that holds on every rx from the transport.  So an
+h1 client reading its body runs under a stale `AWAITING_SERVER_RESPONSE`
+that each read renews, and a body that stalls for 15s is a timeout.  By
+reading only; no C test shows it.  npro has no body timeout on the client.
+
+Still not in the protocol crates: an h1 client's kept-warm `IDLING`
+(`CLIENT_CONN_IDLE`), which comes with the client's keep-alive; the
+staged shutdown's `SHUTDOWN_FLUSH`, and the IO side's connect and tls
+timeouts, which are the driver's.
 
 ### Later stages
 
