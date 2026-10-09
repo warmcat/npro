@@ -339,6 +339,7 @@ impl core::error::Error for ClientRefusal {}
 ///
 /// ```
 /// use npro_core::random::SeededRandom;
+/// use npro_core::time::Instant;
 /// use npro_h1::client::{Client, Connection, Event, Request, Scheme};
 /// use npro_ws::handshake::{ClientKey, MAX_REQUEST_LINES};
 ///
@@ -348,6 +349,7 @@ impl core::error::Error for ClientRefusal {}
 ///
 /// let mut lines = [0u8; MAX_REQUEST_LINES + 32];
 /// let n = key.request_lines(Some(b"echo"), None, &mut lines).unwrap();
+/// let now = Instant::from_micros(1_000_000);
 /// let mut c = Client::new([0u8; 1024], Request {
 ///     method: b"GET",
 ///     path: b"/echo",
@@ -358,10 +360,10 @@ impl core::error::Error for ClientRefusal {}
 ///     connection: Connection::Upgrade(&lines[..n]),
 /// })?;
 /// let mut out = [0u8; 512];
-/// let n = c.tx(&mut out);
+/// let n = c.tx(now, &mut out);
 /// assert!(out[..n].starts_with(b"GET /echo HTTP/1.1\r\nHost: sansio\r\nUpgrade: websocket\r\n"));
 ///
-/// let rx = c.rx(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+/// let rx = c.rx(now, b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
 ///                 Connection: Upgrade\r\nSec-WebSocket-Protocol: echo\r\n\
 ///                 Sec-WebSocket-Accept: rSsJf/ZKQdiul0BGIJ6uQGawdU8=\r\n\r\n")?;
 /// assert_eq!(rx.event, Some(Event::Response));
@@ -543,6 +545,10 @@ pub struct Checked<'t> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use npro_core::time::Instant;
+
+    /// When the tests' connections do all they do.
+    const T0: Instant = Instant::from_micros(1_000_000);
     use npro_core::random::SeededRandom;
     use npro_h1::client::{Client, Connection, Request, Scheme};
 
@@ -589,8 +595,8 @@ mod tests {
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let _ = c.tx(&mut out);
-        let _ = c.rx(response.as_bytes()).unwrap();
+        let _ = c.tx(T0, &mut out);
+        let _ = c.rx(T0, response.as_bytes()).unwrap();
         assert!(c.is_upgraded(), "{response}");
         match key.check(c.status(), c.response(), Some(b"echo, chat"), None) {
             Ok(c) => Verdict::Took(c.protocol.map(<[u8]>::len)),

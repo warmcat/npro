@@ -7,16 +7,18 @@
 //! gives the app must be the transcript's `app_rx` bytes, and npro must ask
 //! to release the connection exactly where C released it, its `close`.
 //! Where C did not, its transaction was complete at the end, and npro's
-//! must be.
+//! must be.  Each step is handed in at its time, and nothing may fall due
+//! between them, as nothing did in C's run.
 
 #![expect(
     unused_crate_dependencies,
-    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test and npro-h1"
+    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-core and npro-h1"
 )]
 
 // held to clippy's rules for tests
 #[cfg(test)]
 mod h1_client_replay {
+    use npro_core::time::Instant;
     use npro_h1::client::{Client, Connection, Event, Request, Scheme};
     use npro_h1::table::DEFAULT_CAPACITY;
     use npro_test::{StepKind, Transcript, vendored};
@@ -33,12 +35,12 @@ mod h1_client_replay {
         "h1-client-304-cl",
     ];
 
-    /// Hands `input` to the client until it takes nothing more; returns
-    /// the body it gave the app, and whether it failed.
-    fn feed(c: &mut Client<Vec<u8>>, mut input: &[u8]) -> (Vec<u8>, bool) {
+    /// Hands `input` to the client at `now` until it takes nothing more;
+    /// returns the body it gave the app, and whether it failed.
+    fn feed(c: &mut Client<Vec<u8>>, mut input: &[u8], now: Instant) -> (Vec<u8>, bool) {
         let mut body = Vec::new();
         loop {
-            let Ok(rx) = c.rx(input) else {
+            let Ok(rx) = c.rx(now, input) else {
                 return (body, true);
             };
             input = &input[rx.consumed..];
@@ -51,8 +53,9 @@ mod h1_client_replay {
     }
 
     fn replay(t: &Transcript) {
+        let time = |t_us: u64| Instant::from_micros(t.t0_us.checked_add(t_us).unwrap());
         let mut steps = t.steps.iter().peekable();
-        let Some(StepKind::Tx(want)) = steps.next().map(|s| &s.kind) else {
+        let Some((sent, StepKind::Tx(want))) = steps.next().map(|s| (s.t_us, &s.kind)) else {
             panic!("{}: does not start with the request", t.case);
         };
         let method: &[u8] = if want.starts_with(b"HEAD ") {
@@ -74,7 +77,7 @@ mod h1_client_replay {
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let n = c.tx(&mut out);
+        let n = c.tx(time(sent), &mut out);
         assert_eq!(
             out[..n].escape_ascii().to_string(),
             want.escape_ascii().to_string(),
@@ -96,7 +99,15 @@ mod h1_client_replay {
                 }
                 steps.next();
             }
-            let (body, failed) = feed(&mut c, rx);
+            // C's run had nothing fall due: nor may npro's
+            let now = time(step.t_us);
+            assert!(
+                c.next_deadline().is_none_or(|d| d > now),
+                "{} at {}us: a deadline passed",
+                t.case,
+                step.t_us
+            );
+            let (body, failed) = feed(&mut c, rx, now);
             assert_eq!(body, want_body, "{} at {}us: the body", t.case, step.t_us);
             assert_eq!(
                 failed,

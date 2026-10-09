@@ -128,7 +128,7 @@ mod ws_client_replay {
                     random,
                     extensions,
                 } => {
-                    let rx = client.rx(&input[at..]).unwrap();
+                    let rx = client.rx(now, &input[at..]).unwrap();
                     at = at.checked_add(rx.consumed).unwrap();
                     progress |= rx.consumed > 0;
                     if rx.event == Some(H1Event::Response) {
@@ -198,12 +198,13 @@ mod ws_client_replay {
         )
         .unwrap();
 
+        let time = |t_us: u64| Instant::from_micros(t.t0_us.checked_add(t_us).unwrap());
         let mut steps = t.steps.iter().peekable();
-        let Some(StepKind::Tx(request)) = steps.next().map(|s| &s.kind) else {
+        let Some((sent, StepKind::Tx(request))) = steps.next().map(|s| (s.t_us, &s.kind)) else {
             panic!("{}: does not start with the request", t.case);
         };
         let mut out = [0u8; 512];
-        let n = client.tx(&mut out);
+        let n = client.tx(time(sent), &mut out);
         assert_eq!(
             out[..n].escape_ascii().to_string(),
             request.escape_ascii().to_string(),
@@ -236,15 +237,17 @@ mod ws_client_replay {
                 steps.next();
             }
             // C's run had nothing fall due: nor may npro's
-            let now = Instant::from_micros(t.t0_us.checked_add(step.t_us).unwrap());
-            if let Conn::Ws(ws) = &conn {
-                assert!(
-                    ws.next_deadline().is_none_or(|d| d > now),
-                    "{} at {}us: a deadline passed",
-                    t.case,
-                    step.t_us
-                );
-            }
+            let now = time(step.t_us);
+            let deadline = match &conn {
+                Conn::H1 { client: h1, .. } => h1.next_deadline(),
+                Conn::Ws(ws) => ws.next_deadline(),
+            };
+            assert!(
+                deadline.is_none_or(|d| d > now),
+                "{} at {}us: a deadline passed",
+                t.case,
+                step.t_us
+            );
             let mut input = rx.clone();
             let got = feed(&mut conn, &mut app, &mut input, now);
             assert_eq!(

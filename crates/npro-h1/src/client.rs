@@ -26,10 +26,20 @@
 //! A response that cannot be framed fails the connection, which asks to be
 //! released.
 //!
+//! Time is an input: the calls that can start a timer take `now`,
+//! [`Client::next_deadline`] says when the connection next needs telling the
+//! time, and [`Client::deadline_passed`] tells it.  From when its request
+//! begins to go, the server has C's 15s ([`RESPONSE_TIMEOUT`]) to answer,
+//! and as long again after each interim response, or the connection fails.
+//!
 //! The final response to a request for an upgrade is not framed at all:
 //! after its head, whatever its status, the connection is the upgraded
 //! protocol's ([`Client::is_upgraded`]), which judges the response, as C's
 //! `lws_client_ws_upgrade()` does for ws.
+
+use core::time::Duration;
+
+use npro_core::time::Instant;
 
 use crate::chunked::{self, Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
@@ -42,6 +52,12 @@ use crate::token::Token;
 /// How many interim responses a client takes before the final one: C's
 /// `LWS_HTTP_INTERIM_RESPONSE_LIMIT`.
 pub const INTERIM_LIMIT: u8 = 8;
+
+/// How long the server has to answer, from when the request begins to go
+/// and again after each interim response: C's
+/// `PENDING_TIMEOUT_AWAITING_SERVER_RESPONSE`, the context's
+/// `timeout_secs`.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where the request's `Origin` comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +145,9 @@ pub enum Failure {
     Chunked(chunked::Error),
     /// The server closed before the body it said it would send.
     Closed,
+    /// The server did not answer in time: C's "Timed out waiting server
+    /// reply".
+    TimedOut,
 }
 
 impl core::fmt::Display for Failure {
@@ -141,6 +160,7 @@ impl core::fmt::Display for Failure {
             Self::ContentLength => f.write_str("HS: bad Content-Length"),
             Self::Chunked(e) => write!(f, "{e}"),
             Self::Closed => f.write_str("closed before the body ended"),
+            Self::TimedOut => f.write_str("Timed out waiting server reply"),
         }
     }
 }
@@ -165,10 +185,13 @@ enum Body {
 /// Where the connection is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Writing the request.
+    /// The request is yet to go.
     Asking,
-    /// Waiting for the response's head; this many interims so far.
-    Head(u8),
+    /// The request is going, and the response is due by `until`.
+    Sending { until: Instant },
+    /// Waiting for the response's head, due by `until`; this many
+    /// interims so far.
+    Head { interims: u8, until: Instant },
     /// Taking the response's body.
     Body(Body),
     /// The transaction is over.
@@ -190,8 +213,10 @@ enum Asked {
 /// One h1 client connection.
 ///
 /// ```
+/// use npro_core::time::Instant;
 /// use npro_h1::client::{Client, Connection, Event, Request, Scheme};
 ///
+/// let now = Instant::from_micros(1_000_000);
 /// let mut c = Client::new([0u8; 1024], Request {
 ///     method: b"GET",
 ///     path: b"/x",
@@ -202,15 +227,15 @@ enum Asked {
 ///     connection: Connection::Close,
 /// })?;
 /// let mut out = [0u8; 256];
-/// let n = c.tx(&mut out);
+/// let n = c.tx(now, &mut out);
 /// assert_eq!(&out[..n], b"GET /x HTTP/1.1\r\nHost: example.com\r\nconnection: close\r\n\r\n");
 ///
 /// let mut input = &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..];
-/// let rx = c.rx(input)?;
+/// let rx = c.rx(now, input)?;
 /// assert_eq!((rx.event, c.status()), (Some(Event::Response), Some(200)));
 /// input = &input[rx.consumed..];
-/// assert_eq!(c.rx(input)?.event, Some(Event::Body(b"ok")));
-/// assert_eq!(c.rx(b"")?.event, Some(Event::BodyEnd));
+/// assert_eq!(c.rx(now, input)?.event, Some(Event::Body(b"ok")));
+/// assert_eq!(c.rx(now, b"")?.event, Some(Event::BodyEnd));
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
@@ -220,6 +245,8 @@ pub struct Client<S> {
     phase: Phase,
     own: Own,
     status: Option<u16>,
+    /// How long the server has to answer.
+    timeout: Duration,
 }
 
 /// Why a client cannot be made.
@@ -278,7 +305,38 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             phase: Phase::Asking,
             own: request_head(&req).map_err(NewError::Head)?,
             status: None,
+            timeout: RESPONSE_TIMEOUT,
         })
+    }
+
+    /// The connection with the server given `timeout` to answer, rather
+    /// than [`RESPONSE_TIMEOUT`].
+    #[must_use]
+    pub const fn with_response_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// When the connection next needs [`Client::deadline_passed`], if it is
+    /// waiting on the server.
+    #[must_use]
+    pub const fn next_deadline(&self) -> Option<Instant> {
+        match self.phase {
+            Phase::Sending { until } | Phase::Head { until, .. } => Some(until),
+            Phase::Asking | Phase::Body(_) | Phase::Done | Phase::Upgraded | Phase::Failed(_) => {
+                None
+            }
+        }
+    }
+
+    /// Tells the connection it is `now`, which may be past its
+    /// [`Client::next_deadline`]: then it fails, [`Failure::TimedOut`], and
+    /// asks to be released.
+    pub fn deadline_passed(&mut self, now: Instant) {
+        if self.next_deadline().is_some_and(|d| now >= d) {
+            self.own = Own::new();
+            self.phase = Phase::Failed(Failure::TimedOut);
+        }
     }
 
     /// The response's headers, after the request's own tokens.
@@ -304,7 +362,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn failed(&self) -> Option<Failure> {
         match self.phase {
             Phase::Failed(f) => Some(f),
-            Phase::Asking | Phase::Head(_) | Phase::Body(_) | Phase::Done | Phase::Upgraded => None,
+            Phase::Asking
+            | Phase::Sending { .. }
+            | Phase::Head { .. }
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Upgraded => None,
         }
     }
 
@@ -322,13 +385,27 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         matches!(self.phase, Phase::Upgraded)
     }
 
-    /// Writes the request's head, or what is left of it, into `out`,
-    /// returning how much.
-    pub fn tx(&mut self, out: &mut [u8]) -> usize {
+    /// Writes the request's head, or what is left of it, into `out`, at
+    /// `now`, returning how much.  The server's answer is due from when the
+    /// head begins to go, as C sends it whole, in one push, and starts
+    /// waiting then.
+    pub fn tx(&mut self, now: Instant, out: &mut [u8]) -> usize {
         let n = self.own.drain(out);
-        if self.phase == Phase::Asking && !self.own.pending() {
-            self.phase = Phase::Head(0);
-        }
+        let until = match self.phase {
+            Phase::Asking if n > 0 => now.saturating_add(self.timeout),
+            Phase::Sending { until } => until,
+            Phase::Asking
+            | Phase::Head { .. }
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Upgraded
+            | Phase::Failed(_) => return n,
+        };
+        self.phase = if self.own.pending() {
+            Phase::Sending { until }
+        } else {
+            Phase::Head { interims: 0, until }
+        };
         n
     }
 
@@ -337,26 +414,31 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         Err(f)
     }
 
-    /// Takes bytes from the server: see [`Event`].
+    /// Takes bytes from the server, at `now`: see [`Event`].
     ///
     /// # Errors
     ///
     /// The [`Failure`], once the response fails the connection, and on
     /// every call after.
-    pub fn rx<'a>(&mut self, input: &'a [u8]) -> Result<Rx<'a>, Failure> {
+    pub fn rx<'a>(&mut self, now: Instant, input: &'a [u8]) -> Result<Rx<'a>, Failure> {
         let held = Ok(Rx {
             consumed: 0,
             event: None,
         });
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Asking | Phase::Done | Phase::Upgraded => held,
-            Phase::Head(interims) => self.rx_head(interims, input),
+            Phase::Asking | Phase::Sending { .. } | Phase::Done | Phase::Upgraded => held,
+            Phase::Head { interims, .. } => self.rx_head(now, interims, input),
             Phase::Body(b) => self.rx_body(b, input),
         }
     }
 
-    fn rx_head<'a>(&mut self, interims: u8, input: &'a [u8]) -> Result<Rx<'a>, Failure> {
+    fn rx_head<'a>(
+        &mut self,
+        now: Instant,
+        interims: u8,
+        input: &'a [u8],
+    ) -> Result<Rx<'a>, Failure> {
         let consumed = match self.head.rx(input) {
             Ok(Progress::More) => {
                 return Ok(Rx {
@@ -379,9 +461,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             if n > INTERIM_LIMIT {
                 return self.fail(Failure::TooManyInterims);
             }
-            // nothing for the app: back to the request, for the final one
+            // nothing for the app: back to the request, for the final one,
+            // which has the timeout again
             self.head.rewind();
-            self.phase = Phase::Head(n);
+            self.phase = Phase::Head {
+                interims: n,
+                until: now.saturating_add(self.timeout),
+            };
             return Ok(Rx {
                 consumed,
                 event: None,
@@ -501,7 +587,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 self.phase = Phase::Done;
                 Ok(None)
             }
-            Phase::Asking | Phase::Head(_) | Phase::Body(Body::Length(_) | Body::Chunked(_)) => {
+            Phase::Asking
+            | Phase::Sending { .. }
+            | Phase::Head { .. }
+            | Phase::Body(Body::Length(_) | Body::Chunked(_)) => {
                 self.phase = Phase::Failed(Failure::Closed);
                 Err(Failure::Closed)
             }
@@ -575,6 +664,9 @@ fn atoi(s: &[u8]) -> i64 {
 mod tests {
     use super::*;
 
+    /// When the tests' connections do all they do.
+    const T0: Instant = Instant::from_micros(1_000_000);
+
     fn get(method: &'static [u8]) -> Client<[u8; 1024]> {
         let mut c = Client::new(
             [0u8; 1024],
@@ -590,7 +682,7 @@ mod tests {
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let _ = c.tx(&mut out);
+        let _ = c.tx(T0, &mut out);
         c
     }
 
@@ -599,7 +691,7 @@ mod tests {
         let mut c = get(b"GET");
         let mut input = &b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early\r\nLink: x\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..];
         loop {
-            let rx = c.rx(input).unwrap();
+            let rx = c.rx(T0, input).unwrap();
             input = &input[rx.consumed..];
             if rx.event == Some(Event::Response) {
                 break;
@@ -613,7 +705,7 @@ mod tests {
         let nine = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(9);
         let mut rest = nine.as_slice();
         let failed = loop {
-            match many.rx(rest) {
+            match many.rx(T0, rest) {
                 Ok(rx) => rest = &rest[rx.consumed..],
                 Err(f) => break f,
             }
@@ -637,7 +729,7 @@ mod tests {
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let n = c.tx(&mut out);
+        let n = c.tx(T0, &mut out);
         assert_eq!(
             &out[..n],
             b"GET /x HTTP/1.1\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\n"
@@ -645,22 +737,22 @@ mod tests {
         // an interim is still dropped; the 101 is final, its frames are not
         // a body, and nor would a 200's be
         let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 101 Go\r\n\r\n\x81\x00";
-        let first = c.rx(input).unwrap();
+        let first = c.rx(T0, input).unwrap();
         assert_eq!(first.event, None);
-        let rx = c.rx(&input[first.consumed..]).unwrap();
+        let rx = c.rx(T0, &input[first.consumed..]).unwrap();
         assert_eq!(rx.event, Some(Event::Response));
         assert_eq!(&input[first.consumed + rx.consumed..], b"\x81\x00");
         assert!(c.is_upgraded());
         assert_eq!(c.status(), Some(101));
-        assert_eq!(c.rx(b"\x81\x00").unwrap().consumed, 0);
+        assert_eq!(c.rx(T0, b"\x81\x00").unwrap().consumed, 0);
     }
 
     #[test]
     fn a_body_to_the_close() {
         let mut c = get(b"GET");
         let head = b"HTTP/1.0 200 OK\r\n\r\n";
-        assert_eq!(c.rx(head).unwrap().event, Some(Event::Response));
-        assert_eq!(c.rx(b"abc").unwrap().event, Some(Event::Body(b"abc")));
+        assert_eq!(c.rx(T0, head).unwrap().event, Some(Event::Response));
+        assert_eq!(c.rx(T0, b"abc").unwrap().event, Some(Event::Body(b"abc")));
         assert_eq!(c.rx_closed(), Ok(Some(Event::BodyEnd)));
         assert!(c.is_done());
     }
@@ -669,7 +761,7 @@ mod tests {
     fn a_close_before_the_body_ended_fails() {
         let mut c = get(b"GET");
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        assert_eq!(c.rx(head).unwrap().event, Some(Event::Response));
+        assert_eq!(c.rx(T0, head).unwrap().event, Some(Event::Response));
         assert_eq!(c.rx_closed(), Err(Failure::Closed));
         assert_eq!(c.failed(), Some(Failure::Closed));
     }
@@ -682,7 +774,7 @@ mod tests {
         let mut body = [0u8; 8];
         let mut n = 0;
         loop {
-            let rx = c.rx(input).unwrap();
+            let rx = c.rx(T0, input).unwrap();
             input = &input[rx.consumed..];
             match rx.event {
                 Some(Event::Body(b)) => {
@@ -702,5 +794,74 @@ mod tests {
         assert_eq!(atoi(b"\t 404"), 404);
         assert_eq!(atoi(b"-1x"), -1);
         assert_eq!(atoi(b"OK"), 0);
+    }
+
+    /// `T0` and `secs` seconds.
+    fn at(secs: u64) -> Instant {
+        T0.checked_add(Duration::from_secs(secs)).unwrap()
+    }
+
+    fn unsent() -> Client<[u8; 1024]> {
+        Client::new(
+            [0u8; 1024],
+            Request {
+                method: b"GET",
+                path: b"/x",
+                host: None,
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Close,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_answer_is_due_from_when_the_request_begins_to_go() {
+        let mut c = unsent();
+        assert_eq!(c.next_deadline(), None);
+        let mut out = [0u8; 512];
+        assert_eq!(c.tx(at(1), &mut out[..4]), 4);
+        assert_eq!(c.next_deadline(), Some(at(16)));
+        assert!(c.tx(at(3), &mut out) > 0);
+        assert_eq!(c.next_deadline(), Some(at(16)));
+        c.deadline_passed(at(15));
+        assert_eq!(c.failed(), None);
+        c.deadline_passed(at(16));
+        assert_eq!(c.failed(), Some(Failure::TimedOut));
+        assert_eq!(c.rx(at(16), b"HTTP/1.1 200 OK\r\n"), Err(Failure::TimedOut));
+        assert_eq!(c.next_deadline(), None);
+        assert!(!c.wants_write());
+    }
+
+    #[test]
+    fn an_interim_gives_the_server_the_timeout_again() {
+        let mut c = get(b"GET");
+        assert_eq!(c.next_deadline(), Some(at(15)));
+        let rx = c.rx(at(10), b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+        assert_eq!(rx.event, None);
+        assert_eq!(c.next_deadline(), Some(at(25)));
+    }
+
+    #[test]
+    fn the_final_response_ends_the_wait() {
+        let mut c = get(b"GET").with_response_timeout(Duration::from_secs(2));
+        let rx = c.rx(at(1), b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n");
+        assert_eq!(rx.unwrap().event, Some(Event::Response));
+        assert_eq!(c.next_deadline(), None);
+        c.deadline_passed(at(60));
+        assert_eq!(c.failed(), None);
+    }
+
+    #[test]
+    fn a_timeout_says_what_c_says() {
+        extern crate alloc;
+        use alloc::string::ToString;
+
+        assert_eq!(
+            Failure::TimedOut.to_string(),
+            "Timed out waiting server reply"
+        );
     }
 }
