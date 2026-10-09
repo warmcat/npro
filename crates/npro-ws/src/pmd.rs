@@ -1031,7 +1031,7 @@ mod tests {
             64,
         );
         assert_eq!(got, Vec::new());
-        assert_eq!(close, Some(Close::Release));
+        assert_eq!(close, Some(Close::Abort));
     }
 
     #[test]
@@ -1039,7 +1039,7 @@ mod tests {
         // a block of the reserved type 3
         let (got, close) = reads(&mut client(Params::DEFAULT), b"\xc1\x02\x07\x00", 64);
         assert_eq!(got, Vec::new());
-        assert_eq!(close, Some(Close::Release));
+        assert_eq!(close, Some(Close::Abort));
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(ws.tx(T0, &mut out, &mut src), 3);
         let mut bad = *b"\xc1\x82\0\0\0\0\x07\x00";
         ws.rx(T0, &mut bad);
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
         assert!(!ws.wants_write());
         assert_eq!(ws.tx(T0, &mut out, &mut src), 0);
     }
@@ -1177,7 +1177,7 @@ mod tests {
         let limited = Params::DEFAULT.with_max_message(4999);
         assert_eq!(
             reads(&mut Ws::server(b"", T0).with_pmd(limited), &frames, 4096),
-            (Vec::new(), Some(Close::Release))
+            (Vec::new(), Some(Close::Abort))
         );
         // and at the limit, it is not
         let exact = Params::DEFAULT.with_max_message(5000);
@@ -1223,7 +1223,7 @@ mod tests {
             }
             assert_eq!(
                 (got, ws.close()),
-                (33026, Some(Close::Release)),
+                (33026, Some(Close::Abort)),
                 "split at {split}"
             );
         }

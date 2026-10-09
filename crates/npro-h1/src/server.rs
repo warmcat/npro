@@ -152,16 +152,10 @@ pub struct Tx {
     pub more: bool,
 }
 
-/// What the connection asks of whatever carries it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Close {
-    /// Stop sending, once what was written has gone, and wait for the
-    /// peer to close: C's `LWS_IOCLOSE_SHUTDOWN`.
-    Shutdown,
-    /// Release it now, with nothing more written: a deadline passed, and
-    /// as C's timeouts mark the socket unusable, nothing more goes.
-    Release,
-}
+/// What the connection asks of whatever carries it: a server closes in
+/// good order with [`Close::Shutdown`], and past a deadline with
+/// [`Close::Abort`].
+pub use npro_core::close::Close;
 
 /// Where the application's payload comes from: [`Server::tx`] pulls it
 /// into the buffer it is writing, after anything the connection writes
@@ -361,15 +355,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
 
     /// Tells the connection it is `now`, which may be past its
     /// [`Server::next_deadline`]: then an idle connection asks to be shut
-    /// down, and any other to be released with nothing more written, as
-    /// C's timeouts close them.
+    /// down, and any other to be aborted, nothing more written, as C's
+    /// timeouts close them.
     pub fn deadline_passed(&mut self, now: Instant) {
         if self.next_deadline().is_none_or(|d| now < d) {
             return;
         }
         let close = match self.phase {
             Phase::Head(Wait::Idle(_)) => Close::Shutdown,
-            Phase::Head(Wait::Head(_)) | Phase::Request(_) | Phase::Refusing(_) => Close::Release,
+            Phase::Head(Wait::Head(_)) | Phase::Request(_) | Phase::Refusing(_) => Close::Abort,
             Phase::Closed(c) => c,
         };
         self.own = Own::new();
@@ -1094,7 +1088,7 @@ mod tests {
         s.deadline_passed(at(9));
         assert_eq!(s.close(), None);
         s.deadline_passed(at(10));
-        assert_eq!(s.close(), Some(Close::Release));
+        assert_eq!(s.close(), Some(Close::Abort));
         assert_eq!(s.next_deadline(), None);
     }
 
@@ -1130,7 +1124,7 @@ mod tests {
         s.tx(T0, &mut out, &mut Text(b""));
         assert!(s.wants_write());
         s.deadline_passed(at(30));
-        assert_eq!(s.close(), Some(Close::Release));
+        assert_eq!(s.close(), Some(Close::Abort));
         assert!(!s.wants_write());
         assert_eq!(s.tx(at(30), &mut out, &mut Text(b"ok")).written, 0);
     }
@@ -1205,7 +1199,7 @@ mod tests {
         s.rx(at(3), b"G");
         assert_eq!(s.next_deadline(), Some(at(13)));
         s.deadline_passed(at(13));
-        assert_eq!(s.close(), Some(Close::Release));
+        assert_eq!(s.close(), Some(Close::Abort));
     }
 
     #[test]
@@ -1225,7 +1219,7 @@ mod tests {
         assert!(s.wants_write());
         assert_eq!(s.next_deadline(), Some(at(30)));
         s.deadline_passed(at(30));
-        assert_eq!(s.close(), Some(Close::Release));
+        assert_eq!(s.close(), Some(Close::Abort));
         assert!(!s.wants_write());
     }
 }

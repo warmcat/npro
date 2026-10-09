@@ -137,6 +137,18 @@ pub enum Side {
     Client,
 }
 
+impl Side {
+    /// How this end closes in good order, once what it wrote has gone: a
+    /// server stages a shutdown, a client releases, as C's
+    /// `__lws_close_free_wsi()` stages one only for a server.
+    const fn polite_close(self) -> Close {
+        match self {
+            Self::Server => Close::Shutdown,
+            Self::Client => Close::Release,
+        }
+    }
+}
+
 /// The sealed trait pattern: public, so it can bound [`Role`], and
 /// unnameable outside, so nothing else implements it.
 mod sealed {
@@ -234,15 +246,11 @@ pub struct Rx<'a> {
     pub event: Option<Event<'a>>,
 }
 
-/// What the connection asks of its carrier, once it is done with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Close {
-    /// Stop sending once what was written has gone.
-    Shutdown,
-    /// Release it now: the close handshake is over, or, for a client
-    /// whose random source failed it, the connection cannot go on.
-    Release,
-}
+/// What the connection asks of its carrier, once it is done with: a
+/// polite close is a server's [`Close::Shutdown`] and a client's
+/// [`Close::Release`], as C stages a shutdown only for a server; a failed
+/// one, or one past a deadline, is [`Close::Abort`].
+pub use npro_core::close::Close;
 
 /// Why a frame cannot be sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -796,7 +804,7 @@ impl<P: Role> Ws<P> {
                 }
                 Parse::Refused => {
                     if !input.is_empty() && matches!(self.closing, Closing::AwaitingAck { .. }) {
-                        self.closing = Closing::Closed(Close::Release);
+                        self.closing = Closing::Closed(self.role.side().polite_close());
                     }
                     return Rx {
                         consumed: input.len(),
@@ -1286,7 +1294,7 @@ impl<P: Role> Ws<P> {
             Closing::Returned { .. } | Closing::Flushing { .. } | Closing::Closed(_) => None,
             // the answer to ours: done
             Closing::AwaitingAck { .. } | Closing::WaitingToSend { .. } => {
-                self.closing = Closing::Closed(Close::Release);
+                self.closing = Closing::Closed(self.role.side().polite_close());
                 self.parse = Parse::Stopped;
                 None
             }
@@ -1365,7 +1373,7 @@ impl<P: Role> Ws<P> {
     /// The connection cannot go on: a client's random source failed it,
     /// or permessage-deflate did.  Nothing more is read or written, not
     /// even the rest of a frame already going, as C marks the socket
-    /// unusable, and it asks to be released.
+    /// unusable, and it asks to be aborted.
     const fn fail(&mut self) {
         self.parse = Parse::Stopped;
         self.out = Out::new();
@@ -1373,7 +1381,7 @@ impl<P: Role> Ws<P> {
         self.ping = None;
         self.check = Check::Off;
         self.app = App::Idle;
-        self.closing = Closing::Closed(Close::Release);
+        self.closing = Closing::Closed(Close::Abort);
     }
 
     /// A control frame into what is in flight, masked as this end masks;
@@ -1523,7 +1531,7 @@ impl<P: Role> Ws<P> {
     /// [`Ws::next_deadline`]:
     ///
     /// - a close that did not finish in time drops the connection, as C's
-    ///   timeouts do, asking to be released with nothing more written;
+    ///   timeouts do, asking to be aborted with nothing more written;
     /// - the validity check, quiet for its ping time, owes the peer a
     ///   ping, whose payload is `now` in microseconds, little-endian;
     /// - with no pong by its hangup time, our close begins with 1000, as
@@ -1621,7 +1629,7 @@ impl<P: Role> Ws<P> {
                     continue;
                 }
                 Closing::Flushing { .. } => {
-                    self.closing = Closing::Closed(Close::Shutdown);
+                    self.closing = Closing::Closed(self.role.side().polite_close());
                     return written;
                 }
                 Closing::None
@@ -1650,7 +1658,7 @@ impl<P: Role> Ws<P> {
                 if !self.queue_control(Op::Close, &ctl) {
                     return written;
                 }
-                self.closing = Closing::Closed(Close::Shutdown);
+                self.closing = Closing::Closed(self.role.side().polite_close());
                 continue;
             }
             // the validity ping, after what the close and the peer's ping
@@ -1857,7 +1865,7 @@ mod tests {
     fn a_client_with_no_random_fails() {
         let mut ws = Ws::client(Dry, T0);
         assert_eq!(ws.send(Kind::Text, 1), Err(SendError::NoMask));
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
         let mut out = [0u8; 8];
         assert_eq!(ws.tx(T0, &mut out, &mut Nothing), 0);
     }
@@ -1914,7 +1922,7 @@ mod tests {
         ws.deadline_passed(at(4));
         assert_eq!(ws.close(), None);
         ws.deadline_passed(at(5));
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
         assert!(!ws.wants_write());
         assert_eq!(ws.next_deadline(), None);
     }
@@ -1929,7 +1937,7 @@ mod tests {
         ws.deadline_passed(at(7));
         assert_eq!(ws.close(), None);
         ws.deadline_passed(at(8));
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
     }
 
     #[test]
@@ -1939,7 +1947,7 @@ mod tests {
         ws.rx(at(1), &mut close);
         assert_eq!(ws.next_deadline(), Some(at(6)));
         ws.deadline_passed(at(6));
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
         assert_eq!(drain(&mut ws, at(6)), b"");
     }
 
@@ -1964,7 +1972,7 @@ mod tests {
         let mut out = [0u8; 64];
         assert_eq!(ws.tx(at(1), &mut out, &mut Payload(b"ab")), 4);
         ws.deadline_passed(at(5));
-        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(ws.close(), Some(Close::Abort));
     }
 
     #[test]

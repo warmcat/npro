@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod base64;
+pub mod close;
 pub mod random;
 pub mod sha1;
 pub mod state;

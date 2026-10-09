@@ -266,7 +266,7 @@ fn opens_agree(a: &Run, b: &Run, bad_utf8: bool, open: Open) -> bool {
     if a.open == b.open {
         return true;
     }
-    if a.close == Some(Close::Release) || open == Open::Deflated {
+    if a.close == Some(Close::Abort) || open == Open::Deflated {
         let bytes = |r: &Run| r.open.as_ref().map_or(Vec::new(), |(_, m)| m.clone());
         let (x, y) = (bytes(a), bytes(b));
         return x.starts_with(&y) || y.starts_with(&x);
@@ -298,7 +298,7 @@ fn frames<P: Role>(target: &str, data: &[u8], open: Open, make: impl Fn() -> Ws<
     // depends on the split, so text it gives that is not UTF-8 may be seen
     // first, or not: either way, it failed
     let failed = |r: &Run, frames_sent: &[(u8, Vec<u8>)]| {
-        (r.close == Some(Close::Release) && r.wrote.is_empty()) || refused_text(frames_sent)
+        (r.close == Some(Close::Abort) && r.wrote.is_empty()) || refused_text(frames_sent)
     };
     let ends_agree = (whole.wrote == pieces.wrote && whole.close == pieces.close)
         || (open == Open::Deflated && failed(&whole, &sent) && failed(&pieces, &sent_in_pieces));

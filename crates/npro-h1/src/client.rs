@@ -48,6 +48,7 @@ use crate::own::Own;
 pub use crate::own::{MAX_OWN, RespondError};
 use crate::table::{CapacityTooLarge, Full, HeaderTable};
 use crate::token::Token;
+pub use npro_core::close::Close;
 
 /// How many interim responses a client takes before the final one: C's
 /// `LWS_HTTP_INTERIM_RESPONSE_LIMIT`.
@@ -206,7 +207,11 @@ enum Phase {
 /// What the request asked for: a transaction, or an upgrade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Asked {
-    Transaction,
+    /// A transaction, then the connection closes.
+    Close,
+    /// A transaction, the connection kept for another.
+    KeepAlive,
+    /// An upgrade.
     Upgrade,
 }
 
@@ -299,7 +304,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         Ok(Self {
             head: Head::with_table(t, Side::Client, head::Config::new()),
             asked: match req.connection {
-                Connection::Close | Connection::KeepAlive => Asked::Transaction,
+                Connection::Close => Asked::Close,
+                Connection::KeepAlive => Asked::KeepAlive,
                 Connection::Upgrade(_) => Asked::Upgrade,
             },
             phase: Phase::Asking,
@@ -331,7 +337,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
 
     /// Tells the connection it is `now`, which may be past its
     /// [`Client::next_deadline`]: then it fails, [`Failure::TimedOut`], and
-    /// asks to be released.
+    /// asks to be aborted.
     pub fn deadline_passed(&mut self, now: Instant) {
         if self.next_deadline().is_some_and(|d| now >= d) {
             self.own = Own::new();
@@ -357,7 +363,30 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         self.own.pending()
     }
 
-    /// Why the connection failed, if it did: then it asks to be released.
+    /// What the connection asks of whatever carries it, once it is done
+    /// with: [`Close::Abort`] once it failed, as C closes a client whose
+    /// connection failed with nothing more to say; [`Close::Release`] once a
+    /// transaction that said `connection: close` is over, a client staging
+    /// no shutdown in C.  A connection kept alive, or upgraded, asks
+    /// nothing: it is the next request's, or the upgraded protocol's.
+    #[must_use]
+    pub const fn close(&self) -> Option<Close> {
+        match (self.phase, self.asked) {
+            (Phase::Failed(_), _) => Some(Close::Abort),
+            (Phase::Done, Asked::Close) => Some(Close::Release),
+            (Phase::Done, Asked::KeepAlive | Asked::Upgrade)
+            | (
+                Phase::Asking
+                | Phase::Sending { .. }
+                | Phase::Head { .. }
+                | Phase::Body(_)
+                | Phase::Upgraded,
+                _,
+            ) => None,
+        }
+    }
+
+    /// Why the connection failed, if it did: then it asks to be aborted.
     #[must_use]
     pub const fn failed(&self) -> Option<Failure> {
         match self.phase {
@@ -863,5 +892,21 @@ mod tests {
             Failure::TimedOut.to_string(),
             "Timed out waiting server reply"
         );
+    }
+
+    #[test]
+    fn a_client_asks_to_release_or_abort_as_c_closes_it() {
+        let mut c = get(b"GET");
+        assert_eq!(c.close(), None);
+        let rx = c.rx(T0, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(rx.unwrap().event, Some(Event::Response));
+        assert_eq!(c.rx(T0, b"").unwrap().event, Some(Event::BodyEnd));
+        assert_eq!(c.rx(T0, b"").unwrap().event, None);
+        assert!(c.is_done());
+        assert_eq!(c.close(), Some(Close::Release));
+
+        let mut failed = get(b"GET");
+        let _ = failed.rx(T0, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
+        assert_eq!(failed.close(), Some(Close::Abort));
     }
 }
