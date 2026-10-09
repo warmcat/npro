@@ -43,6 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "npro-io"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-h1",
+ "npro-ws",
+]
+
+[[package]]
 name = "npro-test"
 version = "0.0.2"
 dependencies = [

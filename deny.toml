@@ -40,6 +40,7 @@ allow = [
 	"npro-core",
 	"npro-h1",
 	"npro-ws",
+	"npro-io",
 	"npro-fuzz",
 	"npro-test",
 

@@ -1,0 +1,27 @@
+[package]
+name        = "npro-io"
+description = "npro's IO: the driver that carries a sans-IO connection between its protocol and the sockets, and in time the adapters to schedulers"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "websocket", "http"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core.workspace = true
+npro-h1.workspace   = true
+npro-ws.workspace   = true
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+
+[features]
+# permessage-deflate on ws connections: needs alloc, as npro-ws' pmd does
+pmd = ["npro-ws/pmd"]
+
+[lints]
+workspace = true

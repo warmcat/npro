@@ -15,6 +15,7 @@ repository   = "https://libwebsockets.org/git/npro"
 [workspace.dependencies]
 npro-core = { path = "crates/npro-core", version = "0.0.2" }
 npro-h1   = { path = "crates/npro-h1", version = "0.0.2" }
+npro-ws   = { path = "crates/npro-ws", version = "0.0.2" }
 
 [workspace.lints.rust]
 unsafe_code     = "forbid"
