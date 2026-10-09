@@ -17,6 +17,11 @@
 //!   payload when it asked to write ([`Driver::request_write`], C's
 //!   `lws_callback_on_writable()`), into its tx buffer, which the adapter
 //!   writes from, saying how much went ([`Driver::write_done`]);
+//! - **tls**, made with [`Driver::with_tls`], between those buffers and the
+//!   socket: records read are opened into the rx buffer, and what the
+//!   connection writes is sealed into records, through the
+//!   [`crate::tls::RecordLayer`] it is given.  Nothing of the connection
+//!   is pulled until the handshake is done, which has C's 15s;
 //! - **times**: [`Driver::want`] says when it next needs [`Driver::timer`];
 //! - **closes** as the connection asks ([`npro_core::close::Close`]): what
 //!   was written goes, then a server half-closes ([`Want::HalfClose`]) and
@@ -81,6 +86,7 @@ use npro_core::time::Instant;
 use npro_h1::server::TxSource;
 
 use crate::conn::{Conn, Event};
+use crate::tls::{NoTls, RecordLayer};
 
 /// How long a closing connection may take to flush what it wrote: C's
 /// `PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE`, 5s.
@@ -229,32 +235,105 @@ impl Window {
     }
 }
 
-/// One connection, its buffers in `B`: see the module's description.
+/// How long a tls handshake may take: C's `PENDING_TIMEOUT_SSL_ACCEPT` and
+/// `PENDING_TIMEOUT_SENT_CLIENT_HANDSHAKE`, the context's `timeout_secs`,
+/// 15s.  Past it the connection is dropped.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The storage of a tls connection's records, as they come from and go to
+/// the socket, beside its [`Buffers`] of plaintext.  A record is up to
+/// 16KiB and its overhead: the rx buffer must hold one, as tls opens a
+/// record only whole.
 #[derive(Clone, Debug)]
-pub struct Driver<S, R, B> {
+pub struct NetBuffers<B> {
+    /// Records read, not yet opened.
+    pub rx: B,
+    /// Records sealed, not yet written.
+    pub tx: B,
+}
+
+/// Where a tls handshake is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handshake {
+    /// Under way, to be done by the deadline.
+    Due(Instant),
+    /// Done: the record layer says it is established.
+    Done,
+}
+
+/// The socket's side of a tls connection: the record layer, and its
+/// records in and out.
+#[derive(Clone, Debug)]
+struct Tls<T, B> {
+    layer: T,
+    handshake: Handshake,
+    net: NetBuffers<B>,
+    /// What of `net.rx` is read and not yet opened.
+    rx: Window,
+    /// What of `net.tx` is sealed and not yet written.
+    tx: Window,
+}
+
+/// What lies between the connection's buffers and the socket.
+#[derive(Clone, Debug)]
+enum Wire<T, B> {
+    /// Nothing: the socket's bytes are the connection's.
+    Plain,
+    /// tls.
+    Tls(Tls<T, B>),
+}
+
+/// One connection, its buffers in `B`, and with tls, its record layer
+/// `T`: see the module's description.
+#[derive(Clone, Debug)]
+pub struct Driver<S, R, B, T = NoTls> {
     conn: Conn<S, R>,
     bufs: Buffers<B>,
-    /// What of `bufs.rx` is read and not yet taken.
+    /// What of `bufs.rx` is read and not yet taken: plaintext.
     rx: Window,
     /// What the last step took, let go at the next call: until then its
     /// event may borrow it.
     taken: usize,
-    /// What of `bufs.tx` is pulled and not yet written.
+    /// What of `bufs.tx` is pulled and not yet written or sealed.
     tx: Window,
     write: Write,
     fin: Fin,
     stage: Stage,
+    wire: Wire<T, B>,
 }
 
-impl<S, R, B> Driver<S, R, B>
-where
-    S: AsRef<[u8]> + AsMut<[u8]>,
-    R: Random,
-    B: AsRef<[u8]> + AsMut<[u8]>,
-{
-    /// Carries `conn`, with `bufs`.
+impl<S, R, B> Driver<S, R, B, NoTls> {
+    /// Carries `conn`, with `bufs`, the socket's bytes being the
+    /// connection's.
     #[must_use]
-    pub fn new(conn: Conn<S, R>, bufs: Buffers<B>) -> Self {
+    pub const fn new(conn: Conn<S, R>, bufs: Buffers<B>) -> Self {
+        Self {
+            conn,
+            bufs,
+            rx: Window { start: 0, end: 0 },
+            taken: 0,
+            tx: Window { start: 0, end: 0 },
+            write: Write::Idle,
+            fin: Fin::Open,
+            stage: Stage::Live,
+            wire: Wire::Plain,
+        }
+    }
+}
+
+impl<S, R, B, T> Driver<S, R, B, T> {
+    /// Carries `conn` over tls, its record layer `layer`, from `now`: the
+    /// plaintext in `bufs`, the records in `net`.  The handshake must be
+    /// done within [`HANDSHAKE_TIMEOUT`].  The connection's bytes wait in
+    /// `bufs` until it is.
+    #[must_use]
+    pub fn with_tls(
+        conn: Conn<S, R>,
+        bufs: Buffers<B>,
+        layer: T,
+        net: NetBuffers<B>,
+        now: Instant,
+    ) -> Self {
         Self {
             conn,
             bufs,
@@ -264,9 +343,34 @@ where
             write: Write::Idle,
             fin: Fin::Open,
             stage: Stage::Live,
+            wire: Wire::Tls(Tls {
+                layer,
+                handshake: Handshake::Due(now.saturating_add(HANDSHAKE_TIMEOUT)),
+                net,
+                rx: Window::default(),
+                tx: Window::default(),
+            }),
         }
     }
 
+    /// The record layer, if the connection is over tls: to ask it the
+    /// peer's ALPN, or why it failed.
+    #[must_use]
+    pub const fn tls(&self) -> Option<&T> {
+        match &self.wire {
+            Wire::Plain => None,
+            Wire::Tls(t) => Some(&t.layer),
+        }
+    }
+}
+
+impl<S, R, B, T> Driver<S, R, B, T>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+    B: AsRef<[u8]> + AsMut<[u8]>,
+    T: RecordLayer,
+{
     /// The connection, to act on outside a [`Step`]: to send from a timer,
     /// say.
     pub const fn conn(&mut self) -> &mut Conn<S, R> {
@@ -339,13 +443,26 @@ where
     /// is to write, the application's payload from `src`.
     pub fn want(&mut self, now: Instant, src: &mut dyn TxSource) -> Want<'_> {
         self.let_go();
+        self.open(now);
         self.pull(now, src);
+        self.settle(now);
+        self.seal(now);
+        // a handshake done by that seal lets the connection write now
+        self.pull(now, src);
+        self.seal(now);
         self.settle(now);
         let until = match self.stage {
             Stage::Done(o) => return Want::Release(o),
             Stage::HalfCloseDue => return Want::HalfClose,
             Stage::Live => self.conn.next_deadline(),
             Stage::Flushing { until, .. } | Stage::HalfClosed { until } => Some(until),
+        };
+        let until = match &self.wire {
+            Wire::Tls(Tls {
+                handshake: Handshake::Due(h),
+                ..
+            }) => Some(until.map_or(*h, |u| u.min(*h))),
+            Wire::Plain | Wire::Tls(_) => until,
         };
         // a closing connection reads what comes and drops it, as C keeps
         // the kernel's rx drained; a live one reads while it has room and
@@ -356,24 +473,142 @@ where
             Stage::HalfCloseDue | Stage::Done(_) => false,
         };
         self.rx.compact(self.bufs.rx.as_mut());
-        let Self { bufs, rx, tx, .. } = self;
-        let read = bufs
-            .rx
-            .as_mut()
-            .get_mut(rx.end..)
-            .filter(|r| reading && !r.is_empty());
-        let write = bufs
-            .tx
-            .as_ref()
-            .get(tx.start..tx.end)
-            .filter(|w| !w.is_empty());
-        Want::Io(Io { read, write, until })
+        let Self {
+            bufs, rx, tx, wire, ..
+        } = self;
+        // the socket's bytes are the connection's, or tls records
+        let (read, write) = match wire {
+            Wire::Plain => (
+                bufs.rx.as_mut().get_mut(rx.end..),
+                bufs.tx.as_ref().get(tx.start..tx.end),
+            ),
+            Wire::Tls(t) => {
+                t.rx.compact(t.net.rx.as_mut());
+                (
+                    t.net.rx.as_mut().get_mut(t.rx.end..),
+                    t.net.tx.as_ref().get(t.tx.start..t.tx.end),
+                )
+            }
+        };
+        Want::Io(Io {
+            read: read.filter(|r| reading && !r.is_empty()),
+            write: write.filter(|w| !w.is_empty()),
+            until,
+        })
+    }
+
+    /// With tls, opens what records were read into the plaintext buffer,
+    /// as far as it has room.  A `close_notify` is the peer's end, as its
+    /// FIN is.
+    fn open(&mut self, now: Instant) {
+        // a connection over has nothing more to open: tls that failed may
+        // not even be asked
+        if let Stage::Done(_) = self.stage {
+            return;
+        }
+        let Wire::Tls(t) = &mut self.wire else {
+            return;
+        };
+        let mut closed = false;
+        loop {
+            self.rx.compact(self.bufs.rx.as_mut());
+            let net = t
+                .net
+                .rx
+                .as_mut()
+                .get_mut(t.rx.start..t.rx.end)
+                .unwrap_or_default();
+            if net.is_empty() {
+                break;
+            }
+            let room = self
+                .bufs
+                .rx
+                .as_mut()
+                .get_mut(self.rx.end..)
+                .unwrap_or_default();
+            let Ok(o) = t.layer.open(now, net, room) else {
+                self.drop_all();
+                return;
+            };
+            let room = room.len();
+            let net = net.len();
+            t.rx.start = t.rx.start.saturating_add(o.consumed.min(net));
+            self.rx.end = self.rx.end.saturating_add(o.produced.min(room));
+            closed |= o.closed;
+            if (o.consumed == 0 && o.produced == 0) || o.closed {
+                break;
+            }
+        }
+        if t.layer.is_established() {
+            t.handshake = Handshake::Done;
+        }
+        self.drop_if_closing();
+        if closed {
+            self.fin_came(now);
+        }
+    }
+
+    /// With tls, seals what the record layer owes and the plaintext
+    /// pulled, as far as there is room for the records.
+    fn seal(&mut self, now: Instant) {
+        if !matches!(self.stage, Stage::Live | Stage::Flushing { .. }) {
+            return;
+        }
+        let Wire::Tls(t) = &mut self.wire else {
+            return;
+        };
+        loop {
+            if t.tx.is_empty() {
+                t.tx = Window::default();
+            } else if t.tx.end >= t.net.tx.as_ref().len() {
+                t.tx.compact(t.net.tx.as_mut());
+            }
+            let plain = self
+                .bufs
+                .tx
+                .as_ref()
+                .get(self.tx.start..self.tx.end)
+                .unwrap_or_default();
+            if plain.is_empty() && !t.layer.wants_write() {
+                break;
+            }
+            let room = t.net.tx.as_mut().get_mut(t.tx.end..).unwrap_or_default();
+            if room.is_empty() {
+                break;
+            }
+            let Ok(s) = t.layer.seal(now, plain, room) else {
+                self.drop_all();
+                return;
+            };
+            self.tx.start = self.tx.start.saturating_add(s.taken.min(plain.len()));
+            t.tx.end = t.tx.end.saturating_add(s.written.min(room.len()));
+            if self.tx.is_empty() {
+                self.tx = Window::default();
+            }
+            if s.taken == 0 && s.written == 0 {
+                break;
+            }
+        }
+        if t.layer.is_established() {
+            t.handshake = Handshake::Done;
+        }
     }
 
     /// Pulls what the connection owes, and the application's payload if
-    /// it asked to write, into the tx buffer.
+    /// it asked to write, into the tx buffer.  Over tls, nothing until the
+    /// handshake is done: the connection's transport is not up, and what it
+    /// writes would start its timers early, an h1 client's wait for its
+    /// answer among them, which C starts once the request has gone.
     fn pull(&mut self, now: Instant, src: &mut dyn TxSource) {
         if !matches!(self.stage, Stage::Live | Stage::Flushing { .. }) {
+            return;
+        }
+        if let Wire::Tls(Tls {
+            handshake: Handshake::Due(_),
+            ..
+        }) = self.wire
+        {
             return;
         }
         if !self.conn.wants_write() && self.write == Write::Idle {
@@ -400,6 +635,16 @@ where
         }
     }
 
+    /// Whether everything written went, or is in the socket's hands: the
+    /// plaintext, and with tls, the records and what tls owes of its own.
+    fn flushed(&self) -> bool {
+        let wire = match &self.wire {
+            Wire::Plain => true,
+            Wire::Tls(t) => t.tx.is_empty() && !t.layer.wants_write(),
+        };
+        wire && self.tx.is_empty() && !self.conn.wants_write()
+    }
+
     /// Moves the close along: the connection asking to close, what it
     /// wrote having gone.
     fn settle(&mut self, now: Instant) {
@@ -408,6 +653,10 @@ where
                 None => {}
                 Some(Close::Abort) => self.drop_all(),
                 Some(close @ (Close::Shutdown | Close::Release)) => {
+                    // tls says it is closing, after what was written
+                    if let Wire::Tls(t) = &mut self.wire {
+                        t.layer.close();
+                    }
                     self.stage = Stage::Flushing {
                         close,
                         until: now.saturating_add(FLUSH_TIMEOUT),
@@ -416,7 +665,7 @@ where
             }
         }
         if let Stage::Flushing { close, .. } = self.stage {
-            if self.tx.is_empty() && !self.conn.wants_write() {
+            if self.flushed() {
                 self.stage = match close {
                     Close::Shutdown => Stage::HalfCloseDue,
                     Close::Release | Close::Abort => Stage::Done(Outcome::Delivered),
@@ -426,8 +675,11 @@ where
     }
 
     /// Ends the connection with what is unwritten dropped.
-    const fn drop_all(&mut self) {
-        self.tx = Window { start: 0, end: 0 };
+    fn drop_all(&mut self) {
+        self.tx = Window::default();
+        if let Wire::Tls(t) = &mut self.wire {
+            t.tx = Window::default();
+        }
         self.stage = Stage::Done(Outcome::Dropped);
     }
 
@@ -439,9 +691,18 @@ where
             self.fin_came(now);
             return;
         }
-        let room = self.bufs.rx.as_ref().len().saturating_sub(self.rx.end);
-        self.rx.end = self.rx.end.saturating_add(n.min(room));
-        self.drop_if_closing();
+        match &mut self.wire {
+            Wire::Plain => {
+                let room = self.bufs.rx.as_ref().len().saturating_sub(self.rx.end);
+                self.rx.end = self.rx.end.saturating_add(n.min(room));
+                self.drop_if_closing();
+            }
+            Wire::Tls(t) => {
+                let room = t.net.rx.as_ref().len().saturating_sub(t.rx.end);
+                t.rx.end = t.rx.end.saturating_add(n.min(room));
+                self.open(now);
+            }
+        }
     }
 
     /// Bytes read elsewhere, copied in at `now`, as far as there is room:
@@ -450,24 +711,24 @@ where
     /// buffer of its own, as threads blocking in `read()` must.  An empty
     /// `bytes` is nothing, not the FIN: that is [`Driver::read_done`] with
     /// 0.
-    pub fn received(&mut self, _now: Instant, bytes: &[u8]) -> usize {
+    pub fn received(&mut self, now: Instant, bytes: &[u8]) -> usize {
         self.let_go();
         if self.stage != Stage::Live {
             // closing: read and dropped
             return bytes.len();
         }
-        self.rx.compact(self.bufs.rx.as_mut());
-        let room = self
-            .bufs
-            .rx
-            .as_mut()
-            .get_mut(self.rx.end..)
-            .unwrap_or_default();
+        let (buf, w) = match &mut self.wire {
+            Wire::Plain => (self.bufs.rx.as_mut(), &mut self.rx),
+            Wire::Tls(t) => (t.net.rx.as_mut(), &mut t.rx),
+        };
+        w.compact(buf);
+        let room = buf.get_mut(w.end..).unwrap_or_default();
         let n = bytes.len().min(room.len());
         if let (Some(d), Some(s)) = (room.get_mut(..n), bytes.get(..n)) {
             d.copy_from_slice(s);
         }
-        self.rx.end = self.rx.end.saturating_add(n);
+        w.end = w.end.saturating_add(n);
+        self.open(now);
         n
     }
 
@@ -478,7 +739,7 @@ where
         }
     }
 
-    /// The peer's FIN came.
+    /// The peer's FIN came, or its tls' `close_notify`.
     const fn fin_came(&mut self, _now: Instant) {
         match self.stage {
             Stage::Live => {
@@ -494,14 +755,15 @@ where
     }
 
     /// The adapter wrote `n` bytes of what [`Driver::want`] offered.
-    pub const fn write_done(&mut self, _now: Instant, n: usize) {
-        let left = self.tx.end.saturating_sub(self.tx.start);
-        self.tx.start = self
-            .tx
-            .start
-            .saturating_add(if n < left { n } else { left });
-        if self.tx.is_empty() {
-            self.tx = Window { start: 0, end: 0 };
+    pub fn write_done(&mut self, _now: Instant, n: usize) {
+        let w = match &mut self.wire {
+            Wire::Plain => &mut self.tx,
+            Wire::Tls(t) => &mut t.tx,
+        };
+        let left = w.end.saturating_sub(w.start);
+        w.start = w.start.saturating_add(n.min(left));
+        if w.is_empty() {
+            *w = Window::default();
         }
     }
 
@@ -519,6 +781,16 @@ where
     /// It is `now`, which may be past what [`Driver::want`] said.
     pub fn timer(&mut self, now: Instant) {
         self.let_go();
+        if let Wire::Tls(Tls {
+            handshake: Handshake::Due(until),
+            ..
+        }) = self.wire
+        {
+            if now >= until && !matches!(self.stage, Stage::Done(_)) {
+                self.drop_all();
+                return;
+            }
+        }
         match self.stage {
             Stage::Live => self.conn.deadline_passed(now),
             Stage::Flushing { until, .. } => {
@@ -543,8 +815,8 @@ where
         if let Stage::Done(_) = self.stage {
             return;
         }
-        let delivered = self.tx.is_empty() && !self.conn.wants_write();
-        self.tx = Window::default();
+        let delivered = self.flushed();
+        self.drop_all();
         self.stage = Stage::Done(if delivered {
             Outcome::Delivered
         } else {
@@ -845,5 +1117,435 @@ mod tests {
         assert_eq!(write(&mut d, T0, &mut Text(b"ok".to_vec()), 1024), b"");
         d.request_write();
         assert_eq!(write(&mut d, T0, &mut Text(b"ok".to_vec()), 1024), b"ok");
+    }
+}
+
+/// The driver's tls path, with a record layer of the tests' own: a toy
+/// tls, its handshake a hello and its answer, its records xored, so what
+/// the driver does with records is seen without a real tls stack, whose
+/// provider npro does not depend on.
+#[cfg(test)]
+mod tls_tests {
+    extern crate alloc;
+
+    use super::*;
+    use crate::conn::RoleMut;
+    use crate::tls::{Failed, Opened, Sealed};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use npro_core::random::SeededRandom;
+    use npro_h1::client::{Client, Connection, Event as H1c, Request, Scheme};
+    use npro_h1::server::{Config, Event as H1s, Response, Server};
+
+    const T0: Instant = Instant::from_micros(1_000_000);
+
+    const HANDSHAKE: u8 = 0x16;
+    const DATA: u8 = 0x17;
+    const ALERT: u8 = 0x15;
+    /// The most plaintext in a toy record.
+    const RECORD: usize = 16;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Side {
+        Client,
+        Server,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Hs {
+        /// A client owes its hello; a server waits for one.
+        Start,
+        /// A client sent its hello.
+        Sent,
+        /// A server owes its answer, and is established once it went.
+        Answer,
+        Established,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Closing {
+        Open,
+        Asked,
+        Sent,
+    }
+
+    #[derive(Debug)]
+    struct Toy {
+        side: Side,
+        hs: Hs,
+        closing: Closing,
+        /// It failed: as rustls, it must not be asked again.
+        failed: Option<Failed>,
+        /// How often it was asked after it failed.
+        asked_again: u32,
+    }
+
+    impl Toy {
+        const fn new(side: Side) -> Self {
+            Self {
+                side,
+                hs: Hs::Start,
+                closing: Closing::Open,
+                failed: None,
+                asked_again: 0,
+            }
+        }
+
+        /// Already established, as a resumed session may be on its first
+        /// step.
+        const fn established(side: Side) -> Self {
+            Self {
+                side,
+                hs: Hs::Established,
+                closing: Closing::Open,
+                failed: None,
+                asked_again: 0,
+            }
+        }
+    }
+
+    fn add(a: usize, b: usize) -> usize {
+        a.checked_add(b).unwrap()
+    }
+
+    /// Puts a record in `net`, or `false` if there is no room.
+    fn record(net: &mut [u8], at: &mut usize, kind: u8, payload: &[u8]) -> bool {
+        let end = add(add(*at, 2), payload.len());
+        if end > net.len() {
+            return false;
+        }
+        net[*at] = kind;
+        net[add(*at, 1)] = u8::try_from(payload.len()).unwrap();
+        for (d, s) in net[add(*at, 2)..end].iter_mut().zip(payload) {
+            *d = s ^ 0x5a;
+        }
+        *at = end;
+        true
+    }
+
+    impl RecordLayer for Toy {
+        fn open(&mut self, _: Instant, net: &mut [u8], plain: &mut [u8]) -> Result<Opened, Failed> {
+            if let Some(f) = self.failed {
+                self.asked_again = self.asked_again.checked_add(1).unwrap();
+                return Err(f);
+            }
+            let (mut consumed, mut produced) = (0, 0);
+            while net.len() >= add(consumed, 2) {
+                let kind = net[consumed];
+                let len = usize::from(net[add(consumed, 1)]);
+                let end = add(add(consumed, 2), len);
+                if net.len() < end {
+                    break;
+                }
+                let payload: Vec<u8> = net[add(consumed, 2)..end]
+                    .iter()
+                    .map(|b| b ^ 0x5a)
+                    .collect();
+                match (kind, self.side, self.hs) {
+                    (HANDSHAKE, Side::Server, Hs::Start) if payload == b"hello" => {
+                        self.hs = Hs::Answer;
+                    }
+                    (HANDSHAKE, Side::Client, Hs::Sent) if payload == b"olleh" => {
+                        self.hs = Hs::Established;
+                    }
+                    (DATA, _, Hs::Established) => {
+                        let Some(room) = plain.get_mut(produced..add(produced, len)) else {
+                            // no room for it whole: it waits
+                            break;
+                        };
+                        room.copy_from_slice(&payload);
+                        produced = add(produced, len);
+                    }
+                    (ALERT, _, Hs::Established) => {
+                        return Ok(Opened {
+                            consumed: end,
+                            produced,
+                            closed: true,
+                        });
+                    }
+                    _ => {
+                        self.failed = Some(Failed);
+                        return Err(Failed);
+                    }
+                }
+                consumed = end;
+            }
+            Ok(Opened {
+                consumed,
+                produced,
+                closed: false,
+            })
+        }
+
+        fn seal(&mut self, _: Instant, plain: &[u8], net: &mut [u8]) -> Result<Sealed, Failed> {
+            if let Some(f) = self.failed {
+                self.asked_again = self.asked_again.checked_add(1).unwrap();
+                return Err(f);
+            }
+            let (mut taken, mut at) = (0, 0);
+            match self.hs {
+                Hs::Start if self.side == Side::Client => {
+                    if record(net, &mut at, HANDSHAKE, b"hello") {
+                        self.hs = Hs::Sent;
+                    }
+                }
+                Hs::Answer => {
+                    if record(net, &mut at, HANDSHAKE, b"olleh") {
+                        self.hs = Hs::Established;
+                    }
+                }
+                Hs::Start | Hs::Sent | Hs::Established => {}
+            }
+            if self.hs == Hs::Established {
+                while taken < plain.len() {
+                    let n = plain.len().checked_sub(taken).unwrap().min(RECORD);
+                    if !record(net, &mut at, DATA, &plain[taken..add(taken, n)]) {
+                        break;
+                    }
+                    taken = add(taken, n);
+                }
+                if self.closing == Closing::Asked
+                    && taken == plain.len()
+                    && record(net, &mut at, ALERT, b"")
+                {
+                    self.closing = Closing::Sent;
+                }
+            }
+            Ok(Sealed { taken, written: at })
+        }
+
+        fn wants_write(&self) -> bool {
+            matches!(
+                (self.side, self.hs),
+                (Side::Client, Hs::Start) | (_, Hs::Answer)
+            ) || (self.hs == Hs::Established && self.closing == Closing::Asked)
+        }
+
+        fn is_established(&self) -> bool {
+            self.hs == Hs::Established
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn close(&mut self) {
+            if self.closing == Closing::Open {
+                self.closing = Closing::Asked;
+            }
+        }
+    }
+
+    type D = Driver<Vec<u8>, SeededRandom, Vec<u8>, Toy>;
+
+    fn tls(conn: Conn<Vec<u8>, SeededRandom>, layer: Toy) -> D {
+        Driver::with_tls(
+            conn,
+            Buffers {
+                rx: vec![0; 256],
+                tx: vec![0; 256],
+                inflate: Vec::new(),
+            },
+            layer,
+            NetBuffers {
+                rx: vec![0; 256],
+                tx: vec![0; 256],
+            },
+            T0,
+        )
+    }
+
+    fn client() -> Conn<Vec<u8>, SeededRandom> {
+        Conn::h1_client(
+            Client::new(
+                vec![0u8; 1024],
+                Request {
+                    method: b"GET",
+                    path: b"/",
+                    host: Some(b"x"),
+                    origin: None,
+                    scheme: Scheme::Https,
+                    no_cache: false,
+                    connection: Connection::Close,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn server() -> Conn<Vec<u8>, SeededRandom> {
+        Conn::h1_server(Server::new(vec![0u8; 1024], Config::default(), T0).unwrap())
+    }
+
+    /// The server's payload.
+    struct Text(Vec<u8>);
+    impl TxSource for Text {
+        fn fill(&mut self, buf: &mut [u8]) -> usize {
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            n
+        }
+    }
+
+    /// Moves what `from` writes into `to`, a few bytes at a time; what
+    /// went.
+    fn carry(from: &mut D, src: &mut Text, to: &mut D, sink: &mut Text) -> Vec<u8> {
+        let mut went = Vec::new();
+        loop {
+            let Want::Io(io) = from.want(T0, src) else {
+                return went;
+            };
+            let Some(w) = io.write else {
+                return went;
+            };
+            let n = w.len().min(5);
+            let bytes = w[..n].to_vec();
+            from.write_done(T0, n);
+            let Want::Io(into) = to.want(T0, sink) else {
+                return went;
+            };
+            let room = into.read.unwrap();
+            room[..n].copy_from_slice(&bytes);
+            to.read_done(T0, n);
+            went.extend_from_slice(&bytes);
+        }
+    }
+
+    #[test]
+    fn an_h1_exchange_goes_over_tls_and_ends_with_close_notify() {
+        let (mut c, mut s) = (
+            tls(client(), Toy::new(Side::Client)),
+            tls(server(), Toy::new(Side::Server)),
+        );
+        let (mut csrc, mut ssrc) = (Text(Vec::new()), Text(b"ok".to_vec()));
+        let mut wire = Vec::new();
+        let mut body = Vec::new();
+        for _ in 0..50 {
+            wire.extend(carry(&mut c, &mut csrc, &mut s, &mut ssrc));
+            while let Some(mut step) = s.poll_rx(T0) {
+                if step.event() == Some(Event::H1Server(H1s::Request)) {
+                    let RoleMut::H1Server(srv) = step.conn().role_mut() else {
+                        panic!("not h1");
+                    };
+                    srv.respond(Response {
+                        status: 200,
+                        content_type: None,
+                        content_length: None,
+                    })
+                    .unwrap();
+                    step.request_write();
+                }
+            }
+            wire.extend(carry(&mut s, &mut ssrc, &mut c, &mut csrc));
+            if ssrc.0.is_empty() {
+                if let RoleMut::H1Server(srv) = s.conn().role_mut() {
+                    srv.complete(T0);
+                }
+            }
+            while let Some(step) = c.poll_rx(T0) {
+                if let Some(Event::H1Client(H1c::Body(b))) = step.event() {
+                    body.extend_from_slice(b);
+                }
+            }
+        }
+        assert_eq!(body, b"ok");
+        // the server closed with a close_notify, which ended the body
+        assert!(matches!(s.want(T0, &mut ssrc), Want::HalfClose));
+        assert!(matches!(
+            c.want(T0, &mut csrc),
+            Want::Release(Outcome::Delivered)
+        ));
+        // and none of it went as plaintext
+        assert!(!wire.windows(5).any(|w| w == b"GET /"));
+        assert!(!wire.windows(8).any(|w| w == b"HTTP/1.1"));
+    }
+
+    #[test]
+    fn nothing_of_the_connection_goes_before_the_handshake() {
+        let mut c = tls(client(), Toy::new(Side::Client));
+        let Want::Io(io) = c.want(T0, &mut Text(Vec::new())) else {
+            panic!("not io");
+        };
+        // the hello only: the request is not pulled until the handshake
+        // is done
+        let mut hello = [0u8; 7];
+        let mut at = 0;
+        assert!(record(&mut hello, &mut at, HANDSHAKE, b"hello"));
+        assert_eq!(io.write, Some(&hello[..]));
+    }
+
+    #[test]
+    fn a_handshake_done_on_its_first_step_takes_the_same_path() {
+        let mut c = tls(client(), Toy::established(Side::Client));
+        let Want::Io(io) = c.want(T0, &mut Text(Vec::new())) else {
+            panic!("not io");
+        };
+        // the request goes at once, sealed, with no deadline but its own
+        let w = io.write.unwrap();
+        assert_eq!(w[0], DATA);
+        assert_eq!(io.until, c.conn.next_deadline());
+    }
+
+    #[test]
+    fn a_handshake_not_done_in_time_is_dropped() {
+        // a server whose own deadline is later than the handshake's
+        let t = npro_h1::server::Timeouts {
+            head: Duration::from_secs(60),
+            ..npro_h1::server::Timeouts::DEFAULT
+        };
+        let srv = Server::new(vec![0u8; 1024], Config::default().with_timeouts(t), T0);
+        let mut s = tls(Conn::h1_server(srv.unwrap()), Toy::new(Side::Server));
+        let at = T0.checked_add(HANDSHAKE_TIMEOUT).unwrap();
+        let Want::Io(io) = s.want(T0, &mut Text(Vec::new())) else {
+            panic!("not io");
+        };
+        assert_eq!(io.until, Some(at));
+        s.timer(at);
+        assert!(matches!(
+            s.want(at, &mut Text(Vec::new())),
+            Want::Release(Outcome::Dropped)
+        ));
+    }
+
+    #[test]
+    fn a_clients_wait_for_its_answer_starts_once_tls_is_up() {
+        let mut c = tls(client(), Toy::new(Side::Client));
+        let mut src = Text(Vec::new());
+        let _ = c.want(T0, &mut src);
+        assert_eq!(c.conn.next_deadline(), None);
+        // the server's answer establishes it, at T0 + 1s
+        let t1 = T0.checked_add(Duration::from_secs(1)).unwrap();
+        let mut olleh = [0u8; 7];
+        let mut at = 0;
+        assert!(record(&mut olleh, &mut at, HANDSHAKE, b"olleh"));
+        let Want::Io(io) = c.want(T0, &mut src) else {
+            panic!("not io");
+        };
+        let hello = io.write.map_or(0, <[u8]>::len);
+        c.write_done(T0, hello);
+        assert_eq!(c.received(t1, &olleh), 7);
+        let _ = c.want(t1, &mut src);
+        assert_eq!(
+            c.conn.next_deadline(),
+            t1.checked_add(npro_h1::client::RESPONSE_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn a_record_that_does_not_open_drops_the_connection() {
+        let mut s = tls(server(), Toy::new(Side::Server));
+        assert_eq!(s.received(T0, &[DATA, 1, 0]), 3);
+        assert!(matches!(
+            s.want(T0, &mut Text(Vec::new())),
+            Want::Release(Outcome::Dropped)
+        ));
+        // failed, the record layer is not asked again, whatever comes
+        assert_eq!(s.received(T0, &[DATA, 1, 0]), 3);
+        assert!(matches!(
+            s.want(T0, &mut Text(Vec::new())),
+            Want::Release(Outcome::Dropped)
+        ));
+        assert_eq!(s.tls().unwrap().asked_again, 0);
     }
 }

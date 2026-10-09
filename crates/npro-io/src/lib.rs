@@ -9,9 +9,10 @@
 //!   either end, and its changes of role, h1 to ws;
 //! - [`driver`]: what carries it, keeping its buffers, close stages and
 //!   deadlines, and saying what IO it wants;
+//! - [`tls`]: the record layer the driver keeps tls behind, a trait a tls
+//!   stack is bound to it by;
 //!
-//! with tls in the driver, and the adapters for threads, mio, tokio and
-//! embassy, to come.
+//! with the adapters for threads, mio, tokio and embassy to come.
 //! Without features it is `no_std`, and does no IO itself.
 
 #![no_std]
@@ -19,3 +20,4 @@
 
 pub mod conn;
 pub mod driver;
+pub mod tls;
