@@ -17,6 +17,9 @@
 
 use npro_core::time::Instant;
 
+#[cfg(feature = "rustls")]
+pub mod rustls;
+
 /// What [`RecordLayer::open`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opened {
