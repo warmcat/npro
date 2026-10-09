@@ -31,20 +31,99 @@
 //!
 //! [`Ws::tx`] writes in C's order: what is in flight first (the 101, a frame
 //! begun), then our own close, then the pong, then the answer to the peer's
-//! close, then the application's next frame, whose payload it pulls.  A
-//! pong still owed when we begin a close is forgotten, as C forgets it.
+//! close, then a validity ping, then the application's next frame, whose
+//! payload it pulls.  A pong or ping still owed when we begin a close is
+//! forgotten, as C forgets them.
+//!
+//! Time is an input, as everywhere in npro: each call that can start a
+//! timer takes `now`, [`Ws::next_deadline`] says when the connection next
+//! needs telling the time, and [`Ws::deadline_passed`] tells it.  Each step
+//! of a close has C's 5s ([`CLOSE_TIMEOUT`]), and past it the connection is
+//! dropped; while open, the peer is checked as [`Validity`] says, pinged
+//! when quiet and closed on if it does not answer.
 //!
 //! With the `pmd` feature and `Ws::with_pmd`, messages are deflated as
 //! `crate::pmd` describes: a little input may then inflate to more than one
 //! call of [`Ws::rx`] gives, and [`Ws::rx_pending`] says when to call it
 //! again with no more.
 
+use core::time::Duration;
+
 use npro_core::random::{Random, Unavailable};
+use npro_core::time::Instant;
 use npro_core::utf8::Utf8Validator;
 use npro_h1::server::TxSource;
 
 /// The longest frame C takes: `LWS_WS_MAX_RX_FRAME_LEN`.
 pub const MAX_FRAME: u64 = 0x1000_0000;
+
+/// How long each step of a close may take before the connection is
+/// dropped: our close going (C's `PENDING_TIMEOUT_CLOSE_SEND`), the peer's
+/// answer coming (`PENDING_TIMEOUT_CLOSE_ACK`), our answer to the peer's
+/// close going, and the application's last message going before a close
+/// without a close frame (`PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE`).  C
+/// fixes each at 5s.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How the connection checks that the peer is still there: C's retry
+/// policy's `secs_since_valid_ping` and `secs_since_valid_hangup`.
+///
+/// Once established, and again whenever a pong comes, the connection waits
+/// `ping`; if no pong came in that time it pings the peer, and if none
+/// comes by `hangup` after the last, it closes.  Only a pong confirms the
+/// peer, as in C: messages, and the peer's own pings, do not.  A `ping` not
+/// shorter than `hangup` sends no ping, and closes at `hangup`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Validity {
+    /// How long without a pong before pinging.
+    pub ping: Duration,
+    /// How long without a pong before closing.
+    pub hangup: Duration,
+}
+
+impl Validity {
+    /// C's default retry policy: ping after 40s, close after 50s.
+    pub const DEFAULT: Self = Self {
+        ping: Duration::from_secs(40),
+        hangup: Duration::from_secs(50),
+    };
+}
+
+/// Where the validity check is: C's `sul_validity` and `validity_hup`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// Not checked: none was asked for, or a close is under way.
+    Off,
+    /// The peer is pinged at `until`.
+    Ping { until: Instant, v: Validity },
+    /// The connection closes at `until`.
+    Hangup { until: Instant, v: Validity },
+}
+
+impl Check {
+    /// The check from `now`: C's `_lws_validity_confirmed_role()`.
+    fn armed(v: Option<Validity>, now: Instant) -> Self {
+        match v {
+            None => Self::Off,
+            Some(v) if v.ping >= v.hangup => Self::Hangup {
+                until: now.saturating_add(v.hangup),
+                v,
+            },
+            Some(v) => Self::Ping {
+                until: now.saturating_add(v.ping),
+                v,
+            },
+        }
+    }
+
+    /// The peer was confirmed there at `now`.
+    fn confirmed(self, now: Instant) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            Self::Ping { v, .. } | Self::Hangup { v, .. } => Self::armed(Some(v), now),
+        }
+    }
+}
 
 /// The longest a control frame's payload may be.
 const MAX_CTL: usize = 125;
@@ -333,15 +412,19 @@ impl Ctl {
 enum Closing {
     /// Open.
     None,
-    /// Our close is to go: `LCS_WAITING_TO_SEND_CLOSE`.
-    WaitingToSend(Ctl),
-    /// Our close has gone: `LCS_AWAITING_CLOSE_ACK`.
-    AwaitingAck,
-    /// The peer's close is to be answered: `LCS_RETURNED_CLOSE`.
-    Returned(Ctl),
-    /// The application closes once what it sent has gone:
-    /// `LCS_FLUSHING_BEFORE_CLOSE`.
-    Flushing,
+    /// Our close is to go, by `until`: `LCS_WAITING_TO_SEND_CLOSE`, under
+    /// `PENDING_TIMEOUT_CLOSE_SEND`.
+    WaitingToSend { ctl: Ctl, until: Instant },
+    /// Our close has gone, and the peer's is due by `until`:
+    /// `LCS_AWAITING_CLOSE_ACK`, under `PENDING_TIMEOUT_CLOSE_ACK`.
+    AwaitingAck { until: Instant },
+    /// The peer's close is to be answered, by `until`:
+    /// `LCS_RETURNED_CLOSE`, under `PENDING_TIMEOUT_CLOSE_SEND`.
+    Returned { ctl: Ctl, until: Instant },
+    /// The application closes once what it sent has gone, by `until`:
+    /// `LCS_FLUSHING_BEFORE_CLOSE`, under
+    /// `PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE`.
+    Flushing { until: Instant },
     /// Done with.
     Closed(Close),
 }
@@ -514,12 +597,14 @@ fn control_frame(op: Op, c: &Ctl, mask: Option<[u8; 4]>, out: &mut Out) {
 /// random source.
 ///
 /// ```
+/// use npro_core::time::Instant;
 /// use npro_ws::conn::{Event, Kind, Ws};
 ///
-/// let mut ws = Ws::server(b"");
+/// let now = Instant::from_micros(1_000_000);
+/// let mut ws = Ws::server(b"", now);
 /// // a masked "Hi", with a zero mask
 /// let mut frame = *b"\x81\x82\0\0\0\0Hi";
-/// let rx = ws.rx(&mut frame);
+/// let rx = ws.rx(now, &mut frame);
 /// assert_eq!(
 ///     rx.event,
 ///     Some(Event::Message { kind: Kind::Text, data: b"Hi", first: true, last: true })
@@ -535,6 +620,11 @@ pub struct Ws<P = AsServer> {
     ctl: Ctl,
     /// The pong owed, if any: C's one pending pong.
     pong: Option<Ctl>,
+    /// The validity check: C's `sul_validity`.
+    check: Check,
+    /// The validity ping owed, if any, its payload: C's
+    /// `send_check_ping`.
+    ping: Option<[u8; 8]>,
     closing: Closing,
     out: Out,
     app: App,
@@ -542,11 +632,13 @@ pub struct Ws<P = AsServer> {
 }
 
 impl Ws<AsServer> {
-    /// A server's connection, `first` being what goes before its frames:
-    /// the 101.
+    /// A server's connection, established at `now`, `first` being what
+    /// goes before its frames: the 101.  Its validity is checked as
+    /// [`Validity::DEFAULT`] says, unless [`Ws::with_validity`] says
+    /// otherwise.
     #[must_use]
-    pub fn server(first: &[u8]) -> Self {
-        Self::new(AsServer, first)
+    pub fn server(first: &[u8], now: Instant) -> Self {
+        Self::new(AsServer, first, now)
     }
 }
 
@@ -556,15 +648,16 @@ impl<R: Random> Ws<AsClient<R>> {
     /// what `random` draws.
     ///
     /// A real connection's source must be one the server cannot predict:
-    /// see [`npro_core::random::Random`].
+    /// see [`npro_core::random::Random`].  It is established at `now`, and
+    /// its validity checked as for [`Ws::server`].
     #[must_use]
-    pub fn client(random: R) -> Self {
-        Self::new(AsClient { random }, b"")
+    pub fn client(random: R, now: Instant) -> Self {
+        Self::new(AsClient { random }, b"", now)
     }
 }
 
 impl<P: Role> Ws<P> {
-    fn new(role: P, first: &[u8]) -> Self {
+    fn new(role: P, first: &[u8], now: Instant) -> Self {
         let mut out = Out::new();
         out.set(first);
         Self {
@@ -574,6 +667,8 @@ impl<P: Role> Ws<P> {
             utf8: Utf8Validator::new(),
             ctl: Ctl::new(),
             pong: None,
+            check: Check::armed(Some(Validity::DEFAULT), now),
+            ping: None,
             closing: Closing::None,
             out,
             app: App::Idle,
@@ -589,6 +684,18 @@ impl<P: Role> Ws<P> {
     pub fn with_pmd(mut self, params: crate::pmd::Params) -> Self {
         let codec = crate::pmd::Codec::new(self.role.side(), params);
         self.ext = Ext::Pmd(alloc::boxed::Box::new(codec));
+        self
+    }
+
+    /// The connection with its validity checked as `v` says, from `now`,
+    /// or not at all for `None`: C's retry policy's
+    /// `secs_since_valid_ping` and `secs_since_valid_hangup`, where a
+    /// hangup of 0 is `None`.
+    #[must_use]
+    pub fn with_validity(mut self, v: Option<Validity>, now: Instant) -> Self {
+        if matches!(self.closing, Closing::None) {
+            self.check = Check::armed(v, now);
+        }
         self
     }
 
@@ -614,10 +721,10 @@ impl<P: Role> Ws<P> {
         match self.closing {
             Closing::Closed(c) => Some(c),
             Closing::None
-            | Closing::WaitingToSend(_)
-            | Closing::AwaitingAck
-            | Closing::Returned(_)
-            | Closing::Flushing => None,
+            | Closing::WaitingToSend { .. }
+            | Closing::AwaitingAck { .. }
+            | Closing::Returned { .. }
+            | Closing::Flushing { .. } => None,
         }
     }
 
@@ -655,29 +762,28 @@ impl<P: Role> Ws<P> {
     pub const fn wants_write(&self) -> bool {
         self.out.pending()
             || self.pong.is_some()
+            || self.ping.is_some()
             || matches!(
                 self.closing,
-                Closing::WaitingToSend(_) | Closing::Returned(_)
+                Closing::WaitingToSend { .. } | Closing::Returned { .. }
             )
     }
 
     /// Fails the connection with our close: C's `lws_close_reason()` and
     /// `LWS_HPI_RET_PLEASE_CLOSE_ME`.  The caller takes all of its input,
     /// the rest of the read, which C drops.
-    fn refuse<'a>(&mut self, code: u16, reason: &[u8]) -> Rx<'a> {
+    fn refuse<'a>(&mut self, now: Instant, code: u16, reason: &[u8]) -> Rx<'a> {
         self.parse = Parse::Refused;
-        if matches!(self.closing, Closing::None) {
-            self.closing = Closing::WaitingToSend(Ctl::close(code, reason));
-        }
+        self.begin_close(now, code, reason);
         Rx {
             consumed: 0,
             event: None,
         }
     }
 
-    /// Takes bytes from the peer: see [`Event`].  A frame's payload is
-    /// unmasked where it lies in `input`.
-    pub fn rx<'a>(&'a mut self, input: &'a mut [u8]) -> Rx<'a> {
+    /// Takes bytes from the peer at `now`: see [`Event`].  A frame's
+    /// payload is unmasked where it lies in `input`.
+    pub fn rx<'a>(&'a mut self, now: Instant, input: &'a mut [u8]) -> Rx<'a> {
         let mut used = 0usize;
         loop {
             match self.parse {
@@ -689,7 +795,7 @@ impl<P: Role> Ws<P> {
                     };
                 }
                 Parse::Refused => {
-                    if !input.is_empty() && matches!(self.closing, Closing::AwaitingAck) {
+                    if !input.is_empty() && matches!(self.closing, Closing::AwaitingAck { .. }) {
                         self.closing = Closing::Closed(Close::Release);
                     }
                     return Rx {
@@ -722,7 +828,7 @@ impl<P: Role> Ws<P> {
                                 };
                             }
                             Deflated::Refused(reason) => {
-                                let mut r = self.refuse(1007, reason);
+                                let mut r = self.refuse(now, 1007, reason);
                                 r.consumed = input.len();
                                 return r;
                             }
@@ -735,7 +841,7 @@ impl<P: Role> Ws<P> {
                             Deflated::Piece(p) => return self.deflated_piece(p),
                         }
                     }
-                    return self.payload(f, left, input, used);
+                    return self.payload(now, f, left, input, used);
                 }
                 Parse::First | Parse::Len(_) | Parse::LenMore(..) | Parse::Mask(..) => {}
             }
@@ -748,7 +854,7 @@ impl<P: Role> Ws<P> {
             used = used.saturating_add(1);
             if let Some((code, reason)) = self.header(c) {
                 // as C, the rest of what was read goes unread
-                let mut r = self.refuse(code, reason);
+                let mut r = self.refuse(now, code, reason);
                 r.consumed = input.len();
                 return r;
             }
@@ -944,7 +1050,14 @@ impl<P: Role> Ws<P> {
     }
 
     /// The payload of `f`, `left` of it still to come.
-    fn payload<'a>(&'a mut self, f: Frame, left: u64, input: &'a mut [u8], used: usize) -> Rx<'a> {
+    fn payload<'a>(
+        &'a mut self,
+        now: Instant,
+        f: Frame,
+        left: u64,
+        input: &'a mut [u8],
+        used: usize,
+    ) -> Rx<'a> {
         let all = input.len();
         let rest = input.get_mut(used..).unwrap_or_default();
         let n = usize::try_from(left).unwrap_or(usize::MAX).min(rest.len());
@@ -970,7 +1083,7 @@ impl<P: Role> Ws<P> {
                 };
             }
             self.parse = Parse::First;
-            let event = self.control(f.op);
+            let event = self.control(now, f.op);
             return Rx { consumed, event };
         }
         self.parse = if left > 0 {
@@ -999,12 +1112,12 @@ impl<P: Role> Ws<P> {
         let last = f.fin && left == 0;
         if kind == Kind::Text {
             if self.utf8.feed(piece).is_err() {
-                let mut r = self.refuse(1007, b"bad utf8");
+                let mut r = self.refuse(now, 1007, b"bad utf8");
                 r.consumed = all;
                 return r;
             }
             if last && !self.utf8.at_boundary() {
-                let mut r = self.refuse(1007, b"partial utf8");
+                let mut r = self.refuse(now, 1007, b"partial utf8");
                 r.consumed = all;
                 return r;
             }
@@ -1145,7 +1258,7 @@ impl<P: Role> Ws<P> {
     }
 
     /// A whole control frame has come.
-    fn control(&mut self, op: Op) -> Option<Event<'_>> {
+    fn control(&mut self, now: Instant, op: Op) -> Option<Event<'_>> {
         match op {
             Op::Ping => {
                 // one pong owed at a time: a second ping is dropped
@@ -1154,20 +1267,25 @@ impl<P: Role> Ws<P> {
                 }
                 None
             }
-            Op::Pong => (self.ctl.len > 0).then(|| Event::Pong(self.ctl.payload())),
-            Op::Close => self.peer_close(),
+            Op::Pong => {
+                // any pong says the peer is there: C's
+                // lws_validity_confirmed()
+                self.check = self.check.confirmed(now);
+                (self.ctl.len > 0).then(|| Event::Pong(self.ctl.payload()))
+            }
+            Op::Close => self.peer_close(now),
             Op::Continuation | Op::Text | Op::Binary => None,
         }
     }
 
     /// The peer's close: C's handling of `LWSWSOPC_CLOSE`.
-    fn peer_close(&mut self) -> Option<Event<'_>> {
+    fn peer_close(&mut self, now: Instant) -> Option<Event<'_>> {
         match self.closing {
             // a second close changes nothing; nor is one answered while
             // the app's last goes
-            Closing::Returned(_) | Closing::Flushing | Closing::Closed(_) => None,
+            Closing::Returned { .. } | Closing::Flushing { .. } | Closing::Closed(_) => None,
             // the answer to ours: done
-            Closing::AwaitingAck | Closing::WaitingToSend(_) => {
+            Closing::AwaitingAck { .. } | Closing::WaitingToSend { .. } => {
                 self.closing = Closing::Closed(Close::Release);
                 self.parse = Parse::Stopped;
                 None
@@ -1190,7 +1308,13 @@ impl<P: Role> Ws<P> {
                         }
                     }
                 }
-                self.closing = Closing::Returned(self.ctl);
+                // C's lws_ws_answer_peer_close(): CLOSE_SEND
+                self.closing = Closing::Returned {
+                    ctl: self.ctl,
+                    until: now.saturating_add(CLOSE_TIMEOUT),
+                };
+                self.check = Check::Off;
+                self.ping = None;
                 // after the peer's close, nothing more is read
                 self.parse = Parse::Stopped;
                 Some(Event::PeerClose(self.ctl.payload()))
@@ -1246,6 +1370,8 @@ impl<P: Role> Ws<P> {
         self.parse = Parse::Stopped;
         self.out = Out::new();
         self.pong = None;
+        self.ping = None;
+        self.check = Check::Off;
         self.app = App::Idle;
         self.closing = Closing::Closed(Close::Release);
     }
@@ -1346,18 +1472,96 @@ impl<P: Role> Ws<P> {
         Some(0)
     }
 
-    /// The application is done: the connection closes once what it sent
-    /// has gone, without a close frame, as C's
-    /// `lws_raw_transaction_completed()`.
-    pub const fn close_when_flushed(&mut self) {
+    /// The application is done, at `now`: the connection closes once what
+    /// it sent has gone, without a close frame, as C's
+    /// `lws_raw_transaction_completed()`.  If that has not gone within
+    /// [`CLOSE_TIMEOUT`], the connection is dropped.
+    pub fn close_when_flushed(&mut self, now: Instant) {
         if matches!(self.closing, Closing::None) {
-            self.closing = Closing::Flushing;
+            self.closing = Closing::Flushing {
+                until: now.saturating_add(CLOSE_TIMEOUT),
+            };
+            self.check = Check::Off;
+            self.ping = None;
         }
     }
 
-    /// Writes what is owed the peer into `out`: see the module's
+    /// Begins our close, at `now`, with `code` and `reason`, unless one is
+    /// under way: C's `lws_close_reason()` and the close that follows.
+    /// Our close must go within [`CLOSE_TIMEOUT`], and the peer's answer
+    /// come within as long again, or the connection is dropped.  A reason
+    /// that does not fit a control frame with its code is left out.
+    fn begin_close(&mut self, now: Instant, code: u16, reason: &[u8]) {
+        if matches!(self.closing, Closing::None) {
+            self.closing = Closing::WaitingToSend {
+                ctl: Ctl::close(code, reason),
+                until: now.saturating_add(CLOSE_TIMEOUT),
+            };
+            self.check = Check::Off;
+            self.ping = None;
+        }
+    }
+
+    /// When the connection next needs [`Ws::deadline_passed`]: the close's
+    /// deadline while one is under way, else the validity check's.
+    #[must_use]
+    pub const fn next_deadline(&self) -> Option<Instant> {
+        match self.closing {
+            Closing::WaitingToSend { until, .. }
+            | Closing::AwaitingAck { until }
+            | Closing::Returned { until, .. }
+            | Closing::Flushing { until } => Some(until),
+            Closing::Closed(_) => None,
+            Closing::None => match self.check {
+                Check::Off => None,
+                Check::Ping { until, .. } | Check::Hangup { until, .. } => Some(until),
+            },
+        }
+    }
+
+    /// Tells the connection it is `now`, which may be past its
+    /// [`Ws::next_deadline`]:
+    ///
+    /// - a close that did not finish in time drops the connection, as C's
+    ///   timeouts do, asking to be released with nothing more written;
+    /// - the validity check, quiet for its ping time, owes the peer a
+    ///   ping, whose payload is `now` in microseconds, little-endian;
+    /// - with no pong by its hangup time, our close begins with 1000, as
+    ///   C's `lws_validity_cb()` closes it.
+    pub fn deadline_passed(&mut self, now: Instant) {
+        match self.closing {
+            Closing::WaitingToSend { until, .. }
+            | Closing::AwaitingAck { until }
+            | Closing::Returned { until, .. }
+            | Closing::Flushing { until } => {
+                if now >= until {
+                    self.fail();
+                }
+            }
+            Closing::Closed(_) => {}
+            Closing::None => match self.check {
+                Check::Off => {}
+                Check::Ping { until, v } => {
+                    if now >= until {
+                        self.ping = Some(now.as_micros().to_le_bytes());
+                        self.check = Check::Hangup {
+                            until: now.saturating_add(v.hangup.saturating_sub(v.ping)),
+                            v,
+                        };
+                    }
+                }
+                Check::Hangup { until, .. } => {
+                    if now >= until {
+                        self.begin_close(now, 1000, b"");
+                    }
+                }
+            },
+        }
+    }
+
+    /// Writes what is owed the peer into `out`, at `now`: see the module's
     /// description.
-    pub fn tx(&mut self, out: &mut [u8], src: &mut dyn TxSource) -> usize {
+    pub fn tx(&mut self, now: Instant, out: &mut [u8], src: &mut dyn TxSource) -> usize {
         let mut written = 0usize;
         loop {
             let room = out.get_mut(written..).unwrap_or_default();
@@ -1406,20 +1610,23 @@ impl<P: Role> Ws<P> {
                 continue;
             }
             match self.closing {
-                Closing::WaitingToSend(c) => {
-                    if !self.queue_control(Op::Close, &c) {
+                Closing::WaitingToSend { ctl, .. } => {
+                    if !self.queue_control(Op::Close, &ctl) {
                         return written;
                     }
-                    self.closing = Closing::AwaitingAck;
+                    // C's PENDING_TIMEOUT_CLOSE_ACK, from when it went
+                    self.closing = Closing::AwaitingAck {
+                        until: now.saturating_add(CLOSE_TIMEOUT),
+                    };
                     continue;
                 }
-                Closing::Flushing => {
+                Closing::Flushing { .. } => {
                     self.closing = Closing::Closed(Close::Shutdown);
                     return written;
                 }
                 Closing::None
-                | Closing::AwaitingAck
-                | Closing::Returned(_)
+                | Closing::AwaitingAck { .. }
+                | Closing::Returned { .. }
                 | Closing::Closed(_) => {}
             }
             // the pong goes while open, or ahead of the answer to the
@@ -1427,23 +1634,34 @@ impl<P: Role> Ws<P> {
             // we began the close, it is forgotten
             if let Some(p) = self.pong.take() {
                 match self.closing {
-                    Closing::None | Closing::Returned(_) => {
+                    Closing::None | Closing::Returned { .. } => {
                         if !self.queue_control(Op::Pong, &p) {
                             return written;
                         }
                     }
-                    Closing::WaitingToSend(_)
-                    | Closing::AwaitingAck
-                    | Closing::Flushing
+                    Closing::WaitingToSend { .. }
+                    | Closing::AwaitingAck { .. }
+                    | Closing::Flushing { .. }
                     | Closing::Closed(_) => {}
                 }
                 continue;
             }
-            if let Closing::Returned(c) = self.closing {
-                if !self.queue_control(Op::Close, &c) {
+            if let Closing::Returned { ctl, .. } = self.closing {
+                if !self.queue_control(Op::Close, &ctl) {
                     return written;
                 }
                 self.closing = Closing::Closed(Close::Shutdown);
+                continue;
+            }
+            // the validity ping, after what the close and the peer's ping
+            // are owed, as C's writeable handling orders them; none goes
+            // once a close has begun, which forgets it
+            if let Some(payload) = self.ping.take() {
+                let mut c = Ctl::new();
+                let _ = c.push(&payload);
+                if !self.queue_control(Op::Ping, &c) {
+                    return written;
+                }
                 continue;
             }
             return written;
@@ -1455,6 +1673,9 @@ impl<P: Role> Ws<P> {
 mod tests {
     use super::*;
 
+    /// When the tests' connections are made, and all they do happens.
+    const T0: Instant = Instant::from_micros(1_000_000);
+
     struct Nothing;
     impl TxSource for Nothing {
         fn fill(&mut self, _: &mut [u8]) -> usize {
@@ -1464,18 +1685,18 @@ mod tests {
 
     /// What the server writes after taking `frames`.
     fn answers(frames: &[u8]) -> ([u8; 64], usize) {
-        let mut ws = Ws::server(b"");
+        let mut ws = Ws::server(b"", T0);
         let mut input = frames.to_vec();
         let mut at = 0;
         while at < input.len() {
-            let rx = ws.rx(&mut input[at..]);
+            let rx = ws.rx(T0, &mut input[at..]);
             if rx.consumed == 0 {
                 break;
             }
             at = at.checked_add(rx.consumed).unwrap();
         }
         let mut out = [0u8; 64];
-        let n = ws.tx(&mut out, &mut Nothing);
+        let n = ws.tx(T0, &mut out, &mut Nothing);
         (out, n)
     }
 
@@ -1505,10 +1726,10 @@ mod tests {
 
     #[test]
     fn a_message_in_pieces_says_its_first_and_last() {
-        let mut ws = Ws::server(b"");
+        let mut ws = Ws::server(b"", T0);
         let mut a = *b"\x01\x81\0\0\0\0a";
         assert_eq!(
-            ws.rx(&mut a).event,
+            ws.rx(T0, &mut a).event,
             Some(Event::Message {
                 kind: Kind::Text,
                 data: b"a",
@@ -1518,7 +1739,7 @@ mod tests {
         );
         let mut b = *b"\x80\x81\0\0\0\0b";
         assert_eq!(
-            ws.rx(&mut b).event,
+            ws.rx(T0, &mut b).event,
             Some(Event::Message {
                 kind: Kind::Text,
                 data: b"b",
@@ -1570,20 +1791,20 @@ mod tests {
 
     /// What a client writes after taking `frames`.
     fn client_answers(frames: &[u8]) -> ([u8; 64], usize) {
-        let mut ws = Ws::client(Zeros);
+        let mut ws = Ws::client(Zeros, T0);
         let mut input = [0u8; 16];
         let input = &mut input[..frames.len()];
         input.copy_from_slice(frames);
         let mut at = 0;
         while at < input.len() {
-            let rx = ws.rx(&mut input[at..]);
+            let rx = ws.rx(T0, &mut input[at..]);
             if rx.consumed == 0 {
                 break;
             }
             at = at.checked_add(rx.consumed).unwrap();
         }
         let mut out = [0u8; 64];
-        let n = ws.tx(&mut out, &mut Nothing);
+        let n = ws.tx(T0, &mut out, &mut Nothing);
         (out, n)
     }
 
@@ -1617,33 +1838,193 @@ mod tests {
 
     #[test]
     fn after_our_close_has_gone_anything_ends_it() {
-        let mut ws = Ws::client(Zeros);
+        let mut ws = Ws::client(Zeros, T0);
         let mut bad = *b"\xc1\x05Hello";
-        assert_eq!(ws.rx(&mut bad).consumed, bad.len());
+        assert_eq!(ws.rx(T0, &mut bad).consumed, bad.len());
         // until our close has gone, what comes is dropped
         let mut more = *b"\x81\x00";
-        assert_eq!(ws.rx(&mut more).consumed, 2);
+        assert_eq!(ws.rx(T0, &mut more).consumed, 2);
         assert_eq!(ws.close(), None);
         let mut out = [0u8; 64];
-        assert!(ws.tx(&mut out, &mut Nothing) > 0);
+        assert!(ws.tx(T0, &mut out, &mut Nothing) > 0);
         assert_eq!(ws.close(), None);
         let mut ack = *b"\x88\x02\x03\xe8";
-        assert_eq!(ws.rx(&mut ack).consumed, 4);
+        assert_eq!(ws.rx(T0, &mut ack).consumed, 4);
         assert_eq!(ws.close(), Some(Close::Release));
     }
 
     #[test]
     fn a_client_with_no_random_fails() {
-        let mut ws = Ws::client(Dry);
+        let mut ws = Ws::client(Dry, T0);
         assert_eq!(ws.send(Kind::Text, 1), Err(SendError::NoMask));
         assert_eq!(ws.close(), Some(Close::Release));
         let mut out = [0u8; 8];
-        assert_eq!(ws.tx(&mut out, &mut Nothing), 0);
+        assert_eq!(ws.tx(T0, &mut out, &mut Nothing), 0);
     }
 
     #[test]
     fn a_second_ping_while_a_pong_is_owed_is_dropped() {
         let (out, n) = answers(b"\x89\x81\0\0\0\0a\x89\x81\0\0\0\0b");
         assert_eq!(&out[..n], b"\x8a\x01a");
+    }
+
+    /// `T0` and `secs` seconds.
+    fn at(secs: u64) -> Instant {
+        T0.checked_add(Duration::from_secs(secs)).unwrap()
+    }
+
+    /// Everything the connection writes now.
+    struct Wrote {
+        buf: [u8; 64],
+        len: usize,
+    }
+
+    impl<const N: usize> PartialEq<&[u8; N]> for Wrote {
+        fn eq(&self, other: &&[u8; N]) -> bool {
+            self.buf[..self.len] == other[..]
+        }
+    }
+
+    impl core::fmt::Debug for Wrote {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{}", self.buf[..self.len].escape_ascii())
+        }
+    }
+
+    fn drain<P: Role>(ws: &mut Ws<P>, now: Instant) -> Wrote {
+        let mut w = Wrote {
+            buf: [0; 64],
+            len: 0,
+        };
+        loop {
+            let n = ws.tx(now, &mut w.buf[w.len..], &mut Nothing);
+            if n == 0 {
+                return w;
+            }
+            w.len = w.len.checked_add(n).unwrap();
+        }
+    }
+
+    #[test]
+    fn our_close_must_go_in_time() {
+        let mut ws = Ws::server(b"", T0);
+        let mut bad = *b"\x83\x80\0\0\0\0";
+        ws.rx(T0, &mut bad);
+        assert_eq!(ws.next_deadline(), Some(at(5)));
+        ws.deadline_passed(at(4));
+        assert_eq!(ws.close(), None);
+        ws.deadline_passed(at(5));
+        assert_eq!(ws.close(), Some(Close::Release));
+        assert!(!ws.wants_write());
+        assert_eq!(ws.next_deadline(), None);
+    }
+
+    #[test]
+    fn the_peers_answer_is_awaited_from_when_ours_went() {
+        let mut ws = Ws::server(b"", T0);
+        let mut bad = *b"\x83\x80\0\0\0\0";
+        ws.rx(T0, &mut bad);
+        assert_eq!(drain(&mut ws, at(3)), b"\x88\x09\x03\xeabad opc");
+        assert_eq!(ws.next_deadline(), Some(at(8)));
+        ws.deadline_passed(at(7));
+        assert_eq!(ws.close(), None);
+        ws.deadline_passed(at(8));
+        assert_eq!(ws.close(), Some(Close::Release));
+    }
+
+    #[test]
+    fn our_answer_to_the_peers_close_must_go_in_time() {
+        let mut ws = Ws::server(b"", T0);
+        let mut close = *b"\x88\x82\0\0\0\0\x03\xe8";
+        ws.rx(at(1), &mut close);
+        assert_eq!(ws.next_deadline(), Some(at(6)));
+        ws.deadline_passed(at(6));
+        assert_eq!(ws.close(), Some(Close::Release));
+        assert_eq!(drain(&mut ws, at(6)), b"");
+    }
+
+    /// The application's payload, all at once.
+    struct Payload(&'static [u8]);
+    impl TxSource for Payload {
+        fn fill(&mut self, buf: &mut [u8]) -> usize {
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            n
+        }
+    }
+
+    #[test]
+    fn a_close_when_flushed_must_flush_in_time() {
+        let mut ws = Ws::server(b"", T0);
+        ws.send(Kind::Text, 4).unwrap();
+        ws.close_when_flushed(T0);
+        assert_eq!(ws.next_deadline(), Some(at(5)));
+        // only half the message comes
+        let mut out = [0u8; 64];
+        assert_eq!(ws.tx(at(1), &mut out, &mut Payload(b"ab")), 4);
+        ws.deadline_passed(at(5));
+        assert_eq!(ws.close(), Some(Close::Release));
+    }
+
+    #[test]
+    fn a_quiet_peer_is_pinged_then_closed_on() {
+        let mut ws = Ws::server(b"", T0);
+        assert_eq!(ws.next_deadline(), Some(at(40)));
+        // its messages and pings do not say it is there
+        let mut msg = *b"\x81\x81\0\0\0\0a\x89\x80\0\0\0\0";
+        let mut taken = 0;
+        while taken < msg.len() {
+            let rx = ws.rx(at(30), &mut msg[taken..]);
+            taken = taken.checked_add(rx.consumed).unwrap();
+        }
+        assert_eq!(drain(&mut ws, at(30)), b"\x8a\x00");
+        assert_eq!(ws.next_deadline(), Some(at(40)));
+        ws.deadline_passed(at(40));
+        assert!(ws.wants_write());
+        let mut ping = *b"\x89\x08\0\0\0\0\0\0\0\0";
+        ping[2..].copy_from_slice(&at(40).as_micros().to_le_bytes());
+        assert_eq!(drain(&mut ws, at(40)), &ping);
+        assert_eq!(ws.next_deadline(), Some(at(50)));
+        ws.deadline_passed(at(50));
+        assert_eq!(drain(&mut ws, at(50)), b"\x88\x02\x03\xe8");
+        assert_eq!(ws.next_deadline(), Some(at(55)));
+    }
+
+    #[test]
+    fn a_pong_starts_the_check_again() {
+        let mut ws = Ws::server(b"", T0);
+        ws.deadline_passed(at(40));
+        drain(&mut ws, at(40));
+        let mut pong = *b"\x8a\x80\0\0\0\0";
+        assert_eq!(ws.rx(at(45), &mut pong).event, None);
+        assert_eq!(ws.next_deadline(), Some(at(85)));
+    }
+
+    #[test]
+    fn a_ping_no_shorter_than_the_hangup_closes_without_pinging() {
+        let v = Validity {
+            ping: Duration::from_secs(10),
+            hangup: Duration::from_secs(10),
+        };
+        let mut ws = Ws::server(b"", T0).with_validity(Some(v), T0);
+        assert_eq!(ws.next_deadline(), Some(at(10)));
+        ws.deadline_passed(at(10));
+        assert_eq!(drain(&mut ws, at(10)), b"\x88\x02\x03\xe8");
+    }
+
+    #[test]
+    fn without_a_validity_check_there_is_no_deadline() {
+        let ws = Ws::server(b"", T0).with_validity(None, T0);
+        assert_eq!(ws.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_ping_owed_is_forgotten_once_the_peer_closes() {
+        let mut ws = Ws::client(Zeros, T0);
+        ws.deadline_passed(at(40));
+        let mut close = *b"\x88\x02\x03\xe8";
+        ws.rx(at(40), &mut close);
+        assert_eq!(drain(&mut ws, at(40)), b"\x88\x82\0\0\0\0\x03\xe8");
     }
 }

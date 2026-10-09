@@ -3,6 +3,7 @@
 //! C's `fuzz-ws-pmd`.
 
 use npro_core::random::{Random, Unavailable};
+use npro_core::time::Instant;
 use npro_ws::conn::{Close, Event, Kind, Role, Side, Ws};
 use npro_ws::pmd::Params;
 
@@ -15,6 +16,10 @@ const MAX_INPUT: usize = 64 * 1024;
 /// The most a message may inflate to in `ws-pmd`: small, so a zip bomb is
 /// within the fuzzer's reach, where C's is 256MiB.
 const FUZZ_MAX_MESSAGE: u64 = 1 << 20;
+
+/// When a run happens: all of it at once, so no deadline falls due and the
+/// run is the frames' alone.
+const T0: Instant = Instant::from_micros(1_000_000);
 
 /// The mask a client's frames are written with: not zero, so masking is
 /// done, and fixed, so a run is its input's alone.
@@ -83,7 +88,7 @@ fn run<'a, P: Role>(
                 break;
             }
             let len = input.len();
-            let rx = ws.rx(input);
+            let rx = ws.rx(T0, input);
             if rx.consumed == 0 && rx.event.is_none() && !draining {
                 finding(target, format_args!("{how}: took none of {len} bytes"));
             }
@@ -130,7 +135,7 @@ fn run<'a, P: Role>(
     let mut wrote = Vec::new();
     let mut out = [0u8; 64];
     loop {
-        let n = ws.tx(&mut out, &mut Nothing);
+        let n = ws.tx(T0, &mut out, &mut Nothing);
         if n == 0 {
             break;
         }
@@ -328,13 +333,13 @@ fn frames<P: Role>(target: &str, data: &[u8], open: Open, make: impl Fn() -> Ws<
 /// message must be UTF-8 by `core::str`; and what the server writes must be
 /// frames a client reads.
 pub fn ws_server(data: &[u8]) {
-    frames("ws-server", data, Open::Plain, || Ws::server(b""));
+    frames("ws-server", data, Open::Plain, || Ws::server(b"", T0));
 }
 
 /// A server's frames as a client reads them after the upgrade: as
 /// [`ws_server`], from the client's side, which writes its frames masked.
 pub fn ws_client(data: &[u8]) {
-    frames("ws-client", data, Open::Plain, || Ws::client(FixedMask));
+    frames("ws-client", data, Open::Plain, || Ws::client(FixedMask, T0));
 }
 
 /// A client's frames as a server with permessage-deflate reads them: C's
@@ -348,6 +353,6 @@ pub fn ws_client(data: &[u8]) {
 pub fn ws_pmd(data: &[u8]) {
     let params = Params::DEFAULT.with_max_message(FUZZ_MAX_MESSAGE);
     frames("ws-pmd", data, Open::Deflated, || {
-        Ws::server(b"").with_pmd(params)
+        Ws::server(b"", T0).with_pmd(params)
     });
 }

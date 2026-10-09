@@ -12,7 +12,9 @@
 //! client would send is deflated, and those bytes are the deflater's
 //! business.
 //!
-//! What npro writes after each `rx` must be the transcript's `tx` bytes,
+//! Each `rx` is handed in at its time, and nothing may fall due between
+//! them, as nothing did in C's run.  What npro writes after each `rx` must
+//! be the transcript's `tx` bytes,
 //! the messages it hands the app its `app_rx` bytes, and it must ask to be
 //! done with the connection exactly where C closed it, its `close`.  It
 //! writes four bytes at a time, so every frame goes in pieces.
@@ -21,6 +23,7 @@
 #[cfg(test)]
 mod ws_client_replay {
     use npro_core::random::SeededRandom;
+    use npro_core::time::Instant;
     use npro_h1::client::{Client, Connection, Event as H1Event, Request, Scheme};
     use npro_h1::server::TxSource;
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -109,9 +112,10 @@ mod ws_client_replay {
         Ws(Box<Ws<AsClient<SeededRandom>>>),
     }
 
-    /// Hands `input` to the connection, with the app answering, until
-    /// neither takes or writes anything more; returns what was written.
-    fn feed(conn: &mut Conn, app: &mut ClientApp, input: &mut [u8]) -> Vec<u8> {
+    /// Hands `input` to the connection at `now`, with the app answering,
+    /// until neither takes or writes anything more; returns what was
+    /// written.
+    fn feed(conn: &mut Conn, app: &mut ClientApp, input: &mut [u8], now: Instant) -> Vec<u8> {
         let mut wrote = Vec::new();
         let mut buf = [0u8; TX_LIMIT];
         let mut at = 0usize;
@@ -138,7 +142,7 @@ mod ws_client_replay {
                             )
                             .unwrap();
                         assert_eq!(checked.protocol, Some(OFFERED));
-                        let mut ws = Ws::client(random.take().unwrap());
+                        let mut ws = Ws::client(random.take().unwrap(), now);
                         if let Some(said) = checked.extensions {
                             ws = ws.with_pmd(pmd::client_accept(said).unwrap());
                         }
@@ -148,7 +152,7 @@ mod ws_client_replay {
                     }
                 }
                 Conn::Ws(ws) => {
-                    let rx = ws.rx(&mut input[at..]);
+                    let rx = ws.rx(now, &mut input[at..]);
                     let consumed = rx.consumed;
                     if let Some(Event::Message { data, .. }) = rx.event {
                         app.app_rx.extend_from_slice(data);
@@ -156,7 +160,7 @@ mod ws_client_replay {
                     at = at.checked_add(consumed).unwrap();
                     progress |= consumed > 0;
                     loop {
-                        let n = ws.tx(&mut buf, app);
+                        let n = ws.tx(now, &mut buf, app);
                         wrote.extend_from_slice(&buf[..n]);
                         if n == 0 {
                             break;
@@ -231,8 +235,18 @@ mod ws_client_replay {
                 }
                 steps.next();
             }
+            // C's run had nothing fall due: nor may npro's
+            let now = Instant::from_micros(t.t0_us.checked_add(step.t_us).unwrap());
+            if let Conn::Ws(ws) = &conn {
+                assert!(
+                    ws.next_deadline().is_none_or(|d| d > now),
+                    "{} at {}us: a deadline passed",
+                    t.case,
+                    step.t_us
+                );
+            }
             let mut input = rx.clone();
-            let got = feed(&mut conn, &mut app, &mut input);
+            let got = feed(&mut conn, &mut app, &mut input, now);
             assert_eq!(
                 got.escape_ascii().to_string(),
                 want.escape_ascii().to_string(),

@@ -9,19 +9,16 @@
 //! C's `callback_echo` in `api-test-sansio`: it echoes each whole message,
 //! and after echoing `Bye`, closes once that has gone, with no close frame.
 //!
-//! What npro writes between one `rx` and the next must be the transcript's
-//! `tx` bytes, and the messages it hands the app its `app_rx` bytes.  It
-//! writes four bytes at a time, as `ws-server-close-partial` has C do, so
-//! every frame here goes in pieces.
-
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-h1 and npro-ws"
-)]
+//! Each `rx` is handed in at its time, and nothing may fall due between
+//! them, as nothing did in C's run.  What npro writes between one `rx` and
+//! the next must be the transcript's `tx` bytes, and the messages it hands
+//! the app its `app_rx` bytes.  It writes four bytes at a time, as
+//! `ws-server-close-partial` has C do, so every frame here goes in pieces.
 
 // held to clippy's rules for tests
 #[cfg(test)]
 mod ws_server_replay {
+    use npro_core::time::Instant;
     use npro_h1::head;
     use npro_h1::server::{Config, Event as H1Event, Response, Server, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -76,7 +73,7 @@ mod ws_server_replay {
 
     impl EchoApp {
         /// A piece of a message: the whole of one is echoed.
-        fn message(&mut self, ws: &mut Ws, data: &[u8], last: bool) {
+        fn message(&mut self, ws: &mut Ws, now: Instant, data: &[u8], last: bool) {
             self.msg.extend_from_slice(data);
             self.app_rx.extend_from_slice(data);
             if !last {
@@ -87,7 +84,7 @@ mod ws_server_replay {
             let len = u64::try_from(self.out.len()).unwrap();
             ws.send(Kind::Text, len).unwrap();
             if self.out == b"Bye" {
-                ws.close_when_flushed();
+                ws.close_when_flushed(now);
             }
         }
     }
@@ -108,7 +105,7 @@ mod ws_server_replay {
 
     /// The h1 request in hand: an upgrade, or one to the vhost's `http`,
     /// which answers `sansio ok` to anything.
-    fn request(s: &mut Server<Vec<u8>>, app: &mut EchoApp) -> Answer {
+    fn request(s: &mut Server<Vec<u8>>, app: &mut EchoApp, now: Instant) -> Answer {
         let t = s.request();
         let mut up = [0u8; 16];
         let up_len = t.copy(Token::Upgrade, &mut up).unwrap();
@@ -135,7 +132,7 @@ mod ws_server_replay {
                 let mut first = [0u8; MAX_101];
                 let n =
                     handshake::response_101(&a, PROTOCOLS[a.protocol], lines, &mut first).unwrap();
-                let mut ws = Ws::server(&first[..n]);
+                let mut ws = Ws::server(&first[..n], now);
                 if let Some(p) = pmd {
                     ws = ws.with_pmd(p.params());
                 }
@@ -148,9 +145,10 @@ mod ws_server_replay {
         }
     }
 
-    /// Hands `input` to the connection, with the app answering, until
-    /// neither takes or writes anything more; returns what was written.
-    fn feed(conn: &mut Conn, app: &mut EchoApp, input: &mut [u8]) -> Vec<u8> {
+    /// Hands `input` to the connection at `now`, with the app answering,
+    /// until neither takes or writes anything more; returns what was
+    /// written.
+    fn feed(conn: &mut Conn, app: &mut EchoApp, input: &mut [u8], now: Instant) -> Vec<u8> {
         let mut wrote = Vec::new();
         let mut buf = [0u8; TX_LIMIT];
         let mut at = 0usize;
@@ -163,7 +161,7 @@ mod ws_server_replay {
                     progress |= rx.consumed > 0;
                     if let Some(H1Event::Request) = rx.event {
                         progress = true;
-                        if let Answer::Upgraded(ws) = request(s, app) {
+                        if let Answer::Upgraded(ws) = request(s, app, now) {
                             *conn = Conn::Ws(ws);
                             continue;
                         }
@@ -184,7 +182,7 @@ mod ws_server_replay {
                     }
                 }
                 Conn::Ws(ws) => {
-                    let rx = ws.rx(&mut input[at..]);
+                    let rx = ws.rx(now, &mut input[at..]);
                     let consumed = rx.consumed;
                     let message = match rx.event {
                         Some(Event::Message { data, last, .. }) => Some((data.to_vec(), last)),
@@ -193,10 +191,10 @@ mod ws_server_replay {
                     at = at.checked_add(consumed).unwrap();
                     progress |= consumed > 0;
                     if let Some((data, last)) = message {
-                        app.message(ws, &data, last);
+                        app.message(ws, now, &data, last);
                     }
                     loop {
-                        let n = ws.tx(&mut buf, app);
+                        let n = ws.tx(now, &mut buf, app);
                         wrote.extend_from_slice(&buf[..n]);
                         if n == 0 {
                             break;
@@ -233,8 +231,18 @@ mod ws_server_replay {
                 }
                 steps.next();
             }
+            // C's run had nothing fall due: nor may npro's
+            let now = Instant::from_micros(t.t0_us.checked_add(step.t_us).unwrap());
+            if let Conn::Ws(ws) = &conn {
+                assert!(
+                    ws.next_deadline().is_none_or(|d| d > now),
+                    "{} at {}us: a deadline passed",
+                    t.case,
+                    step.t_us
+                );
+            }
             let mut input = rx.clone();
-            let got = feed(&mut conn, &mut app, &mut input);
+            let got = feed(&mut conn, &mut app, &mut input, now);
             assert_eq!(
                 got.escape_ascii().to_string(),
                 want.escape_ascii().to_string(),

@@ -894,9 +894,13 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When the tests' connections are made, and all they do happens.
+    const T0: Instant = Instant::from_micros(1_000_000);
     use crate::conn::{AsClient, Close, Event, Kind, Role, Ws};
     use alloc::vec;
     use npro_core::random::SeededRandom;
+    use npro_core::time::Instant;
     use npro_h1::server::TxSource;
 
     /// A message's payload, given a piece at a time.
@@ -929,7 +933,7 @@ mod tests {
             let len = chunk.len();
             let mut at = 0;
             loop {
-                let rx = ws.rx(&mut chunk[at..]);
+                let rx = ws.rx(T0, &mut chunk[at..]);
                 let consumed = rx.consumed;
                 let given = match rx.event {
                     Some(Event::Message {
@@ -967,7 +971,7 @@ mod tests {
             ws.send(*kind, u64::try_from(data.len()).unwrap()).unwrap();
             let mut src = Src { data, at: 0 };
             loop {
-                let n = ws.tx(&mut buf, &mut src);
+                let n = ws.tx(T0, &mut buf, &mut src);
                 if n == 0 {
                     break;
                 }
@@ -979,7 +983,7 @@ mod tests {
     }
 
     fn client(params: Params) -> Ws<AsClient<SeededRandom>> {
-        Ws::client(SeededRandom::new(7)).with_pmd(params)
+        Ws::client(SeededRandom::new(7), T0).with_pmd(params)
     }
 
     #[test]
@@ -1042,17 +1046,17 @@ mod tests {
     fn a_dropped_connection_writes_nothing_more() {
         // a ping, its pong half written, then a message that does not
         // inflate
-        let mut ws = Ws::server(b"").with_pmd(Params::DEFAULT);
+        let mut ws = Ws::server(b"", T0).with_pmd(Params::DEFAULT);
         let mut ping = *b"\x89\x84\0\0\0\0ping";
-        ws.rx(&mut ping);
+        ws.rx(T0, &mut ping);
         let mut out = [0u8; 3];
         let mut src = Src { data: b"", at: 0 };
-        assert_eq!(ws.tx(&mut out, &mut src), 3);
+        assert_eq!(ws.tx(T0, &mut out, &mut src), 3);
         let mut bad = *b"\xc1\x82\0\0\0\0\x07\x00";
-        ws.rx(&mut bad);
+        ws.rx(T0, &mut bad);
         assert_eq!(ws.close(), Some(Close::Release));
         assert!(!ws.wants_write());
-        assert_eq!(ws.tx(&mut out, &mut src), 0);
+        assert_eq!(ws.tx(T0, &mut out, &mut src), 0);
     }
 
     /// Bytes from a fixed stream, which do not compress.
@@ -1112,12 +1116,12 @@ mod tests {
                 // client to server
                 let up = writes(&mut client(params), &msgs, limit);
                 assert_eq!(
-                    reads(&mut Ws::server(b"").with_pmd(params), &up, piece),
+                    reads(&mut Ws::server(b"", T0).with_pmd(params), &up, piece),
                     (payloads.clone(), None),
                     "up {how:?}"
                 );
                 // server to client
-                let down = writes(&mut Ws::server(b"").with_pmd(params), &msgs, limit);
+                let down = writes(&mut Ws::server(b"", T0).with_pmd(params), &msgs, limit);
                 assert_eq!(
                     reads(&mut client(params), &down, piece),
                     (payloads.clone(), None),
@@ -1131,7 +1135,7 @@ mod tests {
     fn compressed_frames_carry_rsv1_on_the_first_only() {
         let data = noise(3000);
         let frames = writes(
-            &mut Ws::server(b"").with_pmd(Params::DEFAULT),
+            &mut Ws::server(b"", T0).with_pmd(Params::DEFAULT),
             &[(Kind::Binary, &data)],
             4096,
         );
@@ -1172,13 +1176,13 @@ mod tests {
         assert!(frames.len() < 100, "zeros compress");
         let limited = Params::DEFAULT.with_max_message(4999);
         assert_eq!(
-            reads(&mut Ws::server(b"").with_pmd(limited), &frames, 4096),
+            reads(&mut Ws::server(b"", T0).with_pmd(limited), &frames, 4096),
             (Vec::new(), Some(Close::Release))
         );
         // and at the limit, it is not
         let exact = Params::DEFAULT.with_max_message(5000);
         assert_eq!(
-            reads(&mut Ws::server(b"").with_pmd(exact), &frames, 4096),
+            reads(&mut Ws::server(b"", T0).with_pmd(exact), &frames, 4096),
             (vec![(Kind::Binary, zeros)], None)
         );
     }
@@ -1201,13 +1205,13 @@ mod tests {
         let mut head = vec![0xc2, 0xfe, 0x08, 0x01];
         head.extend_from_slice(&[0; 4]);
         for split in 0..deflated.len() {
-            let mut ws = Ws::server(b"").with_pmd(Params::DEFAULT);
+            let mut ws = Ws::server(b"", T0).with_pmd(Params::DEFAULT);
             let mut got = 0;
             let first = [&head[..], &deflated[..split]].concat();
             for mut piece in [first, deflated[split..].to_vec()] {
                 let mut at = 0;
                 while at < piece.len() || ws.rx_pending() {
-                    let rx = ws.rx(&mut piece[at..]);
+                    let rx = ws.rx(T0, &mut piece[at..]);
                     at += rx.consumed;
                     if let Some(Event::Message { data, .. }) = rx.event {
                         got += data.len();
@@ -1238,11 +1242,11 @@ mod tests {
             // RSV2 with it
             (b"\xe1\x80\0\0\0\0", b"\x88\x0a\x03\xearsv bits"),
         ] {
-            let mut ws = Ws::server(b"").with_pmd(Params::DEFAULT);
+            let mut ws = Ws::server(b"", T0).with_pmd(Params::DEFAULT);
             let (got, _) = reads(&mut ws, frames, 64);
             assert_eq!(got, Vec::new());
             let mut out = [0u8; 64];
-            let n = ws.tx(&mut out, &mut Src { data: b"", at: 0 });
+            let n = ws.tx(T0, &mut out, &mut Src { data: b"", at: 0 });
             assert_eq!(&out[..n], close, "{}", frames.escape_ascii());
         }
     }
