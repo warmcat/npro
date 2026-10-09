@@ -333,6 +333,21 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         self.head.table()
     }
 
+    /// Whether a request is in hand and not yet answered: the time to
+    /// answer it ([`Server::respond`]), refuse its upgrade
+    /// ([`Server::refuse_upgrade`]), or accept it, as the connection
+    /// carrying it changes role.
+    #[must_use]
+    pub const fn is_awaiting_answer(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Request(Txn {
+                reply: Reply::Awaited,
+                ..
+            })
+        )
+    }
+
     /// Whether the connection has something to write.
     #[must_use]
     pub const fn wants_write(&self) -> bool {
@@ -1268,5 +1283,15 @@ mod tests {
         // the same storage, holding what the request's head was parsed into
         let storage: [u8; 64] = s.into_storage();
         assert!(storage.windows(2).any(|w| w == b"/\0"));
+    }
+
+    #[test]
+    fn a_request_awaits_its_answer_until_it_has_one() {
+        let mut s = server();
+        assert!(!s.is_awaiting_answer());
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        assert!(s.is_awaiting_answer());
+        s.respond(OK2).unwrap();
+        assert!(!s.is_awaiting_answer());
     }
 }
