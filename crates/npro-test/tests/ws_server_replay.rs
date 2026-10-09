@@ -151,6 +151,7 @@ mod ws_server_replay {
     fn feed(conn: &mut Conn, app: &mut EchoApp, input: &mut [u8], now: Instant) -> Vec<u8> {
         let mut wrote = Vec::new();
         let mut buf = [0u8; TX_LIMIT];
+        let mut inflated = [0u8; pmd::RX_CHUNK];
         let mut at = 0usize;
         loop {
             let mut progress = false;
@@ -182,16 +183,13 @@ mod ws_server_replay {
                     }
                 }
                 Conn::Ws(ws) => {
-                    let rx = ws.rx(now, &mut input[at..]);
-                    let consumed = rx.consumed;
-                    let message = match rx.event {
-                        Some(Event::Message { data, last, .. }) => Some((data.to_vec(), last)),
-                        Some(Event::Pong(_) | Event::PeerClose(_)) | None => None,
-                    };
-                    at = at.checked_add(consumed).unwrap();
-                    progress |= consumed > 0;
-                    if let Some((data, last)) = message {
-                        app.message(ws, now, &data, last);
+                    let rx = ws.rx(now, &mut input[at..], &mut inflated);
+                    at = at.checked_add(rx.consumed).unwrap();
+                    progress |= rx.consumed > 0;
+                    // the app answers with the message in hand: it
+                    // borrows the input, not the connection
+                    if let Some(Event::Message { data, last, .. }) = rx.event {
+                        app.message(ws, now, data, last);
                     }
                     loop {
                         let n = ws.tx(now, &mut buf, app);

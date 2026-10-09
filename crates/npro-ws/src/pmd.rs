@@ -14,9 +14,10 @@
 //! **Messages.**  A message whose first frame has RSV1 is compressed: its
 //! payload is inflated as it comes, the four bytes `00 00 ff ff` its
 //! sender removed put back at its end, and the application given what it
-//! inflates to, at most [`RX_CHUNK`] bytes a call.  A message inflating
-//! to more than [`Params::max_message`], C's 256MiB by default, is a zip
-//! bomb.  Data after the peer's deflate stream ended in a message is
+//! inflates to, in the buffer the caller gives [`crate::conn::Ws::rx`]:
+//! at most [`RX_CHUNK`] bytes a call, C's, if that is its size.  A message
+//! inflating to more than [`Params::max_message`], C's 256MiB by default,
+//! is a zip bomb.  Data after the peer's deflate stream ended in a message is
 //! refused, as C refuses it.  Each of these, and data that does not
 //! inflate, drops the connection without a close, as C marks the socket
 //! unusable.  What the application sends is deflated into frames of at
@@ -49,7 +50,8 @@ pub const OFFER: &[u8] = NAME;
 pub const MAX_MESSAGE: u64 = 0x1000_0000;
 
 /// The most inflated data given the application in one call: C's
-/// default `rx_buf_size`, its drain budget.
+/// default `rx_buf_size`, its drain budget.  It is the size of the buffer
+/// to give [`crate::conn::Ws::rx`] to inflate into.
 pub const RX_CHUNK: usize = 1024;
 
 /// The most compressed payload in one frame written: C's default
@@ -483,7 +485,7 @@ enum RxStream {
 /// What a call to [`Codec::inflate`] came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inflated {
-    /// How much it put in [`Codec::rx_out`].
+    /// How much it put in the output it was given.
     pub(crate) produced: usize,
     /// Whether the message is over.
     pub(crate) done: bool,
@@ -520,7 +522,6 @@ pub(crate) struct Codec {
     inflater: Option<Box<InflateState>>,
     held: Vec<u8>,
     held_at: usize,
-    rx_out: Vec<u8>,
     rx_total: u64,
     rx_stream: RxStream,
     /// The inflater may owe output without more input: the last inflate
@@ -559,7 +560,6 @@ impl Codec {
             inflater: None,
             held: Vec::new(),
             held_at: 0,
-            rx_out: Vec::new(),
             rx_total: 0,
             rx_stream: RxStream::Running,
             rx_owed: false,
@@ -603,33 +603,25 @@ impl Codec {
         }
     }
 
-    /// What the last [`Codec::inflate`] produced.
-    pub(crate) fn rx_out(&self, n: usize) -> &[u8] {
-        self.rx_out.get(..n).unwrap_or_default()
-    }
-
     /// Inflates what is held, and at the message's end, `end`, the
-    /// trailer, into [`Codec::rx_out`].
+    /// trailer, into `out`.
     ///
     /// What inflated before a failure is given first, and the failure on
     /// the next call, so the application, and the check of text, see the
     /// stream up to where it went wrong however it was split.
-    pub(crate) fn inflate(&mut self, end: bool) -> Result<Inflated, Fail> {
+    pub(crate) fn inflate(&mut self, end: bool, out: &mut [u8]) -> Result<Inflated, Fail> {
         if let Some(f) = self.rx_failed {
             return Err(f);
         }
-        let first = self.inflate_once(end)?;
+        let first = self.inflate_once(end, out)?;
         // the payload is all in, and gave nothing more: on to the trailer
         if first.produced == 0 && !first.done && matches!(self.rx_stream, RxStream::Trailer(0)) {
-            return self.inflate_once(end);
+            return self.inflate_once(end, out);
         }
         Ok(first)
     }
 
-    fn inflate_once(&mut self, end: bool) -> Result<Inflated, Fail> {
-        if self.rx_out.len() < RX_CHUNK {
-            self.rx_out.resize(RX_CHUNK, 0);
-        }
+    fn inflate_once(&mut self, end: bool, out: &mut [u8]) -> Result<Inflated, Fail> {
         let held = self.held.get(self.held_at..).unwrap_or_default();
         if self.rx_stream == RxStream::Ended {
             // only the padding of the stored block it flushed with
@@ -637,7 +629,7 @@ impl Codec {
                 return Err(Fail::AfterEnd);
             }
             self.held_at = self.held.len();
-            return self.produced(0, end);
+            return self.produced(0, end, out.len());
         }
         let (input, flush) = match self.rx_stream {
             RxStream::Trailer(fed) => (
@@ -649,7 +641,7 @@ impl Codec {
         let inflater = self
             .inflater
             .get_or_insert_with(|| InflateState::new_boxed(DataFormat::Raw));
-        let r = miniz_oxide::inflate::stream::inflate(inflater, input, &mut self.rx_out, flush);
+        let r = miniz_oxide::inflate::stream::inflate(inflater, input, out, flush);
         let progress = r.bytes_consumed > 0 || r.bytes_written > 0;
         match r.status {
             Ok(MZStatus::StreamEnd) => {
@@ -662,7 +654,7 @@ impl Codec {
                     self.held_at = self.held.len();
                 }
                 self.rx_stream = RxStream::Ended;
-                return self.produced(r.bytes_written, end);
+                return self.produced(r.bytes_written, end, out.len());
             }
             // it can go no further without more input, or more room:
             // stuck only if it took and gave nothing, below
@@ -688,18 +680,18 @@ impl Codec {
         if end && !self.holding() && self.rx_stream == RxStream::Running {
             self.rx_stream = RxStream::Trailer(0);
         }
-        self.produced(r.bytes_written, end)
+        self.produced(r.bytes_written, end, out.len())
     }
 
-    /// Counts what was produced against the message's limit, and ends
-    /// the message once its input and trailer are in and nothing more is
-    /// owed.
-    fn produced(&mut self, produced: usize, end: bool) -> Result<Inflated, Fail> {
-        let room = self.params.max_message.saturating_sub(self.rx_total);
+    /// Counts what was produced, into an output of `room` bytes, against
+    /// the message's limit, and ends the message once its input and
+    /// trailer are in and nothing more is owed.
+    fn produced(&mut self, produced: usize, end: bool, room: usize) -> Result<Inflated, Fail> {
+        let left = self.params.max_message.saturating_sub(self.rx_total);
         let n = u64::try_from(produced).unwrap_or(u64::MAX);
-        if n > room {
+        if n > left {
             // up to the limit, then the bomb
-            let upto = usize::try_from(room).unwrap_or(produced);
+            let upto = usize::try_from(left).unwrap_or(produced);
             self.rx_total = self.params.max_message;
             return self.failed_after(Fail::ZipBomb, upto);
         }
@@ -716,7 +708,7 @@ impl Codec {
             .inflater
             .as_ref()
             .is_some_and(|i| i.last_status() == TINFLStatus::HasMoreOutput);
-        self.rx_owed = produced >= self.rx_out.len() || window_full;
+        self.rx_owed = produced >= room || window_full;
         let done = end && !self.holding() && trailer_in && !self.rx_owed;
         if done {
             self.message_received();
@@ -929,11 +921,12 @@ mod tests {
         let mut got = Vec::new();
         let mut open: Option<(Kind, Vec<u8>)> = None;
         let mut buf = frames.to_vec();
+        let mut out = [0u8; RX_CHUNK];
         for chunk in buf.chunks_mut(piece.max(1)) {
             let len = chunk.len();
             let mut at = 0;
             loop {
-                let rx = ws.rx(T0, &mut chunk[at..]);
+                let rx = ws.rx(T0, &mut chunk[at..], &mut out);
                 let consumed = rx.consumed;
                 let given = match rx.event {
                     Some(Event::Message {
@@ -1048,12 +1041,12 @@ mod tests {
         // inflate
         let mut ws = Ws::server(b"", T0).with_pmd(Params::DEFAULT);
         let mut ping = *b"\x89\x84\0\0\0\0ping";
-        ws.rx(T0, &mut ping);
+        ws.rx(T0, &mut ping, &mut []);
         let mut out = [0u8; 3];
         let mut src = Src { data: b"", at: 0 };
         assert_eq!(ws.tx(T0, &mut out, &mut src), 3);
         let mut bad = *b"\xc1\x82\0\0\0\0\x07\x00";
-        ws.rx(T0, &mut bad);
+        ws.rx(T0, &mut bad, &mut [0u8; RX_CHUNK]);
         assert_eq!(ws.close(), Some(Close::Abort));
         assert!(!ws.wants_write());
         assert_eq!(ws.tx(T0, &mut out, &mut src), 0);
@@ -1207,11 +1200,12 @@ mod tests {
         for split in 0..deflated.len() {
             let mut ws = Ws::server(b"", T0).with_pmd(Params::DEFAULT);
             let mut got = 0;
+            let mut out = [0u8; RX_CHUNK];
             let first = [&head[..], &deflated[..split]].concat();
             for mut piece in [first, deflated[split..].to_vec()] {
                 let mut at = 0;
                 while at < piece.len() || ws.rx_pending() {
-                    let rx = ws.rx(T0, &mut piece[at..]);
+                    let rx = ws.rx(T0, &mut piece[at..], &mut out);
                     at += rx.consumed;
                     if let Some(Event::Message { data, .. }) = rx.event {
                         got += data.len();

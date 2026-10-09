@@ -118,6 +118,7 @@ mod ws_client_replay {
     fn feed(conn: &mut Conn, app: &mut ClientApp, input: &mut [u8], now: Instant) -> Vec<u8> {
         let mut wrote = Vec::new();
         let mut buf = [0u8; TX_LIMIT];
+        let mut inflated = [0u8; pmd::RX_CHUNK];
         let mut at = 0usize;
         loop {
             let mut progress = false;
@@ -152,7 +153,7 @@ mod ws_client_replay {
                     }
                 }
                 Conn::Ws(ws) => {
-                    let rx = ws.rx(now, &mut input[at..]);
+                    let rx = ws.rx(now, &mut input[at..], &mut inflated);
                     let consumed = rx.consumed;
                     if let Some(Event::Message { data, .. }) = rx.event {
                         app.app_rx.extend_from_slice(data);

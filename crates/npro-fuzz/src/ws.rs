@@ -5,7 +5,7 @@
 use npro_core::random::{Random, Unavailable};
 use npro_core::time::Instant;
 use npro_ws::conn::{Close, Event, Kind, Role, Side, Ws};
-use npro_ws::pmd::Params;
+use npro_ws::pmd::{Params, RX_CHUNK};
 
 use crate::targets::{Pieces, control, finding};
 
@@ -82,13 +82,14 @@ fn run<'a, P: Role>(
         // calls with nothing to take that gave nothing, while it said it
         // had more to give
         let mut idle = 0u8;
+        let mut inflated = [0u8; RX_CHUNK];
         while let Some(input) = buf.get_mut(at..) {
             let draining = input.is_empty();
             if draining && !ws.rx_pending() {
                 break;
             }
             let len = input.len();
-            let rx = ws.rx(T0, input);
+            let rx = ws.rx(T0, input, &mut inflated);
             if rx.consumed == 0 && rx.event.is_none() && !draining {
                 finding(target, format_args!("{how}: took none of {len} bytes"));
             }
@@ -127,8 +128,8 @@ fn run<'a, P: Role>(
                         open = Some(m);
                     }
                 }
-                Event::Pong(p) => given.push(Given::Pong(p.to_vec())),
-                Event::PeerClose(p) => given.push(Given::PeerClose(p.to_vec())),
+                Event::Pong(p) => given.push(Given::Pong(p.payload().to_vec())),
+                Event::PeerClose(p) => given.push(Given::PeerClose(p.payload().to_vec())),
             }
         }
     }

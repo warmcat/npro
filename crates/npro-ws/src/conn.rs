@@ -231,10 +231,10 @@ pub enum Event<'a> {
         last: bool,
     },
     /// A pong, with its payload: C's `LWS_CALLBACK_RECEIVE_PONG`.
-    Pong(&'a [u8]),
+    Pong(Control),
     /// The peer's close, with its payload: C's
     /// `LWS_CALLBACK_WS_PEER_INITIATED_CLOSE`.  It is answered.
-    PeerClose(&'a [u8]),
+    PeerClose(Control),
 }
 
 /// What [`Ws::rx`] took.
@@ -377,14 +377,16 @@ enum Given {
     Some,
 }
 
-/// A control frame, its payload gathered or to be sent.
+/// A control frame's payload, at most 125 bytes: one gathered from the
+/// peer, which [`Event::Pong`] and [`Event::PeerClose`] carry by value, so
+/// the event does not borrow the connection; or one we send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Ctl {
+pub struct Control {
     buf: [u8; MAX_CTL],
     len: u8,
 }
 
-impl Ctl {
+impl Control {
     const fn new() -> Self {
         Self {
             buf: [0; MAX_CTL],
@@ -392,7 +394,9 @@ impl Ctl {
         }
     }
 
-    fn payload(&self) -> &[u8] {
+    /// The payload.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
         self.buf.get(..usize::from(self.len)).unwrap_or_default()
     }
 
@@ -422,13 +426,13 @@ enum Closing {
     None,
     /// Our close is to go, by `until`: `LCS_WAITING_TO_SEND_CLOSE`, under
     /// `PENDING_TIMEOUT_CLOSE_SEND`.
-    WaitingToSend { ctl: Ctl, until: Instant },
+    WaitingToSend { ctl: Control, until: Instant },
     /// Our close has gone, and the peer's is due by `until`:
     /// `LCS_AWAITING_CLOSE_ACK`, under `PENDING_TIMEOUT_CLOSE_ACK`.
     AwaitingAck { until: Instant },
     /// The peer's close is to be answered, by `until`:
     /// `LCS_RETURNED_CLOSE`, under `PENDING_TIMEOUT_CLOSE_SEND`.
-    Returned { ctl: Ctl, until: Instant },
+    Returned { ctl: Control, until: Instant },
     /// The application closes once what it sent has gone, by `until`:
     /// `LCS_FLUSHING_BEFORE_CLOSE`, under
     /// `PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE`.
@@ -593,7 +597,7 @@ fn frame_header(first: u8, len: u64, mask: Option<[u8; 4]>, out: &mut Out) {
 }
 
 /// A control frame, header and payload, masked with a client's mask.
-fn control_frame(op: Op, c: &Ctl, mask: Option<[u8; 4]>, out: &mut Out) {
+fn control_frame(op: Op, c: &Control, mask: Option<[u8; 4]>, out: &mut Out) {
     frame_header(0x80 | op.code(), u64::from(c.len), mask, out);
     out.push(c.payload());
     if let Some(m) = mask {
@@ -612,11 +616,18 @@ fn control_frame(op: Op, c: &Ctl, mask: Option<[u8; 4]>, out: &mut Out) {
 /// let mut ws = Ws::server(b"", now);
 /// // a masked "Hi", with a zero mask
 /// let mut frame = *b"\x81\x82\0\0\0\0Hi";
-/// let rx = ws.rx(now, &mut frame);
+/// // with no permessage-deflate, nothing is inflated: no buffer for it
+/// let rx = ws.rx(now, &mut frame, &mut []);
 /// assert_eq!(
 ///     rx.event,
 ///     Some(Event::Message { kind: Kind::Text, data: b"Hi", first: true, last: true })
 /// );
+/// // the message borrows the input, not the connection: it can be echoed
+/// // while it is held
+/// if let Some(Event::Message { kind, data, .. }) = rx.event {
+///     ws.send(kind, u64::try_from(data.len())?)?;
+/// }
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct Ws<P = AsServer> {
@@ -625,9 +636,9 @@ pub struct Ws<P = AsServer> {
     msg: Msg,
     utf8: Utf8Validator,
     /// A control frame's payload, gathered.
-    ctl: Ctl,
+    ctl: Control,
     /// The pong owed, if any: C's one pending pong.
-    pong: Option<Ctl>,
+    pong: Option<Control>,
     /// The validity check: C's `sul_validity`.
     check: Check,
     /// The validity ping owed, if any, its payload: C's
@@ -673,7 +684,7 @@ impl<P: Role> Ws<P> {
             parse: Parse::First,
             msg: Msg::Idle,
             utf8: Utf8Validator::new(),
-            ctl: Ctl::new(),
+            ctl: Control::new(),
             pong: None,
             check: Check::armed(Some(Validity::DEFAULT), now),
             ping: None,
@@ -808,8 +819,15 @@ impl<P: Role> Ws<P> {
     }
 
     /// Takes bytes from the peer at `now`: see [`Event`].  A frame's
-    /// payload is unmasked where it lies in `input`.
-    pub fn rx<'a>(&'a mut self, now: Instant, input: &'a mut [u8]) -> Rx<'a> {
+    /// payload is unmasked where it lies in `input`; a deflated message's
+    /// is inflated into `out`, which with permessage-deflate must not be
+    /// empty, [`crate::pmd::RX_CHUNK`] being C's size for it, and without
+    /// may be.  The event borrows those, not the connection, so the
+    /// application can answer while it has it.
+    pub fn rx<'a>(&mut self, now: Instant, input: &'a mut [u8], out: &'a mut [u8]) -> Rx<'a> {
+        // without permessage-deflate nothing is inflated
+        #[cfg(not(feature = "pmd"))]
+        let _ = out;
         let mut used = 0usize;
         loop {
             match self.parse {
@@ -840,7 +858,7 @@ impl<P: Role> Ws<P> {
                             }
                         )
                     {
-                        match self.deflated(f, left, input, used) {
+                        match self.deflated(f, left, input, used, out) {
                             // the frame is done with, and gave nothing:
                             // on to the next
                             Deflated::Again(consumed) => {
@@ -864,7 +882,7 @@ impl<P: Role> Ws<P> {
                                     event: None,
                                 };
                             }
-                            Deflated::Piece(p) => return self.deflated_piece(p),
+                            Deflated::Piece(p) => return Self::deflated_piece(p, out),
                         }
                     }
                     return self.payload(now, f, left, input, used);
@@ -1000,7 +1018,7 @@ impl<P: Role> Ws<P> {
             Parse::Payload(..) | Parse::Stopped | Parse::Refused => {}
         }
         if matches!(self.parse, Parse::Payload(..)) {
-            self.ctl = Ctl::new();
+            self.ctl = Control::new();
         }
         None
     }
@@ -1077,7 +1095,7 @@ impl<P: Role> Ws<P> {
 
     /// The payload of `f`, `left` of it still to come.
     fn payload<'a>(
-        &'a mut self,
+        &mut self,
         now: Instant,
         f: Frame,
         left: u64,
@@ -1177,11 +1195,17 @@ impl<P: Role> Ws<P> {
 
     /// The payload of `f`, `left` of it still to come, in a deflated
     /// message: what fits is unmasked into the codec's hold, and inflated
-    /// from there, at most [`crate::pmd::RX_CHUNK`] bytes a call, so it is
-    /// taken from `input` only as it is held, and given the application
-    /// as it inflates.
+    /// from there into `out`, so it is taken from `input` only as it is
+    /// held, and given the application as it inflates.
     #[cfg(feature = "pmd")]
-    fn deflated(&mut self, f: Frame, left: u64, input: &[u8], used: usize) -> Deflated {
+    fn deflated(
+        &mut self,
+        f: Frame,
+        left: u64,
+        input: &[u8],
+        used: usize,
+        out: &mut [u8],
+    ) -> Deflated {
         let Msg::Open {
             kind,
             given,
@@ -1212,13 +1236,13 @@ impl<P: Role> Ws<P> {
             consumed = consumed.saturating_add(n);
         }
         let end = f.fin && left == 0;
-        let Ok(inflated) = codec.inflate(end) else {
+        let Ok(inflated) = codec.inflate(end, out) else {
             // C marks the socket unusable: no close goes
             self.fail();
             return Deflated::Dropped;
         };
         let more = left > 0 || codec.owes() || (end && !inflated.done);
-        let piece = codec.rx_out(inflated.produced);
+        let piece = out.get(..inflated.produced).unwrap_or_default();
         let bad_text: Option<&'static [u8]> = if kind != Kind::Text {
             None
         } else if self.utf8.feed(piece).is_err() {
@@ -1265,13 +1289,11 @@ impl<P: Role> Ws<P> {
         })
     }
 
-    /// A piece of a deflated message, as the application is given it.
+    /// A piece of a deflated message, inflated into `out`, as the
+    /// application is given it.
     #[cfg(feature = "pmd")]
-    fn deflated_piece(&self, p: Inflating) -> Rx<'_> {
-        let data = match &self.ext {
-            Ext::Pmd(codec) => codec.rx_out(p.produced),
-            Ext::None => &[],
-        };
+    fn deflated_piece(p: Inflating, out: &[u8]) -> Rx<'_> {
+        let data = out.get(..p.produced).unwrap_or_default();
         Rx {
             consumed: p.consumed,
             event: Some(Event::Message {
@@ -1284,7 +1306,7 @@ impl<P: Role> Ws<P> {
     }
 
     /// A whole control frame has come.
-    fn control(&mut self, now: Instant, op: Op) -> Option<Event<'_>> {
+    fn control<'a>(&mut self, now: Instant, op: Op) -> Option<Event<'a>> {
         match op {
             Op::Ping => {
                 // one pong owed at a time: a second ping is dropped
@@ -1297,7 +1319,7 @@ impl<P: Role> Ws<P> {
                 // any pong says the peer is there: C's
                 // lws_validity_confirmed()
                 self.check = self.check.confirmed(now);
-                (self.ctl.len > 0).then(|| Event::Pong(self.ctl.payload()))
+                (self.ctl.len > 0).then_some(Event::Pong(self.ctl))
             }
             Op::Close => self.peer_close(now),
             Op::Continuation | Op::Text | Op::Binary => None,
@@ -1305,7 +1327,7 @@ impl<P: Role> Ws<P> {
     }
 
     /// The peer's close: C's handling of `LWSWSOPC_CLOSE`.
-    fn peer_close(&mut self, now: Instant) -> Option<Event<'_>> {
+    fn peer_close<'a>(&mut self, now: Instant) -> Option<Event<'a>> {
         match self.closing {
             // a second close changes nothing; nor is one answered while
             // the app's last goes
@@ -1343,7 +1365,7 @@ impl<P: Role> Ws<P> {
                 self.ping = None;
                 // after the peer's close, nothing more is read
                 self.parse = Parse::Stopped;
-                Some(Event::PeerClose(self.ctl.payload()))
+                Some(Event::PeerClose(self.ctl))
             }
         }
     }
@@ -1404,7 +1426,7 @@ impl<P: Role> Ws<P> {
 
     /// A control frame into what is in flight, masked as this end masks;
     /// `false` if the mask could not be drawn, which fails the connection.
-    fn queue_control(&mut self, op: Op, c: &Ctl) -> bool {
+    fn queue_control(&mut self, op: Op, c: &Control) -> bool {
         let Ok(mask) = self.role.next_mask() else {
             self.fail();
             return false;
@@ -1520,7 +1542,7 @@ impl<P: Role> Ws<P> {
     fn begin_close(&mut self, now: Instant, code: u16, reason: &[u8]) {
         if matches!(self.closing, Closing::None) {
             self.closing = Closing::WaitingToSend {
-                ctl: Ctl::close(code, reason),
+                ctl: Control::close(code, reason),
                 until: now.saturating_add(CLOSE_TIMEOUT),
             };
             self.check = Check::Off;
@@ -1688,7 +1710,7 @@ impl<P: Role> Ws<P> {
             // are owed, as C's writeable handling orders them; none goes
             // once a close has begun, which forgets it
             if let Some(payload) = self.ping.take() {
-                let mut c = Ctl::new();
+                let mut c = Control::new();
                 let _ = c.push(&payload);
                 if !self.queue_control(Op::Ping, &c) {
                     return written;
@@ -1720,7 +1742,7 @@ mod tests {
         let mut input = frames.to_vec();
         let mut at = 0;
         while at < input.len() {
-            let rx = ws.rx(T0, &mut input[at..]);
+            let rx = ws.rx(T0, &mut input[at..], &mut []);
             if rx.consumed == 0 {
                 break;
             }
@@ -1760,7 +1782,7 @@ mod tests {
         let mut ws = Ws::server(b"", T0);
         let mut a = *b"\x01\x81\0\0\0\0a";
         assert_eq!(
-            ws.rx(T0, &mut a).event,
+            ws.rx(T0, &mut a, &mut []).event,
             Some(Event::Message {
                 kind: Kind::Text,
                 data: b"a",
@@ -1770,7 +1792,7 @@ mod tests {
         );
         let mut b = *b"\x80\x81\0\0\0\0b";
         assert_eq!(
-            ws.rx(T0, &mut b).event,
+            ws.rx(T0, &mut b, &mut []).event,
             Some(Event::Message {
                 kind: Kind::Text,
                 data: b"b",
@@ -1828,7 +1850,7 @@ mod tests {
         input.copy_from_slice(frames);
         let mut at = 0;
         while at < input.len() {
-            let rx = ws.rx(T0, &mut input[at..]);
+            let rx = ws.rx(T0, &mut input[at..], &mut []);
             if rx.consumed == 0 {
                 break;
             }
@@ -1871,16 +1893,16 @@ mod tests {
     fn after_our_close_has_gone_anything_ends_it() {
         let mut ws = Ws::client(Zeros, T0);
         let mut bad = *b"\xc1\x05Hello";
-        assert_eq!(ws.rx(T0, &mut bad).consumed, bad.len());
+        assert_eq!(ws.rx(T0, &mut bad, &mut []).consumed, bad.len());
         // until our close has gone, what comes is dropped
         let mut more = *b"\x81\x00";
-        assert_eq!(ws.rx(T0, &mut more).consumed, 2);
+        assert_eq!(ws.rx(T0, &mut more, &mut []).consumed, 2);
         assert_eq!(ws.close(), None);
         let mut out = [0u8; 64];
         assert!(ws.tx(T0, &mut out, &mut Nothing) > 0);
         assert_eq!(ws.close(), None);
         let mut ack = *b"\x88\x02\x03\xe8";
-        assert_eq!(ws.rx(T0, &mut ack).consumed, 4);
+        assert_eq!(ws.rx(T0, &mut ack, &mut []).consumed, 4);
         assert_eq!(ws.close(), Some(Close::Release));
     }
 
@@ -1940,7 +1962,7 @@ mod tests {
     fn our_close_must_go_in_time() {
         let mut ws = Ws::server(b"", T0);
         let mut bad = *b"\x83\x80\0\0\0\0";
-        ws.rx(T0, &mut bad);
+        ws.rx(T0, &mut bad, &mut []);
         assert_eq!(ws.next_deadline(), Some(at(5)));
         ws.deadline_passed(at(4));
         assert_eq!(ws.close(), None);
@@ -1954,7 +1976,7 @@ mod tests {
     fn the_peers_answer_is_awaited_from_when_ours_went() {
         let mut ws = Ws::server(b"", T0);
         let mut bad = *b"\x83\x80\0\0\0\0";
-        ws.rx(T0, &mut bad);
+        ws.rx(T0, &mut bad, &mut []);
         assert_eq!(drain(&mut ws, at(3)), b"\x88\x09\x03\xeabad opc");
         assert_eq!(ws.next_deadline(), Some(at(8)));
         ws.deadline_passed(at(7));
@@ -1967,7 +1989,7 @@ mod tests {
     fn our_answer_to_the_peers_close_must_go_in_time() {
         let mut ws = Ws::server(b"", T0);
         let mut close = *b"\x88\x82\0\0\0\0\x03\xe8";
-        ws.rx(at(1), &mut close);
+        ws.rx(at(1), &mut close, &mut []);
         assert_eq!(ws.next_deadline(), Some(at(6)));
         ws.deadline_passed(at(6));
         assert_eq!(ws.close(), Some(Close::Abort));
@@ -2006,7 +2028,7 @@ mod tests {
         let mut msg = *b"\x81\x81\0\0\0\0a\x89\x80\0\0\0\0";
         let mut taken = 0;
         while taken < msg.len() {
-            let rx = ws.rx(at(30), &mut msg[taken..]);
+            let rx = ws.rx(at(30), &mut msg[taken..], &mut []);
             taken = taken.checked_add(rx.consumed).unwrap();
         }
         assert_eq!(drain(&mut ws, at(30)), b"\x8a\x00");
@@ -2028,7 +2050,7 @@ mod tests {
         ws.deadline_passed(at(40));
         drain(&mut ws, at(40));
         let mut pong = *b"\x8a\x80\0\0\0\0";
-        assert_eq!(ws.rx(at(45), &mut pong).event, None);
+        assert_eq!(ws.rx(at(45), &mut pong, &mut []).event, None);
         assert_eq!(ws.next_deadline(), Some(at(85)));
     }
 
@@ -2055,7 +2077,7 @@ mod tests {
         let mut ws = Ws::client(Zeros, T0);
         ws.deadline_passed(at(40));
         let mut close = *b"\x88\x02\x03\xe8";
-        ws.rx(at(40), &mut close);
+        ws.rx(at(40), &mut close, &mut []);
         assert_eq!(drain(&mut ws, at(40)), b"\x88\x82\0\0\0\0\x03\xe8");
     }
 
@@ -2067,14 +2089,14 @@ mod tests {
         assert_eq!(drain(&mut ws, at(2)), b"\x88\x02\x03\xe8");
         assert_eq!(ws.close(), Some(Close::Shutdown));
         let mut more = *b"\x81\x80\0\0\0\0";
-        assert_eq!(ws.rx(at(2), &mut more).event, None);
+        assert_eq!(ws.rx(at(2), &mut more, &mut []).event, None);
     }
 
     #[test]
     fn the_peers_close_during_ours_ends_it() {
         let mut ws = Ws::client(Zeros, T0);
         let mut bad = *b"\x83\x00";
-        ws.rx(T0, &mut bad);
+        ws.rx(T0, &mut bad, &mut []);
         drain(&mut ws, T0);
         ws.rx_closed(at(1));
         assert_eq!(ws.close(), Some(Close::Release));
