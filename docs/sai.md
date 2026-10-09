@@ -22,6 +22,8 @@ unix platform has one step, `scripts/sai.sh ${cmake}`.  Each configuration's
 | `miri-big-endian` | `miri s390x-unknown-linux-gnu` | fedora44 x86_64 | the tests pass on a big-endian machine, interpreted by Miri |
 | `miri-32bit` | `miri i686-unknown-linux-gnu` | fedora44 x86_64 | the tests pass where `usize` is 32 bits |
 | `c-oracle` | `oracle` | fedora44 x86_64 | C lws main-dev, built afresh, records the same transcripts npro holds |
+| `aws-lc` | `aws-lc` | fedora44 x86_64 | the npro-aws-lc workspace's gates (`scripts/aws-lc.sh`): its own cargo deny, fmt, clippy and tests |
+| `aws-lc-test` | `aws-lc-test` | every default platform | npro-aws-lc's tests natively: real tls 1.3 and 1.2 through npro-io's driver, aws-lc-rs as rustls' provider, AWS-LC's C compiled on the builder.  Windows is not yet among them: AWS-LC may want NASM or cmake there |
 | `fuzz` | `fuzz 60` | fuzz-debian13 x86_64 | no known bug still crashes, and a minute of libFuzzer on each fuzz target finds nothing new; two idle tasks carry on fuzzing in idle time, with the corpora in the `fuzz` pool ([fuzzing.md](fuzzing.md)) |
 
 How the C build's dimensions map here:
@@ -70,8 +72,8 @@ disk.
 
 | builder | configurations | needs |
 |---|---|---|
-| x86_64 and aarch64 Linux, riscv64, both macOS | `test` | rustup with stable (`--profile default`) |
-| fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle` | everything below |
+| x86_64 and aarch64 Linux, riscv64, both macOS | `test`, `aws-lc-test` | rustup with stable (`--profile default`), and a C compiler for AWS-LC |
+| fedora44 x86_64 | `gate`, `features`, `nostd`, `miri-*`, `c-oracle`, `aws-lc` | everything below |
 | freebsd/aarch64 | `test-freebsd` | `pkg install rust`, 1.85 or later; rustup has no FreeBSD aarch64 host |
 | fuzz-debian13 x86_64 | `fuzz`, and its idle tasks | rustup with stable and nightly, cargo-fuzz, cargo-deny, a C++ compiler and llvm-symbolizer, and an `idle` object for the platform in the builder's configuration: see below |
 | w11/x86_64 | `test-windows` | rustup with stable for the MSVC host, and an `env` for the platform in the builder's configuration: see below |

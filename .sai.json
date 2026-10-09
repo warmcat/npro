@@ -131,6 +131,22 @@
 		# it, sharing each slice (SAI_IDLE_SECS) between the targets in
 		# turn.  docs/fuzzing.md has the details.
 
+		# npro-aws-lc, npro with tls by rustls and aws-lc-rs: a workspace
+		# of its own, so none of aws-lc is in npro's gates.  Its gates on
+		# the gate builder, and its tests, real tls handshakes through
+		# npro-io's driver with aws-lc's C compiled there, natively on
+		# every default platform.  npro-io's rustls record layer is only
+		# tested with a provider here, so a change to npro-io can break
+		# these and not npro's own.
+
+		"aws-lc": {
+			"cmake":	"aws-lc",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+		"aws-lc-test": {
+			"cmake":	"aws-lc-test"
+		},
+
 		"fuzz": {
 			"cmake":	"fuzz 60",
 			"platforms":	"none, fuzz-linux-debian13/x86_64-amd/gcc",

@@ -15,6 +15,10 @@
 #                   with the copies in crates/npro-test/transcripts
 #   fuzz [secs]     libFuzzer over every fuzz target (scripts/fuzz.sh), in
 #                   CI and in sai's idle time, with the corpora in a pool
+#   aws-lc          the npro-aws-lc workspace's gates (scripts/aws-lc.sh):
+#                   its door, fmt, clippy and its tests
+#   aws-lc-test     the npro-aws-lc workspace's tests, natively here: real
+#                   tls through npro-io's driver, aws-lc's C compiled here
 #
 # Each profile first checks for the tools it uses and lists any that are
 # missing with their install commands; docs/sai.md says what each builder
@@ -146,6 +150,19 @@ oracle)
 	exit 1
 	;;
 
+aws-lc)
+	# aws-lc.sh checks its own tools
+	exec scripts/aws-lc.sh
+	;;
+
+aws-lc-test)
+	require_rust
+	require_cmd cc "a C compiler, for aws-lc-sys: your distro's gcc or clang"
+	require_done
+	cargo --version
+	exec cargo test --manifest-path npro-aws-lc/Cargo.toml --locked -j "$jobs"
+	;;
+
 fuzz)
 	# libFuzzer's line for every new unit and its periodic status would
 	# swamp the job log, as in C's fuzz job: keep its start, the final
@@ -157,7 +174,7 @@ fuzz)
 	;;
 
 *)
-	echo "usage: $0 gate | test | features | nostd | miri <target> | oracle | fuzz [secs]" >&2
+	echo "usage: $0 gate | test | features | nostd | miri <target> | oracle | fuzz [secs] | aws-lc | aws-lc-test" >&2
 	exit 1
 	;;
 esac

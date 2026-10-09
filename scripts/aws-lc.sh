@@ -20,8 +20,7 @@ require_rust
 require_cargo fmt "rustup component add rustfmt"
 require_cargo clippy "rustup component add clippy"
 require_cargo deny "cargo install --locked cargo-deny"
-command -v cc >/dev/null 2>&1 || _miss "a C compiler, cc" \
-	"your distro's gcc or clang"
+require_cmd cc "a C compiler, for aws-lc-sys: your distro's gcc or clang"
 require_done
 
 m=npro-aws-lc/Cargo.toml
