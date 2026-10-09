@@ -19,6 +19,11 @@
 //! done with the connection exactly where C closed it, its `close`.  It
 //! writes four bytes at a time, so every frame goes in pieces.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-core, npro-h1 and npro-ws"
+)]
+
 // held to clippy's rules for tests
 #[cfg(test)]
 mod ws_client_replay {

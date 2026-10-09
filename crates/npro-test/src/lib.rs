@@ -17,7 +17,7 @@
     test,
     expect(
         unused_crate_dependencies,
-        reason = "npro-core, npro-h1 and npro-ws are dev-dependencies for the tests in tests/, which the unit tests do not use"
+        reason = "npro-core, npro-h1, npro-ws and npro-io are dev-dependencies for the tests in tests/, which the unit tests do not use"
     )
 )]
 

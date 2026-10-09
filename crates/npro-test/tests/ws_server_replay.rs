@@ -15,6 +15,11 @@
 //! the app its `app_rx` bytes.  It writes four bytes at a time, as
 //! `ws-server-close-partial` has C do, so every frame here goes in pieces.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-core, npro-h1 and npro-ws"
+)]
+
 // held to clippy's rules for tests
 #[cfg(test)]
 mod ws_server_replay {
