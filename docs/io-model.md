@@ -203,6 +203,13 @@ device that pools tables wants it back: `accept_ws` can return it.
 
 ### The driver
 
+**Built (2026-10-09)** as below, but for two things learned building it:
+events come from `poll_rx()` a step at a time, a step possibly without
+an event, since today's borrow checker refuses returning a borrowed
+event from a loop that borrows the buffer again (NLL "problem case 3");
+and `want()` takes the application's payload source, since it pulls
+what there is to write.  tls is not in it yet.  The sketch as it was:
+
 ```rust
 pub struct Driver<B, S, R, T = Plain> {
     conn: Conn<S, R>,
@@ -300,11 +307,11 @@ in the driver's buffer.
 
 ### Answered by Andy, 2026-10-09
 
-- **Where `Conn` lives**: wherever lets a user write their own loop.
-  The driver already allows that, since it does no IO and needs no
-  feature; a crate of its own would also allow a loop that keeps its
-  own buffers and skips the driver.  Which of the two, and the crate's
-  name if it is its own, is still to settle (below).
+- **Where `Conn` lives**: in `npro-io`, beside the driver.  A user's own
+  loop is a fifth adapter over the driver, which does no IO and needs no
+  feature; a crate of its own would only serve a loop that skips the
+  driver and reimplements its buffers, close stages and tls, which is not
+  worth a crate.
 - **Events are exposed** (`poll_event`), and an `App` trait is a thin
   layer over them for whoever prefers callbacks.  The event is the
   lower level: a loop of the user's own, or a test, sees exactly what
@@ -404,14 +411,15 @@ then become sai tasks.
   user's own.
 - 2026-10-06: tests against C lws run locally until they pass, then
   move into sai.
+- 2026-10-09: `Conn` lives in `npro-io`; events are exposed, with a
+  callback trait over them; the driver owns the buffers; a role change
+  gives the header table's storage back.
 
 ## Open
 
 - The tls provider on desktop: graviola is the leading candidate, which
   needs its licence admitted.  What covers CPUs it does not, if anything.
 - tls on esp32, which follows from which world and which chip.
-- Whether `Conn` goes in `npro-io` or in a crate of its own, which needs
-  a name reserved on crates.io.
 - Admitting `mio`, `libc` and `windows-sys` (and whatever `cargo deny`
   shows they bring) when the `mio` adapter is written.  `libc` has a
   build script.

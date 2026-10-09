@@ -923,6 +923,19 @@ h1 client reading its body runs under a stale `AWAITING_SERVER_RESPONSE`
 that each read renews, and a body that stalls for 15s is a timeout.  By
 reading only; no C test shows it.  npro has no body timeout on the client.
 
+**The driver (done, 2026-10-09)**: `npro-io`, `no_std`.  First the roles
+were given what a driver needs of each: one `Close` in `npro-core`
+(`Shutdown`, a server's staged close; `Release`, a client's; `Abort`,
+dropping what is unwritten), the peer's close as an input on every role,
+ws events borrowing only the caller's buffers, and the h1 roles giving
+their header table's storage back.  Then `npro_io::conn::Conn`, one
+connection whatever its role, with the h1 to ws changes, and
+`npro_io::driver::Driver`, holding it and its buffers, its close stages
+with C's deadlines, and saying what IO it wants.  All 46 transcripts the
+roles replay also replay through the driver over an in-memory adapter
+writing four bytes at a time.  Next: the threads adapter on std TCP,
+then the examples, autobahn and the runs against C.
+
 Still not in the protocol crates: an h1 client's kept-warm `IDLING`
 (`CLIENT_CONN_IDLE`), which comes with the client's keep-alive; the
 staged shutdown's `SHUTDOWN_FLUSH`, and the IO side's connect and tls

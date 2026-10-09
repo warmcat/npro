@@ -1,0 +1,64 @@
+--- docs/sai.md
++++ docs/sai.md
+@@ -133,25 +130,49 @@ PowerShell: there `set` makes a PowerShell variable, not an environment
+ variable, and rustup then installs under `%USERPROFILE%` as usual.  The
+ installer ends by printing where it installed; it should say `C:\rust`.
+ 
+-then add `C:\rust\cargo\bin` to the system `PATH` (System Properties →
+-Environment Variables), and reboot: services only see a changed system
+-environment after one.
+-
+-The service's account must be able to read `C:\rust\rustup` and write
+-`C:\rust\cargo`, where cargo keeps its package cache and the lock on it.
+-Find the account with
+-`Get-CimInstance Win32_Service | ? Name -like '*sai*' | select Name, StartName`.
+-`LocalSystem` can already do both.  For an ordinary account, here `sai`:
++The account the jobs run as must be able to read `C:\rust\rustup` and
++write `C:\rust\cargo`, where cargo keeps its package cache and the lock on
++it.  For an ordinary account, here `sai`:
+ 
+ ```powershell
+ icacls C:\rust\rustup /grant 'sai:(OI)(CI)RX' /T
+ icacls C:\rust\cargo /grant 'sai:(OI)(CI)M' /T
+ ```
+ 
++Then give the platform an `env` in the builder's configuration file.  It
++is JSON, so every backslash is doubled: a single one is read as an escape,
++and `\r` in `C:\rust\rustup` becomes a carriage return.
++
++```json
++{
++	"name":	"w11/x86_64-amd/msvc",
++	"env": [
++		"PATH=c:\\rust\\cargo\\bin;c:\\Windows\\System32;c:\\Windows",
++		"RUSTUP_HOME=c:\\rust\\rustup",
++		"CARGO_HOME=c:\\rust\\cargo",
++		"SystemRoot=c:\\Windows",
++		"TEMP=c:\\Users\\sai.sai-vm\\AppData\\Local\\Temp",
++		"TMP=c:\\Users\\sai.sai-vm\\AppData\\Local\\Temp"
++	],
++	...
++}
++```
++
++- `PATH`: rustup's `cargo` first, then the system's own programs.
++- `RUSTUP_HOME`, `CARGO_HOME`: without them `cargo` looks for its
++  toolchains under the profile, and finds none.
++- `SystemRoot`: much of Win32, sockets and crypto among it, fails
++  without it.
++- `TEMP`, `TMP`: where rustc and `link.exe` write temporary files.  They
++  must be in the profile of the account the jobs run as, which need not
++  be named after it: here the jobs run in `C:\Users\sai.sai-vm`, and
++  `link.exe` failed with `LNK1104: cannot open file '...\Temp\lnk{...}.tmp'`
++  while they pointed at `C:\Users\sai`.
++
+ The linker is MSVC's `link.exe`, from the Visual Studio Build Tools the
+-builder already has for building C lws.  `rustup-init.exe` warns if it
+-cannot find them.  As the service's account (or in a new administrator
+-`cmd`), `cargo --version` should then print 1.85 or later.
++builder already has for building C lws.  rustc finds Visual Studio
++itself, so none of its variables (`LIB`, `INCLUDE`, `VCINSTALLDIR`) are
++needed in `env`.
+ 
+ ### Checking a builder
+ 
