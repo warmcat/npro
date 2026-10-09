@@ -141,7 +141,9 @@ adapter's loop against it.
 
 The driver holds one connection whatever its role, and what it holds has
 to answer the same questions.  Four changes to the protocol crates come
-before the driver, each its own commit:
+before the driver, each its own commit.  The first three are done
+(2026-10-09), with `into_storage()` on the h1 roles for `accept_ws`; the
+fourth is the driver's own:
 
 1. **One `Close`.**  The h1 server's and ws' `Close` are the same two
    asks, `Shutdown` (stop sending once what was written has gone, then
