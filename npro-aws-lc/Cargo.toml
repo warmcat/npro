@@ -1,0 +1,34 @@
+# npro bound to aws-lc for tls: rustls through npro-io's record layer, with
+# aws-lc-rs as rustls' crypto provider.
+#
+# A workspace of its own, with its own Cargo.lock and deny.toml, so that
+# aws-lc, its C and the build tools it needs never enter npro's graph:
+# npro depends on no crypto provider, and builds where aws-lc cannot (an
+# esp32).  Whatever wants npro with aws-lc builds against this.  See
+# docs/io-model.md, "tls".
+
+[package]
+name         = "npro-aws-lc"
+description  = "npro with tls by rustls, its crypto provider aws-lc-rs"
+version      = "0.0.0"
+publish      = false
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT"
+
+[dependencies]
+npro-io  = { path = "../crates/npro-io", features = ["rustls"] }
+# aws-lc-rs as rustls' provider, and std for rustls' clock and its config
+# builders: docs/dependencies.md, "The npro-aws-lc workspace"
+rustls   = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+
+[dev-dependencies]
+npro-core = { path = "../crates/npro-core" }
+npro-h1   = { path = "../crates/npro-h1" }
+
+[lints.rust]
+unsafe_code     = "forbid"
+missing_docs    = "deny"
+unexpected_cfgs = "deny"
+
+[workspace]

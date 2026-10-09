@@ -130,6 +130,31 @@ its `Arc`, so not on the M0 or riscv32imc that sai builds for.
 ISC and BSD-3-Clause were admitted with them: both are permissive, as
 MIT is, and ask only that the notice is kept.
 
+### The npro-aws-lc workspace
+
+`npro-aws-lc/` is npro with tls by rustls, its crypto provider aws-lc-rs,
+which Andy chose (2026-10-09, [io-model.md](io-model.md), "tls").  A
+workspace of its own, with its own `Cargo.lock` and `deny.toml`, as
+`fuzz/` is: aws-lc's C and the tools that build it never enter npro's
+graph, npro depends on no provider, and builds where aws-lc cannot, an
+esp32 among them.  What wants npro with aws-lc builds against this.  It
+holds the tests of npro-io's rustls record layer with a real provider;
+`scripts/aws-lc.sh` checks its door and runs them.  Not published yet.
+
+Its door admits npro's crates and their opt-in features' crates, as the
+main workspace's does, and:
+
+| crate | why | build script | unsafe | licence |
+|---|---|---|---|---|
+| `aws-lc-rs` 1.18 | rustls' crypto provider, AWS's, and rustls' default.  Maintained by AWS, actively; has a FIPS-validated build | finds aws-lc-sys' build and probes the compiler; no network | the bindings to AWS-LC | ISC AND (Apache-2.0 OR ISC) |
+| `aws-lc-sys` 0.45 | AWS-LC itself, BoringSSL's descendant, its C and assembly carried in the crate (about 69MB of source) | compiles AWS-LC with `cc`, or `cmake` where needed; no network.  Its perlasm generators, and its Windows prebuilt-NASM script, are never run on Linux: the assembly comes ready generated.  Those 70 scripts are admitted by glob in its `deny.toml` | FFI, by nature | ISC AND Apache-2.0 AND MIT AND BSD-3-Clause, with alternatives: **Apache-2.0** is admitted here for it |
+| `cc`, `cmake`, `find-msvc-tools`, `jobserver`, `shlex`, `pkg-config`, `dunce`, `fs_extra` | aws-lc-sys' build script's tools: compiling C, running cmake, finding a system AWS-LC, paths and files | none | `cc` and `jobserver` some | MIT or Apache-2.0 among others (`fs_extra` MIT; `dunce` CC0-1.0 OR MIT-0 OR Apache-2.0) |
+| `libc` | `jobserver`, `cc` | probes the rustc version, no network | the C bindings it is for | MIT or Apache-2.0 |
+| `getrandom`, `r-efi`, `cfg-if` | `jobserver` on Windows | `getrandom`'s probes the target, no network | `getrandom`'s syscalls | MIT or Apache-2.0 among others |
+
+All but aws-lc-rs and aws-lc-sys run only at build time, on the machine
+building.  They were admitted in the commit adding the workspace.
+
 ### The fuzz workspace
 
 `fuzz/` builds the libFuzzer targets ([fuzzing.md](fuzzing.md)) and

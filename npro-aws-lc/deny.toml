@@ -1,0 +1,121 @@
+# cargo deny for the npro-aws-lc workspace: what may enter npro bound to
+# aws-lc.
+#
+# This is the same door as the main workspace's deny.toml, for a separate
+# graph: aws-lc's C and what builds it never enter npro's own.  Each
+# admitted crate has its entry in the npro-aws-lc section of
+# docs/dependencies.md.  scripts/aws-lc.sh runs this check before it builds
+# anything.
+#
+#   cargo deny --manifest-path npro-aws-lc/Cargo.toml check --config npro-aws-lc/deny.toml
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# npro's, and for rustls the main workspace's ISC and BSD-3-Clause.
+# Apache-2.0 for aws-lc: aws-lc-sys' licence asks for it with the others,
+# not as an alternative to them.
+allow = ["MIT", "ISC", "BSD-3-Clause", "Apache-2.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+wildcards         = "deny"
+allow-wildcard-paths = true
+
+allow = [
+	# this workspace, and npro's crates it builds on
+	"npro-aws-lc",
+	"npro-core",
+	"npro-h1",
+	"npro-ws",
+	"npro-io",
+
+	# npro-io's features, as the main workspace admits them
+	"miniz_oxide",
+	"adler2",
+	"rustls",
+	"rustls-pki-types",
+	"rustls-webpki",
+	"untrusted",
+	"subtle",
+	"zeroize",
+	"once_cell",
+
+	# aws-lc-rs, rustls' provider, and AWS-LC's C, which aws-lc-sys carries
+	# and compiles
+	"aws-lc-rs",
+	"aws-lc-sys",
+
+	# what aws-lc-sys' build script compiles AWS-LC with, by cc or by cmake
+	"cc",
+	"cmake",
+	"find-msvc-tools",
+	"jobserver",
+	"libc",
+	"shlex",
+	"pkg-config",
+	"dunce",
+	"fs_extra",
+	# jobserver's, on Windows
+	"getrandom",
+	"r-efi",
+	"cfg-if",
+]
+
+[bans.build]
+allow-build-scripts = [
+	"rustls",
+	# compiles AWS-LC's C and assembly, carried in the crate, with cc or
+	# cmake; no network
+	"aws-lc-sys",
+	# finds aws-lc-sys' build, and probes the compiler
+	"aws-lc-rs",
+	# probe the rustc version and target, no network
+	"libc",
+	"getrandom",
+]
+executables = "deny"
+interpreted = "deny"
+include-dependencies = true
+include-workspace = true
+include-archives = true
+
+[[bans.build.bypass]]
+crate = "untrusted"
+allow = [
+	{ path = "mk/cargo.sh", checksum = "766c00df2767ac0998000e9b55d076b6dbbeb05ecf4c4d9b317df8551fae1bbe" },
+	{ path = "mk/install-build-tools.sh", checksum = "90ec3cce41b1660b5103a37803e537ff167bae17badaca2d89f492116555919d" },
+	{ path = "mk/runner", checksum = "471602c60f4243f87ebf952f8e69c07dfa29d8c69f2ef3885a4c61a2d6bf3b33" },
+]
+
+# aws-lc-sys carries AWS-LC's perlasm generators, which made the
+# assembly it ships ready generated, so a build never runs perl; and its
+# maintainers' prebuilt-NASM script, for Windows, never run by the build
+# script on other platforms.  aws-lc-rs carries its maintainers' test and
+# CI scripts.  Admitted by glob, there being 70 of them in AWS-LC's tree,
+# each glob the narrowest that names them.
+[[bans.build.bypass]]
+crate = "aws-lc-sys"
+allow-globs = [
+	"aws-lc/crypto/*/asm/*.pl",
+	"aws-lc/crypto/fipsmodule/*/asm/*.pl",
+	"aws-lc/crypto/perlasm/*.pl",
+	"aws-lc/crypto/test/asm/*.pl",
+	"builder/prebuilt-nasm.sh",
+]
+
+[[bans.build.bypass]]
+crate = "aws-lc-rs"
+allow-globs = [
+	"scripts/*.sh",
+	"util/*.rs",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"

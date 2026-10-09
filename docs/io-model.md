@@ -363,6 +363,11 @@ rustls needs `alloc`, and around 16 KiB of record buffer per direction.
   is npro being consumed like that.
 - So graviola, below, is no longer the lead: what is found about
   providers is for whoever binds one.
+- **The aws-lc binding is its own crate, detachable**: `npro-aws-lc/`, a
+  workspace of its own in this repository, as `fuzz/` is, with its own
+  `Cargo.lock` and `deny.toml`, so nothing of aws-lc enters npro's graph,
+  and npro builds where aws-lc cannot.  Not published yet, so its name is
+  not yet reserved; it can move to a repository of its own as it is.
 
 ### The crypto provider
 
@@ -434,11 +439,6 @@ then become sai tasks.
 
 ## Open
 
-- Where the binding to aws-lc lives (`npro-aws-lc` or so): in this
-  repository as a workspace of its own, as `fuzz/` is, with its own
-  `Cargo.lock` and `deny.toml` so none of it enters npro's graph, or a
-  repository of its own.  It is where tls is tested against C with a
-  real provider, and its name needs reserving.
 - tls on esp32, which follows from which world and which chip.
 - Admitting `mio`, `libc` and `windows-sys` (and whatever `cargo deny`
   shows they bring) when the `mio` adapter is written.  `libc` has a
