@@ -789,6 +789,24 @@ impl<P: Role> Ws<P> {
         }
     }
 
+    /// The peer closed its side, at `now`: C's zero-length rx.  Nothing more
+    /// is read.  An open connection begins our close with 1000, as C's
+    /// close sends one even then (RFC 6455 7.1.1), and once it has gone,
+    /// closes in good order, there being no ack to wait for.  One whose
+    /// close was under way closes in good order now, as C gives up "the
+    /// polite way", unless the application's last message is still going.
+    pub fn rx_closed(&mut self, now: Instant) {
+        self.parse = Parse::Stopped;
+        match self.closing {
+            Closing::None => self.begin_close(now, 1000, b""),
+            Closing::AwaitingAck { .. } | Closing::Returned { .. } => {
+                self.pong = None;
+                self.closing = Closing::Closed(self.role.side().polite_close());
+            }
+            Closing::WaitingToSend { .. } | Closing::Flushing { .. } | Closing::Closed(_) => {}
+        }
+    }
+
     /// Takes bytes from the peer at `now`: see [`Event`].  A frame's
     /// payload is unmasked where it lies in `input`.
     pub fn rx<'a>(&'a mut self, now: Instant, input: &'a mut [u8]) -> Rx<'a> {
@@ -1622,9 +1640,14 @@ impl<P: Role> Ws<P> {
                     if !self.queue_control(Op::Close, &ctl) {
                         return written;
                     }
-                    // C's PENDING_TIMEOUT_CLOSE_ACK, from when it went
-                    self.closing = Closing::AwaitingAck {
-                        until: now.saturating_add(CLOSE_TIMEOUT),
+                    self.closing = if self.parse == Parse::Stopped {
+                        // the peer closed its side: no ack can be read
+                        Closing::Closed(self.role.side().polite_close())
+                    } else {
+                        // C's PENDING_TIMEOUT_CLOSE_ACK, from when it went
+                        Closing::AwaitingAck {
+                            until: now.saturating_add(CLOSE_TIMEOUT),
+                        }
                     };
                     continue;
                 }
@@ -2034,5 +2057,26 @@ mod tests {
         let mut close = *b"\x88\x02\x03\xe8";
         ws.rx(at(40), &mut close);
         assert_eq!(drain(&mut ws, at(40)), b"\x88\x82\0\0\0\0\x03\xe8");
+    }
+
+    #[test]
+    fn the_peers_close_has_ours_sent_then_ends_without_an_ack() {
+        let mut ws = Ws::server(b"", T0);
+        ws.rx_closed(at(1));
+        assert_eq!(ws.next_deadline(), Some(at(6)));
+        assert_eq!(drain(&mut ws, at(2)), b"\x88\x02\x03\xe8");
+        assert_eq!(ws.close(), Some(Close::Shutdown));
+        let mut more = *b"\x81\x80\0\0\0\0";
+        assert_eq!(ws.rx(at(2), &mut more).event, None);
+    }
+
+    #[test]
+    fn the_peers_close_during_ours_ends_it() {
+        let mut ws = Ws::client(Zeros, T0);
+        let mut bad = *b"\x83\x00";
+        ws.rx(T0, &mut bad);
+        drain(&mut ws, T0);
+        ws.rx_closed(at(1));
+        assert_eq!(ws.close(), Some(Close::Release));
     }
 }

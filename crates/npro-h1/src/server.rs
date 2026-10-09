@@ -370,6 +370,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         self.phase = Phase::Closed(close);
     }
 
+    /// The peer closed its side: C's zero-length rx, which its h1 server
+    /// answers by closing.  What the connection already composed goes, then
+    /// it shuts down; payload the application has yet to give is not
+    /// asked for.
+    pub const fn rx_closed(&mut self) {
+        match self.phase {
+            Phase::Head(_) | Phase::Request(_) | Phase::Refusing(_) => {
+                self.phase = Phase::Closed(Close::Shutdown);
+            }
+            Phase::Closed(_) => {}
+        }
+    }
+
     /// Takes bytes from the peer, at `now`: see [`Event`].
     pub fn rx<'a>(&mut self, now: Instant, input: &'a [u8]) -> Rx<'a> {
         let held = Rx {
@@ -1221,5 +1234,20 @@ mod tests {
         s.deadline_passed(at(30));
         assert_eq!(s.close(), Some(Close::Abort));
         assert!(!s.wants_write());
+    }
+
+    #[test]
+    fn the_peers_close_shuts_down_after_what_was_composed() {
+        let mut s = server();
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        s.respond(OK2).unwrap();
+        s.rx_closed();
+        assert_eq!(s.close(), Some(Close::Shutdown));
+        assert_eq!(s.next_deadline(), None);
+        // the head goes, the payload is not asked for
+        let mut out = [0u8; 256];
+        let tx = s.tx(T0, &mut out, &mut Text(b"ok"));
+        assert!(out[..tx.written].ends_with(b"\r\n\r\n"));
+        assert!(!tx.more);
     }
 }
