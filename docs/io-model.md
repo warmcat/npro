@@ -296,18 +296,30 @@ in the driver's buffer.
 
 **Your own loop**: what mio's loop does, with your poll.
 
-### Open, for Andy
+### Answered by Andy, 2026-10-09
 
-- `Conn` as an enum in `npro-io`, as agreed, or in a crate of its own
-  that `npro-io` and a user's own loop both use without the driver.
-- Events returned (`poll_event`) rather than an `App` trait called by
-  the driver.  A trait could be a thin layer over it.
-- The driver owning the rx and tx buffers, against handing the adapter
-  the bytes and asking how many were taken, which would save embassy a
-  copy without tls.
-- Whether `accept_ws` gives the header table's storage back.
-- The four protocol changes above, change 3 especially: it moves the pmd
-  output buffer out of the codec and changes `Ws::rx`.
+- **Where `Conn` lives**: wherever lets a user write their own loop.
+  The driver already allows that, since it does no IO and needs no
+  feature; a crate of its own would also allow a loop that keeps its
+  own buffers and skips the driver.  Which of the two, and the crate's
+  name if it is its own, is still to settle (below).
+- **Events are exposed** (`poll_event`), and an `App` trait is a thin
+  layer over them for whoever prefers callbacks.  The event is the
+  lower level: a loop of the user's own, or a test, sees exactly what
+  happened, in order, with no callback re-entering the library.
+- **The driver owns the buffers.**  Secure Streams, the user's API,
+  hands user code a buffer the core owns, to read or to fill, either
+  way, which is the same ownership.
+- **`accept_ws` gives the header table's storage back.**  In C the ah is
+  dropped when the user returns from ESTABLISHED, the last time user
+  code sees the headers; the request event is that time here.
+
+Found doing change 1: there are three asks, not two.  C closes a client
+after flushing what it wrote, with no staged shutdown, and a timed-out
+or failed connection with nothing more written.  So `Close` is
+`Shutdown` (a server: flush, half-close, wait for the FIN), `Release`
+(flush, then close) and `Abort` (close now, dropping what is unwritten,
+as C's unusable socket).
 
 ## tls
 
@@ -396,8 +408,8 @@ then become sai tasks.
 - The tls provider on desktop: graviola is the leading candidate, which
   needs its licence admitted.  What covers CPUs it does not, if anything.
 - tls on esp32, which follows from which world and which chip.
-- The driver's interface: sketched above, with its own open questions,
-  for review before it is built.
+- Whether `Conn` goes in `npro-io` or in a crate of its own, which needs
+  a name reserved on crates.io.
 - Admitting `mio`, `libc` and `windows-sys` (and whatever `cargo deny`
   shows they bring) when the `mio` adapter is written.  `libc` has a
   build script.
