@@ -24,6 +24,7 @@ use npro_h1::table::MAX_CAPACITY;
 use npro_h1::token::Token;
 use npro_io::conn::{Conn, Event as ConnEvent, Role, RoleMut};
 use npro_io::driver::{Buffers, Driver, NetBuffers, Parts, Want};
+use npro_io::host::Host;
 use npro_io::tls::{NoTls, RecordLayer};
 use npro_ws::conn::{self as ws, Ws};
 use npro_ws::handshake::{self, MAX_101};
@@ -201,17 +202,9 @@ impl core::fmt::Display for AcceptError {
 
 impl core::error::Error for AcceptError {}
 
-/// An id whose stream or connection is gone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Gone;
-
-impl core::fmt::Display for Gone {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("no such stream or connection")
-    }
-}
-
-impl core::error::Error for Gone {}
+/// An id whose stream or connection is gone: the adapter's, as a
+/// [`Host`]'s.
+pub use npro_io::host::Gone;
 
 /// What the application asks of a stream: each method on [`Ss`] that acts
 /// on one is [`Ss::call`] with one of these, the value a stream's calls
@@ -750,6 +743,62 @@ where
             }
         }
         None
+    }
+}
+
+/// The adapter's side of [`Ss`], for an adapter carrying any host, as
+/// npro-io's threads adapter does: each is the method of the same name.
+impl<U, S, R, T> Host for Ss<'_, U, S, R, T>
+where
+    U: Default,
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+    T: RecordLayer,
+{
+    type Listener = ListenerId;
+    type Conn = ConnId;
+    type Tls = T;
+    type Refused = AcceptError;
+
+    fn accepted(
+        &mut self,
+        now: Instant,
+        listener: ListenerId,
+        tls: Option<T>,
+    ) -> Result<ConnId, AcceptError> {
+        Ss::accepted(self, now, listener, tls)
+    }
+
+    fn want(&mut self, now: Instant, conn: ConnId) -> Result<Want<'_>, Gone> {
+        Ss::want(self, now, conn)
+    }
+
+    fn read_done(&mut self, now: Instant, conn: ConnId, n: usize) -> Result<(), Gone> {
+        Ss::read_done(self, now, conn, n)
+    }
+
+    fn received(&mut self, now: Instant, conn: ConnId, bytes: &[u8]) -> Result<usize, Gone> {
+        Ss::received(self, now, conn, bytes)
+    }
+
+    fn write_done(&mut self, now: Instant, conn: ConnId, n: usize) -> Result<(), Gone> {
+        Ss::write_done(self, now, conn, n)
+    }
+
+    fn half_closed(&mut self, now: Instant, conn: ConnId) -> Result<(), Gone> {
+        Ss::half_closed(self, now, conn)
+    }
+
+    fn timer(&mut self, now: Instant, conn: ConnId) -> Result<(), Gone> {
+        Ss::timer(self, now, conn)
+    }
+
+    fn hangup(&mut self, now: Instant, conn: ConnId) -> Result<(), Gone> {
+        Ss::hangup(self, now, conn)
+    }
+
+    fn released(&mut self, conn: ConnId) -> Result<(), Gone> {
+        Ss::released(self, conn)
     }
 }
 

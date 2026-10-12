@@ -19,6 +19,8 @@ npro-io.workspace   = true
 
 [dev-dependencies]
 npro-core = { workspace = true, features = ["replay"] }
+# the threads adapter, to carry the streams over real sockets in its tests
+npro-io = { workspace = true, features = ["std"] }
 
 [features]
 # permessage-deflate on ws streams: needs alloc, as npro-ws' pmd does

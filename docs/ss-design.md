@@ -326,6 +326,11 @@ Not yet, in this half:
 - there is no `until` across all connections: the adapter keeps the
   earliest of each connection's.
 
+`Ss` is a `npro_io::host::Host`, so npro-io's threads adapter carries its
+streams over real sockets (2026-10-12): its tests serve h1 over TCP and
+a unix domain socket, echo ws, send an answer far larger than the
+buffers, and take more clients than there are slots.
+
 Tests: C's server transcripts (h1, ws, permessage-deflate) replay
 through an accepted stream as they do through the driver; unit tests
 for the rest; and the `ss-server` fuzz target, which drives the streams
