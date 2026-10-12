@@ -363,6 +363,51 @@ impl<S, R, B, T> Driver<S, R, B, T> {
             Wire::Tls(t) => Some(&t.layer),
         }
     }
+
+    /// The driver done with, taken apart: the connection, the buffers and,
+    /// over tls, the record layer and its buffers, so storage the caller
+    /// gave can carry the next connection.  What the buffers held is
+    /// dropped with them.
+    ///
+    /// ```
+    /// use npro_core::random::SeededRandom;
+    /// use npro_core::time::Instant;
+    /// use npro_h1::Storage;
+    /// use npro_h1::server::{Config, Server};
+    /// use npro_io::conn::Conn;
+    /// use npro_io::driver::{Buffers, Driver};
+    ///
+    /// let now = Instant::from_micros(1_000_000);
+    /// let s = Server::new(Storage { table: vec![0u8; 1024], out: vec![0u8; 512] }, Config::default(), now)?;
+    /// let conn: Conn<_, SeededRandom> = Conn::h1_server(s);
+    /// let d = Driver::new(conn, Buffers { rx: vec![0u8; 256], tx: vec![0u8; 256], inflate: Vec::new() });
+    /// let parts = d.into_parts();
+    /// assert_eq!(parts.bufs.rx.len(), 256);
+    /// assert!(parts.tls.is_none());
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_parts(self) -> Parts<S, R, B, T> {
+        Parts {
+            conn: self.conn,
+            bufs: self.bufs,
+            tls: match self.wire {
+                Wire::Plain => None,
+                Wire::Tls(t) => Some((t.layer, t.net)),
+            },
+        }
+    }
+}
+
+/// A driver taken apart: [`Driver::into_parts`].
+#[derive(Clone, Debug)]
+pub struct Parts<S, R, B, T> {
+    /// The connection.
+    pub conn: Conn<S, R>,
+    /// Its buffers.
+    pub bufs: Buffers<B>,
+    /// Over tls, the record layer and the buffers of its records.
+    pub tls: Option<(T, NetBuffers<B>)>,
 }
 
 impl<S, R, B, T> Driver<S, R, B, T>
@@ -382,6 +427,21 @@ where
     /// [`Driver::want`] pulls: C's `lws_callback_on_writable()`.
     pub const fn request_write(&mut self) {
         self.write = Write::Wanted;
+    }
+
+    /// Whether a pull now would have room for the application's payload:
+    /// the connection is live, over tls the handshake is done, and the tx
+    /// buffer is not full.  For a caller deciding whether to offer its
+    /// application the chance to write, as C's `POLLOUT` does, rather
+    /// than leaving it to [`Driver::want`].
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        let up = match &self.wire {
+            Wire::Plain => true,
+            Wire::Tls(t) => t.handshake == Handshake::Done,
+        };
+        let held = self.tx.end.saturating_sub(self.tx.start);
+        up && self.stage == Stage::Live && held < self.bufs.tx.as_ref().len()
     }
 
     /// Lets go of what the last step took.
@@ -1264,6 +1324,52 @@ mod tests {
     }
 
     #[test]
+    fn writable_while_live_with_room_in_the_tx_buffer() {
+        let mut d = server(256, 64);
+        assert!(d.is_writable());
+        read(&mut d, T0, &mut nothing(), b"GET / HTTP/1.1\r\n\r\n");
+        while let Some(mut step) = d.poll_rx(T0) {
+            let RoleMut::H1Server(s) = step.conn().role_mut() else {
+                panic!("not h1");
+            };
+            if s.is_awaiting_answer() {
+                s.respond(Response {
+                    status: 200,
+                    content_type: None,
+                    content_length: Some(200),
+                    headers: &[],
+                })
+                .unwrap();
+            }
+        }
+        // the head and payload fill the tx buffer: no room until some went
+        let mut big = Text(vec![b'x'; 200]);
+        d.request_write();
+        let Want::Io(io) = d.want(T0, &mut big) else {
+            panic!("not io");
+        };
+        assert_eq!(io.write.map(<[u8]>::len), Some(64));
+        assert!(!d.is_writable());
+        d.write_done(T0, 1);
+        assert!(d.is_writable());
+        // closing, it is not
+        d.hangup(T0);
+        assert!(!d.is_writable());
+    }
+
+    #[test]
+    fn taken_apart_the_buffers_come_back() {
+        let mut d = server(32, 48);
+        read(&mut d, T0, &mut nothing(), b"GET / HTTP/1.1\r\n\r\n");
+        d.hangup(T0);
+        assert!(matches!(d.want(T0, &mut nothing()), Want::Release(_)));
+        let p = d.into_parts();
+        assert_eq!((p.bufs.rx.len(), p.bufs.tx.len()), (32, 48));
+        let storage = p.conn.into_storage().unwrap();
+        assert_eq!((storage.table.len(), storage.out.len()), (1024, 512));
+    }
+
+    #[test]
     fn a_switched_connection_carries_raw_bytes_from_the_ones_behind_its_head() {
         let mut d = server(256, 256);
         let mut app = nothing();
@@ -1776,6 +1882,19 @@ mod tls_tests {
             s.want(at, &mut Text(Vec::new())),
             Want::Release(Outcome::Dropped)
         ));
+    }
+
+    #[test]
+    fn not_writable_before_the_handshake_and_the_layer_comes_back() {
+        let s = tls(server(), Toy::new(Side::Server));
+        assert!(!s.is_writable());
+        let mut e = tls(server(), Toy::established(Side::Server));
+        e.want(T0, &mut Text(Vec::new()));
+        assert!(e.is_writable());
+        let p = e.into_parts();
+        let (layer, net) = p.tls.unwrap();
+        assert!(layer.is_established());
+        assert_eq!(net.rx.len(), 256);
     }
 
     #[test]

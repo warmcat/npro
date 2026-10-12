@@ -193,6 +193,35 @@ impl<S, R> Conn<S, R> {
         }
     }
 
+    /// The connection done with, its h1 role's storage back, as
+    /// [`Server::into_storage`] gives it; `None` once the role changed,
+    /// since the change gave it back then.
+    ///
+    /// ```
+    /// use npro_core::random::SeededRandom;
+    /// use npro_core::time::Instant;
+    /// use npro_h1::Storage;
+    /// use npro_h1::server::{Config, Server};
+    /// use npro_io::conn::Conn;
+    ///
+    /// let now = Instant::from_micros(1_000_000);
+    /// let s = Server::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Config::default(), now)?;
+    /// let conn: Conn<_, SeededRandom> = Conn::h1_server(s);
+    /// assert!(conn.into_storage().is_some());
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_storage(self) -> Option<Storage<S>>
+    where
+        S: AsRef<[u8]> + AsMut<[u8]>,
+    {
+        match self.inner {
+            Inner::H1Server(s) => Some(s.into_storage()),
+            Inner::H1Client(c) => Some(c.into_storage()),
+            Inner::WsServer(_) | Inner::WsClient(_) | Inner::Raw(_) => None,
+        }
+    }
+
     /// The role, to look at.
     #[must_use]
     pub const fn role(&self) -> Role<'_, S, R> {
