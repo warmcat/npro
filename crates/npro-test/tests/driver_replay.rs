@@ -279,31 +279,28 @@ mod driver_replay {
                 };
                 progress = true;
                 match step.event() {
-                    Some(Event::H1Server(H1s::Request)) => {
+                    Event::H1Server(H1s::Request) => {
                         app.request(step.conn(), now);
                         step.request_write();
                     }
-                    Some(Event::H1Client(H1c::Response)) => {
+                    Event::H1Client(H1c::Response) => {
                         app.response(step.conn(), now);
                         step.request_write();
                     }
-                    Some(Event::H1Client(H1c::Body(b))) => app.app_rx.extend_from_slice(b),
-                    Some(Event::H1Server(H1s::Body(_))) if app.h1 == H1Next::Body => {
+                    Event::H1Client(H1c::Body(b)) => app.app_rx.extend_from_slice(b),
+                    Event::H1Server(H1s::Body(_)) if app.h1 == H1Next::Body => {
                         app.answer(step.conn(), 3, b"ok\n");
                         step.request_write();
                     }
-                    Some(Event::Ws(WsEvent::Message { data, last, .. })) => {
+                    Event::Ws(WsEvent::Message { data, last, .. }) => {
                         app.message(step.conn(), now, data, last);
                         step.request_write();
                     }
-                    Some(
-                        Event::H1Server(H1s::Body(_) | H1s::BodyEnd)
-                        | Event::H1Client(H1c::BodyEnd)
-                        | Event::Ws(WsEvent::Pong(_) | WsEvent::PeerClose(_))
-                        // no transcript has the raw role
-                        | Event::Raw(_),
-                    )
-                    | None => {}
+                    Event::H1Server(H1s::Body(_) | H1s::BodyEnd)
+                    | Event::H1Client(H1c::BodyEnd)
+                    | Event::Ws(WsEvent::Pong(_) | WsEvent::PeerClose(_))
+                    // no transcript has the raw role
+                    | Event::Raw(_) => {}
                 }
             }
             if let Want::Io(io) = d.want(now, app) {

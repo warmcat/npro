@@ -178,7 +178,7 @@ fn get(mut c: C<RustlsClient>, mut s: C<RustlsServer>) -> Run {
     for _ in 0..100 {
         wire.extend(carry(&mut c, &mut csrc, &mut s, &mut ssrc));
         while let Some(mut step) = s.poll_rx(T0) {
-            if step.event() == Some(Event::H1Server(H1s::Request)) {
+            if step.event() == Event::H1Server(H1s::Request) {
                 let RoleMut::H1Server(srv) = step.conn().role_mut() else {
                     panic!("not h1");
                 };
@@ -199,7 +199,7 @@ fn get(mut c: C<RustlsClient>, mut s: C<RustlsServer>) -> Run {
             }
         }
         while let Some(step) = c.poll_rx(T0) {
-            if let Some(Event::H1Client(H1c::Body(b))) = step.event() {
+            if let Event::H1Client(H1c::Body(b)) = step.event() {
                 body.extend_from_slice(b);
             }
         }

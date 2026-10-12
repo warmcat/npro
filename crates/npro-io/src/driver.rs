@@ -66,7 +66,7 @@
 //!
 //! // the application answers each event as it comes
 //! while let Some(mut step) = d.poll_rx(now) {
-//!     if step.event() == Some(Event::H1Server(H1::Request)) {
+//!     if step.event() == Event::H1Server(H1::Request) {
 //!         let RoleMut::H1Server(s) = step.conn().role_mut() else { unreachable!() };
 //!         s.respond(Response { status: 200, content_type: None, content_length: Some(2), headers: &[] })?;
 //!         step.request_write();
@@ -147,20 +147,19 @@ pub struct Io<'d> {
     pub until: Option<Instant>,
 }
 
-/// A step of [`Driver::poll_rx`]: what the connection made of the bytes,
-/// with the connection to act on.
+/// A step of [`Driver::poll_rx`]: an event the connection made of the
+/// bytes, with the connection to act on.
 #[derive(Debug)]
 pub struct Step<'d, S, R> {
-    event: Option<Event<'d>>,
+    event: Event<'d>,
     conn: &'d mut Conn<S, R>,
     write: &'d mut Write,
 }
 
 impl<'d, S, R> Step<'d, S, R> {
-    /// The event, if the bytes came to one.  It borrows the driver's
-    /// buffers, not the connection.
+    /// The event.  It borrows the driver's buffers, not the connection.
     #[must_use]
-    pub const fn event(&self) -> Option<Event<'d>> {
+    pub const fn event(&self) -> Event<'d> {
         self.event
     }
 
@@ -169,9 +168,63 @@ impl<'d, S, R> Step<'d, S, R> {
         self.conn
     }
 
+    /// The event and the connection, for as long as the step's borrow of
+    /// the driver: for a caller handing them on together, as npro-ss gives
+    /// its application an event with a handle on the connection.
+    #[must_use]
+    pub const fn into_parts(self) -> (Event<'d>, &'d mut Conn<S, R>) {
+        (self.event, self.conn)
+    }
+
     /// The application has payload to write: [`Driver::request_write`].
     pub const fn request_write(&mut self) {
         *self.write = Write::Wanted;
+    }
+}
+
+/// An event found by [`Driver::poll_rx`], its bytes taken out, and where
+/// they are.
+#[derive(Clone, Copy, Debug)]
+struct Found {
+    event: Event<'static>,
+    at: At,
+}
+
+/// Where an event's bytes are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum At {
+    /// It carries none.
+    Nowhere,
+    /// In the rx buffer, at this window of what was given the connection.
+    Rx(Window),
+    /// In the inflate buffer, at this window of it.
+    Inflate(Window),
+    /// In neither: never so, as the roles give back what they were given.
+    Lost,
+}
+
+/// Where a buffer was when the connection was given it: its address and
+/// length, to find the bytes of an event in it once it is no longer
+/// borrowed.  Addresses are compared, never used to reach memory.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    addr: usize,
+    len: usize,
+}
+
+impl Place {
+    fn of(b: &[u8]) -> Self {
+        Self {
+            addr: b.as_ptr().addr(),
+            len: b.len(),
+        }
+    }
+
+    /// Where `d` lies in the buffer, if it lies wholly in it.
+    fn find(self, d: &[u8]) -> Option<Window> {
+        let start = d.as_ptr().addr().checked_sub(self.addr)?;
+        let end = start.checked_add(d.len())?;
+        (end <= self.len).then_some(Window { start, end })
     }
 }
 
@@ -308,6 +361,35 @@ impl<S, R, B> Driver<S, R, B, NoTls> {
     /// connection's.
     #[must_use]
     pub const fn new(conn: Conn<S, R>, bufs: Buffers<B>) -> Self {
+        Self::plain(conn, bufs)
+    }
+}
+
+impl<S, R, B, T> Driver<S, R, B, T> {
+    /// Carries `conn`, with `bufs`, the socket's bytes being the
+    /// connection's, in a driver whose type has room for tls: where some
+    /// connections are tls and some not, as a server's listeners may be,
+    /// and all are one type.  [`Driver::new`] is the same with no tls.
+    ///
+    /// ```
+    /// use npro_core::random::SeededRandom;
+    /// use npro_core::time::Instant;
+    /// use npro_h1::Storage;
+    /// use npro_h1::server::{Config, Server};
+    /// use npro_io::conn::Conn;
+    /// use npro_io::driver::{Buffers, Driver};
+    /// use npro_io::tls::NoTls;
+    ///
+    /// let now = Instant::from_micros(1_000_000);
+    /// let s = Server::new(Storage { table: vec![0u8; 1024], out: vec![0u8; 512] }, Config::default(), now)?;
+    /// let conn: Conn<_, SeededRandom> = Conn::h1_server(s);
+    /// let bufs = Buffers { rx: vec![0u8; 256], tx: vec![0u8; 256], inflate: Vec::new() };
+    /// let d: Driver<_, _, _, NoTls> = Driver::plain(conn, bufs);
+    /// assert!(d.tls().is_none());
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub const fn plain(conn: Conn<S, R>, bufs: Buffers<B>) -> Self {
         Self {
             conn,
             bufs,
@@ -320,9 +402,7 @@ impl<S, R, B> Driver<S, R, B, NoTls> {
             wire: Wire::Plain,
         }
     }
-}
 
-impl<S, R, B, T> Driver<S, R, B, T> {
     /// Carries `conn` over tls, its record layer `layer`, from `now`: the
     /// plaintext in `bufs`, the records in `net`.  The handshake must be
     /// done within [`HANDSHAKE_TIMEOUT`].  The connection's bytes wait in
@@ -453,48 +533,98 @@ where
         }
     }
 
-    /// Gives the connection what was read, one step: `None` once it takes
-    /// nothing more for now.  A step may have no event: bytes were taken
-    /// that came to nothing yet, a ping answered, a head not yet whole.
-    /// Call it until it gives `None` after reading, before
-    /// [`Driver::want`]: what it does not give, the connection holds.
+    /// Gives the connection what was read until it comes to an event,
+    /// returned as a step with the connection to answer it: `None` once it
+    /// takes nothing more for now.  Bytes that came to nothing yet (a head
+    /// not yet whole, a ping answered) are taken on the way.  Call it until
+    /// it gives `None` after reading, before [`Driver::want`]: what it does
+    /// not take, the connection holds.
     ///
     /// Once all before it was taken, the peer's FIN is passed on, which
-    /// may itself be a step, an h1 client's body ending with the close.
+    /// may itself be an event, an h1 client's body ending with the close.
     pub fn poll_rx(&mut self, now: Instant) -> Option<Step<'_, S, R>> {
         self.let_go();
         if !matches!(self.stage, Stage::Live) {
+            return None;
+        }
+        // An event borrows the buffers, so one cannot be returned from
+        // inside the loop that takes the steps coming to none: the borrow
+        // would outlast the loop's next turn.  The step is found in the
+        // loop, where its bytes are, and the event made again from them
+        // after it.
+        let found = loop {
+            let input = self
+                .bufs
+                .rx
+                .as_mut()
+                .get_mut(self.rx.start..self.rx.end)
+                .unwrap_or_default();
+            if input.is_empty() && !self.conn.rx_pending() {
+                if self.fin != Fin::Seen {
+                    return None;
+                }
+                self.fin = Fin::Told;
+                break Found {
+                    event: self.conn.rx_closed(now)?,
+                    at: At::Nowhere,
+                };
+            }
+            let rx_at = Place::of(input);
+            let out = self.bufs.inflate.as_mut();
+            let out_at = Place::of(out);
+            let r = self.conn.rx(now, input, out);
+            let consumed = r.consumed;
+            let found = r.event.map(|e| Found {
+                event: e.with_data(&[]),
+                at: e.data().filter(|d| !d.is_empty()).map_or(At::Nowhere, |d| {
+                    rx_at
+                        .find(d)
+                        .map(At::Rx)
+                        .or_else(|| out_at.find(d).map(At::Inflate))
+                        .unwrap_or(At::Lost)
+                }),
+            });
+            match found {
+                Some(f) => {
+                    self.taken = consumed;
+                    break f;
+                }
+                None if consumed == 0 => return None,
+                None => {
+                    self.taken = consumed;
+                    self.let_go();
+                }
+            }
+        };
+        if found.at == At::Lost {
+            // the role gave bytes from neither buffer: not to be trusted
+            self.drop_all();
             return None;
         }
         let Self {
             conn,
             bufs,
             rx,
-            taken,
             write,
-            fin,
             ..
         } = self;
-        let input = bufs
-            .rx
-            .as_mut()
-            .get_mut(rx.start..rx.end)
-            .unwrap_or_default();
-        if input.is_empty() && !conn.rx_pending() {
-            if *fin != Fin::Seen {
-                return None;
-            }
-            *fin = Fin::Told;
-            let event = conn.rx_closed(now);
-            return Some(Step { event, conn, write });
-        }
-        let r = conn.rx(now, input, bufs.inflate.as_mut());
-        if r.consumed == 0 && r.event.is_none() {
-            return None;
-        }
-        *taken = r.consumed;
+        // where they were found, so there still
+        let data = match found.at {
+            At::Nowhere | At::Lost => &[][..],
+            At::Rx(w) => bufs
+                .rx
+                .as_ref()
+                .get(rx.start..rx.end)
+                .and_then(|b| b.get(w.start..w.end))
+                .unwrap_or_default(),
+            At::Inflate(w) => bufs
+                .inflate
+                .as_ref()
+                .get(w.start..w.end)
+                .unwrap_or_default(),
+        };
         Some(Step {
-            event: r.event,
+            event: found.event.with_data(data),
             conn,
             write,
         })
@@ -978,19 +1108,19 @@ mod tests {
 
     /// Answers every request with `ok`, completing it once its answer
     /// went: what the steps gave.
-    fn answer(d: &mut D, now: Instant) -> Vec<Option<Event<'static>>> {
+    fn answer(d: &mut D, now: Instant) -> Vec<Event<'static>> {
         let mut seen = Vec::new();
         while let Some(mut step) = d.poll_rx(now) {
             let ev = step.event();
-            seen.push(ev.map(|e| match e {
+            seen.push(match ev {
                 Event::H1Server(H1::Request) => Event::H1Server(H1::Request),
                 Event::H1Server(H1::BodyEnd) => Event::H1Server(H1::BodyEnd),
                 Event::H1Server(H1::Body(_))
                 | Event::H1Client(_)
                 | Event::Ws(_)
                 | Event::Raw(_) => Event::H1Server(H1::Body(b"")),
-            }));
-            if ev == Some(Event::H1Server(H1::Request)) {
+            });
+            if ev == Event::H1Server(H1::Request) {
                 let RoleMut::H1Server(s) = step.conn().role_mut() else {
                     panic!("not h1");
                 };
@@ -1028,7 +1158,7 @@ mod tests {
             panic!("not h1");
         };
         s.complete(T0);
-        assert_eq!(answer(&mut d, T0), [Some(Event::H1Server(H1::Request))]);
+        assert_eq!(answer(&mut d, T0), [Event::H1Server(H1::Request)]);
         // room again for the rest
         assert_eq!(read(&mut d, T0, &mut nothing(), &three[51..]), 6);
     }
@@ -1133,7 +1263,7 @@ mod tests {
         ] {
             let mut d = server(256, 256);
             assert_eq!(read(&mut d, T0, &mut nothing(), req), req.len());
-            let got: Vec<_> = answer(&mut d, T0).into_iter().flatten().collect();
+            let got = answer(&mut d, T0);
             assert_eq!(got, seen, "{}", req.escape_ascii());
         }
     }
@@ -1164,7 +1294,7 @@ mod tests {
         assert_eq!(read(&mut d, T0, &mut nothing(), resp), resp.len());
         let mut ended = false;
         while let Some(step) = d.poll_rx(T0) {
-            ended |= step.event() == Some(Event::H1Client(H1c::BodyEnd));
+            ended |= step.event() == Event::H1Client(H1c::BodyEnd);
         }
         // with no FIN: the length ended it
         assert!(ended);
@@ -1203,7 +1333,7 @@ mod tests {
         let ended = |drv: &mut D| {
             let mut ended = false;
             while let Some(step) = drv.poll_rx(T0) {
-                ended |= step.event() == Some(Event::H1Client(H1c::BodyEnd));
+                ended |= step.event() == Event::H1Client(H1c::BodyEnd);
             }
             ended
         };
@@ -1272,7 +1402,7 @@ mod tests {
         d.read_done(T0, 0);
         let mut seen = Vec::new();
         while let Some(step) = d.poll_rx(T0) {
-            if let Some(Event::H1Client(e)) = step.event() {
+            if let Event::H1Client(e) = step.event() {
                 seen.push(match e {
                     H1c::Response => b"response".to_vec(),
                     H1c::Body(b) => b.to_vec(),
@@ -1305,8 +1435,9 @@ mod tests {
     fn received_bytes_are_taken_as_far_as_there_is_room() {
         let mut d = server(8, 256);
         assert_eq!(d.received(T0, b"GET / HTTP/1.1\r\n\r\n"), 8);
-        // the head is taken into the table as it comes, making room
-        assert_eq!(answer(&mut d, T0), [None]);
+        // the head is taken into the table as it comes, making room, with
+        // nothing to tell yet
+        assert_eq!(answer(&mut d, T0), []);
         assert_eq!(d.received(T0, b" HTTP/1.1\r\n\r\n"), 8);
     }
 
@@ -1358,6 +1489,19 @@ mod tests {
     }
 
     #[test]
+    fn a_steps_event_and_connection_go_on_together() {
+        let mut d = server(256, 256);
+        read(&mut d, T0, &mut nothing(), b"GET / HTTP/1.1\r\n\r\n");
+        let step = d.poll_rx(T0).unwrap();
+        let (event, conn) = step.into_parts();
+        assert_eq!(event, Event::H1Server(H1::Request));
+        let RoleMut::H1Server(s) = conn.role_mut() else {
+            panic!("not h1");
+        };
+        assert!(s.is_awaiting_answer());
+    }
+
+    #[test]
     fn taken_apart_the_buffers_come_back() {
         let mut d = server(32, 48);
         read(&mut d, T0, &mut nothing(), b"GET / HTTP/1.1\r\n\r\n");
@@ -1377,7 +1521,7 @@ mod tests {
         assert_eq!(read(&mut d, T0, &mut app, wire), wire.len());
         let mut requests = 0;
         while let Some(mut step) = d.poll_rx(T0) {
-            if step.event() == Some(Event::H1Server(H1::Request)) {
+            if step.event() == Event::H1Server(H1::Request) {
                 requests += 1;
                 let RoleMut::H1Server(s) = step.conn().role_mut() else {
                     panic!("not h1");
@@ -1392,7 +1536,7 @@ mod tests {
         // the bytes that came behind the head, held while it was h1
         let mut got = Vec::new();
         while let Some(step) = d.poll_rx(T0) {
-            if let Some(Event::Raw(raw::Event::Data(b))) = step.event() {
+            if let Event::Raw(raw::Event::Data(b)) = step.event() {
                 got.extend_from_slice(b);
             }
         }
@@ -1405,7 +1549,7 @@ mod tests {
         d.read_done(T0, 0);
         let mut closed = false;
         while let Some(mut step) = d.poll_rx(T0) {
-            if step.event() == Some(Event::Raw(raw::Event::PeerClosed)) {
+            if step.event() == Event::Raw(raw::Event::PeerClosed) {
                 closed = true;
                 let RoleMut::Raw(r) = step.conn().role_mut() else {
                     panic!("not raw");
@@ -1749,7 +1893,7 @@ mod tls_tests {
         for _ in 0..50 {
             wire.extend(carry(&mut c, &mut csrc, &mut s, &mut ssrc));
             while let Some(mut step) = s.poll_rx(T0) {
-                if step.event() == Some(Event::H1Server(H1s::Request)) {
+                if step.event() == Event::H1Server(H1s::Request) {
                     let RoleMut::H1Server(srv) = step.conn().role_mut() else {
                         panic!("not h1");
                     };
@@ -1770,7 +1914,7 @@ mod tls_tests {
                 }
             }
             while let Some(step) = c.poll_rx(T0) {
-                if let Some(Event::H1Client(H1c::Body(b))) = step.event() {
+                if let Event::H1Client(H1c::Body(b)) = step.event() {
                     body.extend_from_slice(b);
                 }
             }
@@ -1810,9 +1954,12 @@ mod tls_tests {
                 wire.extend(carry(&mut c, &mut csrc, &mut s, &mut ssrc));
                 while let Some(step) = s.poll_rx(T0) {
                     match step.event() {
-                        Some(Event::H1Server(H1s::Body(b))) => got.extend_from_slice(b),
-                        Some(Event::H1Server(H1s::BodyEnd)) => ended = true,
-                        _ => {}
+                        Event::H1Server(H1s::Body(b)) => got.extend_from_slice(b),
+                        Event::H1Server(H1s::BodyEnd) => ended = true,
+                        Event::H1Server(H1s::Request)
+                        | Event::H1Client(_)
+                        | Event::Ws(_)
+                        | Event::Raw(_) => {}
                     }
                 }
                 if ended {

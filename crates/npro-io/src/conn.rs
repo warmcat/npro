@@ -104,6 +104,47 @@ pub enum Event<'a> {
     Raw(raw::Event<'a>),
 }
 
+impl<'a> Event<'a> {
+    /// The bytes the event carries, if it is one that carries any.
+    pub(crate) const fn data(&self) -> Option<&'a [u8]> {
+        match self {
+            Self::H1Server(server::Event::Body(d))
+            | Self::H1Client(client::Event::Body(d))
+            | Self::Ws(ws::Event::Message { data: d, .. })
+            | Self::Raw(raw::Event::Data(d)) => Some(d),
+            Self::H1Server(server::Event::Request | server::Event::BodyEnd)
+            | Self::H1Client(client::Event::Response | client::Event::BodyEnd)
+            | Self::Ws(ws::Event::Pong(_) | ws::Event::PeerClose(_))
+            | Self::Raw(raw::Event::PeerClosed) => None,
+        }
+    }
+
+    /// The same event, carrying `data` in place of its bytes, if it is one
+    /// that carries any.
+    pub(crate) const fn with_data(self, data: &[u8]) -> Event<'_> {
+        match self {
+            Self::H1Server(server::Event::Body(_)) => Event::H1Server(server::Event::Body(data)),
+            Self::H1Server(server::Event::Request) => Event::H1Server(server::Event::Request),
+            Self::H1Server(server::Event::BodyEnd) => Event::H1Server(server::Event::BodyEnd),
+            Self::H1Client(client::Event::Body(_)) => Event::H1Client(client::Event::Body(data)),
+            Self::H1Client(client::Event::Response) => Event::H1Client(client::Event::Response),
+            Self::H1Client(client::Event::BodyEnd) => Event::H1Client(client::Event::BodyEnd),
+            Self::Ws(ws::Event::Message {
+                kind, first, last, ..
+            }) => Event::Ws(ws::Event::Message {
+                kind,
+                data,
+                first,
+                last,
+            }),
+            Self::Ws(ws::Event::Pong(c)) => Event::Ws(ws::Event::Pong(c)),
+            Self::Ws(ws::Event::PeerClose(c)) => Event::Ws(ws::Event::PeerClose(c)),
+            Self::Raw(raw::Event::Data(_)) => Event::Raw(raw::Event::Data(data)),
+            Self::Raw(raw::Event::PeerClosed) => Event::Raw(raw::Event::PeerClosed),
+        }
+    }
+}
+
 /// What [`Conn::rx`] took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rx<'a> {
