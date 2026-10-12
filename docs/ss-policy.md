@@ -38,7 +38,9 @@ configuration language.
 - **Parameters only.**  Configuration binds declared parameters; nothing
   else can be changed from outside.
 - **Merging is by namespace, never by file order.**  There is no
-  equivalent of `conf.d`'s alphabetical loading.
+  equivalent of `conf.d`'s alphabetical loading.  The one ordering is
+  the fixed precedence of the default layers below ("Defaults, by
+  layer"), which is by what each layer is, not which was read last.
 - **Nothing is accepted and ignored.**  An unknown key, a parameter
   bound to the wrong type or out of its bounds, or a required parameter
   left unbound, fails resolution, and the error names its path, for
@@ -87,6 +89,24 @@ a route, or an instance.  The rules:
 
 Precedence is decided by the structure, never by which file was read
 last.  *(Open: agreed in discussion, not yet confirmed.)*
+
+### Defaults, by layer
+
+What a machine or a user usually wants, the tls provider, the loop, the
+trust store, is said once rather than in every policy.  A program's
+policy is made of five layers, lowest first, each overriding those
+under it (Andy, 2026-10-12):
+
+1. **built in**: the defaults compiled into the program, so it works
+   with no policy at all;
+2. **system**: `/etc/npro/defaults.json`;
+3. **user**: `~/.config/npro/defaults.json`;
+4. **the policy** the program was given;
+5. **fragments on the command line**, `-p`.
+
+Within one layer the scope rules above hold: binding a parameter twice
+in one scope is still an error.  A missing system or user file is no
+error; one that does not parse, or binds what is not declared, is.
 
 ### Exports and references
 
@@ -381,6 +401,10 @@ and references cover what it was used for), and `conf.d` order.
   libwebsockets.org to it.
 - 2026-10-08: npro does not supervise processes; systemd does.  npro
   knows their health from proxying to them.
+
+- 2026-10-12: defaults come in fixed layers, built in, system, user,
+  the policy, then the command line's fragments, each overriding those
+  under it.
 
 ## Open
 

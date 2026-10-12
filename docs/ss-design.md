@@ -828,6 +828,17 @@ code for exactly this trust model.
 - 2026-10-12: JWTs are verified by the algorithm the key says (ES256
   for npro.rs' P-256 key) through the tls provider; CGI is kept, for
   git over https.
+- 2026-10-12: `npro serve` serves everything its policy says, and takes
+  no names.  The system and the user have default layers under the
+  policy, for things like the tls and the loop (ss-policy.md, "Defaults,
+  by layer").
+- 2026-10-12: the server process is not where service code piles up.
+  lws' plugins, whatever their faults, kept the large amount of user
+  code (login, deaddrop, dnssec-monitor, webrtc) contained and apart
+  from the core; linking every service into one process would grow a
+  monolith.  Services that are code, not configuration, run in
+  processes of their own.  *(How they are bound, found and started,
+  open: 3 below.)*
 
 ## Open
 
@@ -835,5 +846,12 @@ For Andy:
 
 1. **The utility**: its subcommands and options, and how a
    policy fragment or a named streamtype is given on its command line.
-   To be designed once npro-ss is far enough along to see it.
+   `serve` and the default layers are decided (above); the rest is
+   proposed as `npro get URL`, `npro ws URL`, `--policy FILE` and `-p`
+   fragments.
 2. SSPC's two questions above, when it is built.
+3. **Services in their own processes**: what links into the front and
+   what does not, how a route is bound to an instance's socket, how an
+   instance knows which it is, how it is started, guards (the login
+   interceptor) when the login is elsewhere, and instances with udp
+   listeners of their own (webrtc).
