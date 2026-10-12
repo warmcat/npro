@@ -960,11 +960,15 @@ where
 
     /// The adapter half-closed the socket, as [`Want::HalfClose`] asked,
     /// at `now`: the peer's FIN is awaited, for C's
-    /// [`SHUTDOWN_TIMEOUT`].
+    /// [`SHUTDOWN_TIMEOUT`], unless it came already.
     pub fn half_closed(&mut self, now: Instant) {
         if self.stage == Stage::HalfCloseDue {
-            self.stage = Stage::HalfClosed {
-                until: now.saturating_add(SHUTDOWN_TIMEOUT),
+            self.stage = match self.fin {
+                Fin::Open => Stage::HalfClosed {
+                    until: now.saturating_add(SHUTDOWN_TIMEOUT),
+                },
+                // the FIN came already: in C the next read says so at once
+                Fin::Seen | Fin::Told => Stage::Done(Outcome::Delivered),
             };
         }
     }
@@ -1192,6 +1196,25 @@ mod tests {
         d.read_done(at(2), 0);
         assert!(matches!(
             d.want(at(2), &mut nothing()),
+            Want::Release(Outcome::Delivered)
+        ));
+    }
+
+    #[test]
+    fn a_server_whose_peer_closed_first_does_not_wait_for_its_fin() {
+        let mut d = server(256, 256);
+        read(&mut d, T0, &mut nothing(), b"GET / HTTP/1.1\r\n\r\n");
+        answer(&mut d, T0);
+        // the peer's FIN, after its request: what was composed goes, and
+        // the server shuts down, as C's does
+        d.read_done(T0, 0);
+        answer(&mut d, T0);
+        let wrote = write(&mut d, T0, &mut nothing(), 1024);
+        assert!(wrote.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(matches!(d.want(T0, &mut nothing()), Want::HalfClose));
+        d.half_closed(T0);
+        assert!(matches!(
+            d.want(T0, &mut nothing()),
             Want::Release(Outcome::Delivered)
         ));
     }
