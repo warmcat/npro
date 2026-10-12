@@ -147,6 +147,20 @@
 			"cmake":	"aws-lc-test"
 		},
 
+		# npro-cli, npro's utility and its runner: a workspace of its own
+		# beside npro-aws-lc, which it builds on, with caps for dropping
+		# the server's privileges.  Its gates on the gate builder, and its
+		# tests, the runner serving over real sockets, plain and tls, on
+		# every default platform.
+
+		"cli": {
+			"cmake":	"cli",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+		"cli-test": {
+			"cmake":	"cli-test"
+		},
+
 		"fuzz": {
 			"cmake":	"fuzz 60",
 			"platforms":	"none, fuzz-linux-debian13/x86_64-amd/gcc",

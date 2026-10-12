@@ -472,6 +472,19 @@ What Rust allows for that:
 The runner crate links aws-lc, so it is a workspace outside npro's own,
 as the utility is, and the utility becomes a user of it.
 
+**Begun (2026-10-12)** in `npro-cli/`, the utility's workspace, as its
+`runner` module: for now it builds in the threads adapter and rustls
+over aws-lc alone, so the policy has nothing yet to choose between.
+`runner::bind()` binds each listener, loads each tls one's certificate
+and key, then drops every capability; `Bound::serve()` makes the
+streams in slots sized for tls records and carries them with the threads
+adapter, the application given the streams after every change.  A
+listener's certificate and key are looked at, at most every 10s, when a
+connection is accepted, and the config made again if they changed; a
+pair that does not load keeps the old one, as C does.  npro's random is
+the provider's.  The command line is not there yet: it waits on the
+first item under "Open".
+
 ### The first goal: npro.rs served by npro
 
 The first thing SS2 is for (Andy, 2026-10-12): replace the lwsws

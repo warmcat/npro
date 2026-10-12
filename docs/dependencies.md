@@ -155,6 +155,21 @@ main workspace's does, and:
 All but aws-lc-rs and aws-lc-sys run only at build time, on the machine
 building.  They were admitted in the commit adding the workspace.
 
+### The npro-cli workspace
+
+`npro-cli/` is npro's utility, `npro`, and its runner, which binds SS2 to
+the threads adapter and to rustls over aws-lc
+([ss-design.md](ss-design.md), "Where the utility lives").  A workspace
+of its own, as `npro-aws-lc/` is, which it builds on: its door admits
+what that one admits, re-listed since a workspace cannot inherit
+another's (Andy, 2026-10-12: a provider is admitted where it is chosen),
+and one crate of its own.  `scripts/cli.sh` checks its door and runs its
+tests.  Not published.
+
+| crate | why | build script | unsafe | licence |
+|---|---|---|---|---|
+| `caps` 0.5.6 | dropping every capability once the listeners are bound, so code an attacker runs in the server cannot bind a privileged port (Andy, 2026-10-12, rather than `rustix`, which opens the rest of POSIX).  Linux only, as capabilities are; its one dependency is `libc`, admitted already for aws-lc-sys | none | `capget`, `capset` and `prctl`, by `libc` | MIT OR Apache-2.0 |
+
 ### The fuzz workspace
 
 `fuzz/` builds the libFuzzer targets ([fuzzing.md](fuzzing.md)) and
