@@ -20,9 +20,12 @@ repeat that: the boilerplate and the effort of keeping them are too
 much, and the story they tell users is too complex.  SS is npro's user
 API for client and server ([ss-policy.md](ss-policy.md)), so what the
 examples did is done by **one utility**, as busybox is one program, or
-curl one tool with many options.  Not yet designed; what is agreed of it
-(Andy, 2026-10-12):
+curl one tool with many options.  Its command is `npro` (Andy,
+2026-10-12).  Not yet designed; what is agreed of it (Andy,
+2026-10-12):
 
+- **It is also npro's lwsws.**  Given a site's policy, it is the
+  server: npro.rs is served by it (below).
 - **One program, client and server.**  What C has a minimal example for
   is an option or a subcommand of it: fetch, post, ws, raw, a large URL,
   metadata, many streams at once; serve a status page, files, ws echo,
@@ -268,6 +271,10 @@ the SS commit that needs it:
 
 ## Phases
 
+The order below was written client first.  The first goal (below)
+brings the server forward: phase 2, then 3, then the client parts the
+proxy needs, then the rest of phase 1.
+
 1. **`npro-ss`, client**, over the in-memory transport: create, connect
    by request, rx and tx, metadata to h1 headers, QoS from the status,
    retry and backoff with C's table and conceal count, redirects, ws.
@@ -297,7 +304,7 @@ the policy; the loop and the tls provider are bound where the program is
 linked, never in it.  An application that has to name any of them is a
 sign that SS2's API is missing something, to be fixed in SS2.
 
-So the utility is a workspace of its own *(name open)*, beside
+So the utility, `npro`, is a workspace of its own, beside
 `npro-aws-lc/` and `fuzz/`:
 
 - what it does is applications and services, each a type implementing
@@ -317,6 +324,183 @@ an opt-in feature naming aws-lc would put it in npro's graph.  The
 services and applications do not depend on that, and are crates in
 npro's own workspace, usable by anyone; only the utility, which links
 them to a runner, is outside it.
+
+### The policy picks the loop and the tls
+
+An application's own code is sansIO already: SS2 lends it a buffer to
+read or fill, with its `&mut U`, and takes back what it did.  It never
+waits, so nothing about it is sync or async.  So the policy, not the
+program, says which loop drives it and which tls each connection uses,
+and has defaults, so a policy that says nothing gets a working program
+(Andy, 2026-10-12).  The user's story is: write the guts, buffers in and
+out; the policy says, hides or defaults everything under them.
+
+What Rust allows for that:
+
+- **The policy chooses among what was built in.**  There are no plugins
+  loaded at run time: Rust has no stable ABI, and loading one is
+  `unsafe`.  A runner crate builds in a set of loops and tls providers,
+  each an additive feature; the policy names one, and a name not built
+  in is refused when the policy is loaded, saying what was built in.
+  This refines "the runner is the only code that names a loop and a
+  provider", above: the runner names what can be chosen, the policy
+  chooses.
+- **The loop is the process's, the tls the connection's.**  The loop is
+  chosen once, in the policy's global part, by a `match` in the
+  runner's `run()` before anything starts: threads, mio, or a tokio
+  runtime the runner builds and blocks on.  tls is chosen per trust
+  store or vhost, so it is a choice per connection in the driver,
+  behind the record-layer trait io-model.md already has: rustls over
+  aws-lc, rustls over another provider, later others.
+- **One bound for the application's type.**  Bounds are checked when
+  the program is built, so `U` meets the strictest of the loops built
+  in: with threads, `U: Send`.  An application whose type is not `Send`
+  builds only a runner without that loop.
+- **A program with its own loop** (an existing tokio program) does not
+  use the runner: it drives `npro-ss` itself, as any adapter does, and
+  its policy's loop choice does not apply.
+- **Blocking work in the guts blocks the loop**, as in C.  What the
+  guts may need that could block is offered by the runner as a request,
+  as dns and connect are; reading files is the first case (below).
+
+The runner crate links aws-lc, so it is a workspace outside npro's own,
+as the utility is, and the utility becomes a user of it.
+
+### The first goal: npro.rs served by npro
+
+The first thing SS2 is for (Andy, 2026-10-12): replace the lwsws
+serving npro.rs with an npro server whose whole configuration is a
+policy, not C and not lejp-conf.
+
+#### What the vhost does now
+
+From its lwsws conf (Andy, 2026-10-12), one vhost on 443:
+
+| mount | origin | needs |
+|---|---|---|
+| `/` | files, `/var/www/npro.rs` | default `index.html`, cache-control (max-age 172800, reuse, no revalidate, no intermediaries), extra mime types |
+| `/git` | h1 over UDS, gitohashi | proxy |
+| `/sai` | h1 and ws over UDS, sai | proxy, behind the login interceptor |
+| `/npro-login-sai` | `lws-login` plugin | login against auth.warmcat.com, JWT cookie checked with a JWK |
+| `/oauth` | `lws-oauth2-client` plugin | an oauth2 client: an h1 client over tls to auth.warmcat.com |
+| `/repo` | CGI, `git-http-backend` | spawning a process, its environment, a timeout |
+| `/npro-login-deaddrop` | `lws-login` | as above, no unauthenticated access |
+| `/docrepo` | files, behind the interceptor | |
+| `/docrepo/upload` | `lws-deaddrop` plugin | uploads up to 50 MB, multipart, behind the interceptor |
+| `/docrepo/get` | files, behind the interceptor | its own extra mime types, `.tar.gz` among them |
+
+and for the vhost: the cert and key by path (`-latest` names, renewed
+on disk), an access log, a 404 document, response headers on
+everything (CSP, HSTS and the rest), ws upgrades refused where no
+protocol takes them, and client tls for the oauth2 client.  A vhost on
+port 80 redirecting to https is assumed, as before.
+
+`/npro-login-sai` was mounted twice, with and without `unauth-allow`.
+C takes the first of two equally long matches (`lws_find_mount()`
+takes a later one only if it is longer, or exact), so the second was
+never used, though it was the one meant; Andy has removed the first
+(2026-10-12).  A policy refuses a mountpoint given twice, as npro-json
+refuses a member named twice.
+
+#### In stages
+
+So it is more than files and proxies.  It is moved over in stages, and
+**until a stage is done, npro proxies its mounts to an lwsws** kept
+listening on a unix domain socket.  npro takes the public port from the
+first stage, and the C plugins carry on behind it until each is
+replaced.
+
+1. **Serve npro.rs**: the listening half of SS2 (phase 2 below,
+   brought forward); the runner, with unix domain sockets as well as
+   tcp; rustls over aws-lc, chosen by the policy, with the cert and key
+   it names, reloaded when they change on disk as C's
+   `tls-cert-watch.c` does (by looking at the paths periodically at
+   first: watching a directory needs inotify, which std does not have);
+   the file service; the proxy, which needs the client half too; the
+   vhost's headers, the 404 document and the access log; the redirect
+   to https.  Everything else is proxied to lwsws.
+2. **Login and oauth2**: the interceptor, checking the JWT cookie
+   against the JWK, and the oauth2 client.  The JWK is an EC P-256
+   key (Andy, 2026-10-12).  lws-login lists `ES256,ES384,ES512,RS256,
+   RS384,RS512,HS256` as acceptable, but C's `lws_jws_sig_confirm()`
+   also insists the key's type, and for EC its curve, match the
+   token's alg, so with this key only ES256 can verify: ECDSA over
+   P-256 with SHA-256, the signature R and S, 32 bytes each.  npro goes
+   further and takes the algorithm from the key alone, refusing a token
+   whose header names another.  The verification is the tls provider's,
+   reached through rustls (its `SignatureVerificationAlgorithm` for
+   ECDSA P-256 SHA-256, given the point and a DER signature, which R
+   and S are re-encoded as), so the login service in npro's graph links
+   no crypto of its own.
+3. **Uploads**: a multipart parser, with its fuzz target, and the
+   deaddrop service.
+4. **CGI**, for `/repo`, which serves git over https (Andy,
+   2026-10-12): spawning the process is a request to the runner, as a
+   file read is; its stdin and stdout are flow controlled as the proxy's
+   two sides are; its response head (`Status:`, `Location:`, the rest)
+   has a parser with its fuzz target; and the mount's timeout and
+   environment come from the policy.
+
+**The file service** maps a url prefix to a directory: the default
+document, mime types from the extension and the policy's extras
+(longest suffix first, for `.tar.gz`), cache-control, and refusing `..`
+and anything resolving outside the mount.  Reading a file is a request,
+as dns and connect are: the service's tx pull says "not yet" and asks
+for a read, the runner does it on a worker thread, as C's
+`LWS_WITH_ASYNC_QUEUE` takes the file server's reads off the service
+thread (Andy, 2026-10-12), and the result wakes the stream.  So the loop
+never waits on a disk.  The reads go through a small file-ops trait, as
+C's `lws_plat_file_ops`, so a romfs or a test's in-memory tree serve the
+same way.
+
+**The proxy** forwards each request to its origin, `unix:/path` or
+`http://..`, always as h1, whatever the return side is (h1 now, h2 and
+h3 later): C's translated headers and `X-Forwarded-For`, the bodies both
+ways, and a 503 when the origin cannot be reached.  After a ws upgrade
+both sides have agreed, it passes bytes both ways.  A ws frame over h2
+(RFC 8441) is the same bytes inside DATA frames, so that holds when
+the return side is h2.
+
+**The proxy is flow controlled** (Andy, 2026-10-12): passing bytes
+through is still networking.  Between the two sides there is one
+bounded buffer per direction, its size from the policy, and nothing
+else: no list of buffers that grows with whatever the origin sends.  It
+reads from a side only when the other side has room for what it reads,
+so when the return side cannot take more (a slow client, h2 credit the
+client has not given), the proxy stops reading from the origin.  The
+origin's socket fills and it feels the backpressure, however fast it
+would like to send.  Uploads are regulated the same way, the other way
+round.  In sansIO this is the driver's `Want` without a read buffer:
+the connection simply is not asked to read.
+
+**Privileges**: the process does not start as root.  systemd starts it
+as its own user, with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
+`CapabilityBoundingSet=CAP_NET_BIND_SERVICE` in its unit, so binding a
+port below 1024 is the only privilege it has.  Once its listeners are
+bound it drops that too (Andy, 2026-10-12), so an attacker who gets
+code running in it cannot bind a port of their own.  Dropping it needs
+`capset()` (or `prctl()`), which std does not have, so a dependency:
+`caps` (Andy, 2026-10-12), not `rustix`, which opens the way to the
+rest of POSIX that npro means to leave behind.  `caps` 0.5.6 is MIT or
+Apache-2.0, its only dependency is `libc` (which has a build script),
+and its `unsafe` is the syscalls themselves.  It is the runner's, in the
+runner's workspace and its `deny.toml`, never npro's graph, and is
+entered in the register when the runner is written.
+
+Dropping the capability guards only ports below 1024: anyone may bind
+above.  The unit closes the rest with no code, by systemd's cgroup bind
+filter (systemd 249 and later): `SocketBindAllow=tcp:80`,
+`SocketBindAllow=tcp:443` and `SocketBindDeny=any` let the service bind
+those two ports and no other, privileged or not, and
+`NoNewPrivileges=yes` stops it gaining privileges by exec.  Both are
+used: the filter from the first deployment, the drop when its
+dependency is admitted.  The user needs read
+access to the key and the served trees, write access to the log, and to
+connect to the UDS of gitohashi, sai and lwsws.
+
+**Each stage is tested** in memory first, then against the C server and
+with browsers, then by serving npro.rs from it on another port beside
+the lwsws one, before it takes 443.
 
 ## SSPC: the working plan
 
@@ -506,12 +690,31 @@ code for exactly this trust model.
   device keys, and it keeps no wire compatibility with C's.
 - 2026-10-12: `Connected` means the peer has agreed: a stream joining a
   kept-warm connection is told so when the peer answers, not at the join.
+- 2026-10-12: the utility's command is `npro`, and it is the server
+  for npro.rs too.  Its package needs another name, since `npro` is the
+  library's on crates.io: `npro-cli` is proposed, and free.
+- 2026-10-12: the application's code is sansIO, and the policy picks
+  the loop and the tls among those the runner built in, with defaults.
+- 2026-10-12: the first goal is npro.rs served by npro, configured by a
+  policy: files, and h1 and ws proxied to gitohashi and sai over unix
+  domain sockets.  It moves over in stages, npro proxying to an lwsws
+  what is not done yet.
+- 2026-10-12: the proxy is flow controlled, with one bounded buffer per
+  direction, reading from a side only when the other has room.
+- 2026-10-12: file reads are requests, done on a worker thread, as C's
+  async queue; npro.rs is h1 only until there is h2; the server runs
+  unprivileged with `CAP_NET_BIND_SERVICE` from systemd, drops it once
+  bound, by `caps`, and is kept by systemd's bind filter to its own
+  ports.
+- 2026-10-12: JWTs are verified by the algorithm the key says (ES256
+  for npro.rs' P-256 key) through the tls provider; CGI is kept, for
+  git over https.
 
 ## Open
 
 For Andy:
 
-1. **The utility**: its name, its subcommands and options, and how a
+1. **The utility**: its subcommands and options, and how a
    policy fragment or a named streamtype is given on its command line.
    To be designed once npro-ss is far enough along to see it.
 2. SSPC's two questions above, when it is built.
