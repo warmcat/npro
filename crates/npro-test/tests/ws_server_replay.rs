@@ -24,6 +24,7 @@
 #[cfg(test)]
 mod ws_server_replay {
     use npro_core::time::Instant;
+    use npro_h1::Storage;
     use npro_h1::head;
     use npro_h1::server::{Config, Event as H1Event, Response, Server, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -119,6 +120,7 @@ mod ws_server_replay {
                 status: 200,
                 content_type: Some(b"text/plain"),
                 content_length: Some(10),
+                headers: &[],
             })
             .unwrap();
             app.out = b"sansio ok\n".to_vec();
@@ -215,7 +217,10 @@ mod ws_server_replay {
     fn replay(t: &Transcript) {
         let start = t.steps.first().map_or(0, |s| s.t_us);
         let server = Server::new(
-            vec![0u8; DEFAULT_CAPACITY],
+            Storage {
+                table: vec![0u8; DEFAULT_CAPACITY],
+                out: vec![0u8; 512],
+            },
             Config::new(head::Config::new()),
             Instant::from_micros(t.t0_us.checked_add(start).unwrap()),
         );

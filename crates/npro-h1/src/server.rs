@@ -31,10 +31,11 @@ use core::time::Duration;
 
 use npro_core::time::Instant;
 
+use crate::Storage;
 use crate::chunked::{Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
 use crate::head::{self, Answer, Head, Progress, Refused, Side, Version};
-use crate::own::Own;
+use crate::own::{Own, decimal};
 use crate::table::{CapacityTooLarge, HeaderTable};
 use crate::token::Token;
 
@@ -189,9 +190,52 @@ pub struct Response<'a> {
     /// The payload's length.  Without one the connection closes after it,
     /// and says so.
     pub content_length: Option<u64>,
+    /// The application's own headers, names and values, after the
+    /// server's: C's `lws_add_http_header_by_name()` after
+    /// `lws_add_http_common_headers()`.  A name must be a token, and a
+    /// value must have no CR, LF or NUL, so neither can end its line
+    /// early; the headers the server writes itself are refused here
+    /// ([`HeaderRefused`]).
+    pub headers: &'a [(&'a [u8], &'a [u8])],
 }
 
-pub use crate::own::{MAX_OWN, RespondError};
+pub use crate::own::{HeaderRefused, RespondError};
+
+/// The least [`Storage::out`] a server may have: room for C's status
+/// pages, which the server writes itself to refuse a request.
+pub const MIN_OUT: usize = 512;
+
+/// The headers the server writes itself, which the application may not:
+/// `Content-Type`, given as [`Response::content_type`], and those the
+/// response's framing and the connection's fate depend on,
+/// `Content-Length`, `Transfer-Encoding`, `Connection` and `Upgrade`.
+const RESERVED: [&[u8]; 5] = [
+    b"content-type",
+    b"content-length",
+    b"transfer-encoding",
+    b"connection",
+    b"upgrade",
+];
+
+/// Why a server cannot be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewError {
+    /// The table's storage is too large for a table.
+    Capacity(CapacityTooLarge),
+    /// [`Storage::out`] is shorter than [`MIN_OUT`].
+    OutTooSmall,
+}
+
+impl core::fmt::Display for NewError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Capacity(e) => write!(f, "{e}"),
+            Self::OutTooSmall => write!(f, "a server's out storage is at least {MIN_OUT} bytes"),
+        }
+    }
+}
+
+impl core::error::Error for NewError {}
 
 /// How the request's body is framed, and how far it has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +314,7 @@ enum Phase {
 ///
 /// ```
 /// use npro_core::time::Instant;
+/// use npro_h1::Storage;
 /// use npro_h1::server::{Config, Event, Response, Server, TxSource};
 ///
 /// struct Text(&'static [u8]);
@@ -283,13 +328,14 @@ enum Phase {
 /// }
 ///
 /// let now = Instant::from_micros(1_000_000);
-/// let mut s = Server::new([0u8; 1024], Config::default(), now)?;
+/// let mut s = Server::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Config::default(), now)?;
 /// let rx = s.rx(now, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
 /// assert_eq!(rx.event, Some(Event::Request));
 /// s.respond(Response {
 ///     status: 200,
 ///     content_type: Some(b"text/plain"),
 ///     content_length: Some(2),
+///     headers: &[],
 /// })?;
 /// let mut out = [0u8; 256];
 /// let tx = s.tx(now, &mut out, &mut Text(b"ok"));
@@ -305,38 +351,46 @@ pub struct Server<S> {
     head: Head<S>,
     config: Config,
     phase: Phase,
-    own: Own,
+    own: Own<S>,
     /// The version the last request asked in, which C answers a refused
     /// request target in: `wsi->stream.request_version`.
     version: Version,
 }
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
-    /// A connection whose request heads are kept in `storage`.
+    /// A connection whose request heads are kept in `storage`'s table,
+    /// and its answers composed in its `out`.  The connection starts at
+    /// `now`, and its first request's head must be whole within
+    /// [`Timeouts::head`] of it.
     ///
     /// # Errors
     ///
-    /// [`CapacityTooLarge`] if `storage` is longer than a table may be.
-    /// The connection starts at `now`, and its first request's head must
-    /// be whole within [`Timeouts::head`] of it.
-    pub fn new(storage: S, config: Config, now: Instant) -> Result<Self, CapacityTooLarge> {
+    /// [`NewError`] if the table's storage is longer than a table may be,
+    /// or `out` is shorter than [`MIN_OUT`].
+    pub fn new(storage: Storage<S>, config: Config, now: Instant) -> Result<Self, NewError> {
+        if storage.out.as_ref().len() < MIN_OUT {
+            return Err(NewError::OutTooSmall);
+        }
         Ok(Self {
-            head: Head::new(storage, Side::Server, config.head)?,
+            head: Head::new(storage.table, Side::Server, config.head)
+                .map_err(NewError::Capacity)?,
             config,
             phase: Phase::Head(Wait::Head(now.saturating_add(config.timeouts.head))),
-            own: Own::new(),
+            own: Own::new(storage.out),
             version: Version::Http10,
         })
     }
 
-    /// Gives back the storage the connection's header table was made in.
-    /// It is done with the connection: as C drops the ah when the user
-    /// returns from ESTABLISHED, a server upgraded to ws gives it back
-    /// once the request event, the last time the headers are seen, is
-    /// over.
+    /// Gives back the storage the connection was made in.  It is done
+    /// with the connection: as C drops the ah when the user returns from
+    /// ESTABLISHED, a server upgraded to ws gives it back once the request
+    /// event, the last time the headers are seen, is over.
     #[must_use]
-    pub fn into_storage(self) -> S {
-        self.head.into_table().into_storage()
+    pub fn into_storage(self) -> Storage<S> {
+        Storage {
+            table: self.head.into_table().into_storage(),
+            out: self.own.into_storage(),
+        }
     }
 
     /// The request in hand's headers.
@@ -419,7 +473,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             Phase::Head(Wait::Head(_)) | Phase::Request(_) | Phase::Refusing(_) => Close::Abort,
             Phase::Closed(c) => c,
         };
-        self.own = Own::new();
+        self.own.clear();
         self.phase = Phase::Closed(close);
     }
 
@@ -536,7 +590,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     /// # Errors
     ///
     /// [`RespondError::NotNow`] if there is no request in hand, or it is
-    /// answered already.
+    /// answered already; [`RespondError::TooLong`] if `extra` does not fit,
+    /// and the request is still unanswered.
     pub fn refuse_upgrade(
         &mut self,
         now: Instant,
@@ -552,29 +607,26 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 return Err(RespondError::NotNow);
             }
         }
-        self.refuse_with(now, self.version, code, b"", extra);
+        self.own
+            .compose(|o| status_page(o, self.version, code, b"", extra))?;
+        self.refusing(now);
         Ok(())
     }
 
-    /// Queues C's status page, then the shutdown.
+    /// Queues C's status page, then the shutdown.  It fits: `out` is at
+    /// least [`MIN_OUT`], which every page the server writes itself fits
+    /// in (a test says so).
     fn refuse(&mut self, now: Instant, version: Version, code: u16, text: &[u8]) {
-        self.refuse_with(now, version, code, text, None);
+        // if it did not, nothing would be written before the shutdown
+        let _ = self
+            .own
+            .compose(|o| status_page(o, version, code, text, None));
+        self.refusing(now);
     }
 
     /// The status page is an answer: it goes under the response's
     /// watchdog.
-    fn refuse_with(
-        &mut self,
-        now: Instant,
-        version: Version,
-        code: u16,
-        text: &[u8],
-        extra: Option<(&[u8], &[u8])>,
-    ) {
-        self.own = Own::new();
-        if status_page(&mut self.own, version, code, text, extra).is_err() {
-            self.own = Own::new();
-        }
+    fn refusing(&mut self, now: Instant) {
         self.phase = Phase::Refusing(now.saturating_add(self.config.timeouts.response));
     }
 
@@ -701,8 +753,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     ///
     /// # Errors
     ///
-    /// [`RespondError`] if there is none unanswered, or the head is too
-    /// long.
+    /// [`RespondError`] if there is none unanswered, the head is too
+    /// long, or one of the application's headers is refused.  The request
+    /// is then still unanswered.
     pub fn respond(&mut self, r: Response<'_>) -> Result<(), RespondError> {
         let Phase::Request(mut t) = self.phase else {
             return Err(RespondError::NotNow);
@@ -710,24 +763,28 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         if t.reply != Reply::Awaited {
             return Err(RespondError::NotNow);
         }
-        let mut own = Own::new();
-        status_line(&mut own, self.version, r.status)?;
-        if let Some(ct) = r.content_type {
-            own.push(b"content-type: ")?;
-            own.push(ct)?;
-            own.push(b"\r\n")?;
-        }
-        if let Some(n) = r.content_length {
-            own.push(b"content-length: ")?;
-            own.push_u64(n)?;
-            own.push(b"\r\n")?;
-        } else {
-            // there is no length: the connection's close ends it
-            own.push(b"connection: close\r\n")?;
+        let version = self.version;
+        self.own.compose(|own| {
+            status_line(own, version, r.status)?;
+            if let Some(ct) = r.content_type {
+                own.push(b"content-type: ")?;
+                own.push(ct)?;
+                own.push(b"\r\n")?;
+            }
+            if let Some(n) = r.content_length {
+                own.push(b"content-length: ")?;
+                own.push_u64(n)?;
+                own.push(b"\r\n")?;
+            } else {
+                // there is no length: the connection's close ends it
+                own.push(b"connection: close\r\n")?;
+            }
+            own.push_headers(r.headers, &RESERVED)?;
+            own.push(b"\r\n")
+        })?;
+        if r.content_length.is_none() {
             t.keep_alive = false;
         }
-        own.push(b"\r\n")?;
-        self.own = own;
         // a HEAD's answer has no payload, whatever its length says
         t.reply = Reply::Payload(if t.head_request {
             Some(0)
@@ -906,7 +963,11 @@ fn reason(code: u16) -> &'static [u8] {
     }
 }
 
-fn status_line(own: &mut Own, v: Version, code: u16) -> Result<(), RespondError> {
+fn status_line<S: AsRef<[u8]> + AsMut<[u8]>>(
+    own: &mut Own<S>,
+    v: Version,
+    code: u16,
+) -> Result<(), RespondError> {
     own.push(match v {
         Version::Http10 => b"HTTP/1.0 ",
         Version::Http11 => b"HTTP/1.1 ",
@@ -919,8 +980,8 @@ fn status_line(own: &mut Own, v: Version, code: u16) -> Result<(), RespondError>
 
 /// C's status page: `_lws_return_http_status()` and
 /// `lws_http_status_page_body()`.
-fn status_page(
-    own: &mut Own,
+fn status_page<S: AsRef<[u8]> + AsMut<[u8]>>(
+    own: &mut Own<S>,
     v: Version,
     code: u16,
     text: &[u8],
@@ -930,9 +991,8 @@ fn status_page(
 content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>\
 </head><body><h1>";
     const POST: &[u8] = b"</body></html>";
-    let mut code_text = Own::new();
-    code_text.push_u64(u64::from(code))?;
-    let code_text = code_text.buf.get(..code_text.len).unwrap_or_default();
+    let mut d = [0u8; 20];
+    let code_text = decimal(u64::from(code), &mut d);
     let body_len = [PRE.len(), code_text.len(), 5, text.len(), POST.len()]
         .iter()
         .try_fold(0usize, |a, n| a.checked_add(*n))
@@ -960,6 +1020,7 @@ mod tests {
     extern crate alloc;
 
     use super::*;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// When the tests' connections are made, and all they do happens.
@@ -973,7 +1034,15 @@ mod tests {
     }
 
     fn server() -> Server<[u8; 1024]> {
-        Server::new([0u8; 1024], Config::default().with_max_body(100), T0).unwrap()
+        Server::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            Config::default().with_max_body(100),
+            T0,
+        )
+        .unwrap()
     }
 
     /// What the server writes for `head` before it shuts down.
@@ -1058,6 +1127,7 @@ mod tests {
             status: 200,
             content_type: None,
             content_length: Some(0),
+            headers: &[],
         })
         .unwrap();
         let mut out = [0u8; 256];
@@ -1083,6 +1153,7 @@ mod tests {
                 status: 200,
                 content_type: None,
                 content_length: Some(0),
+                headers: &[],
             })
             .unwrap();
             let mut out = [0u8; 256];
@@ -1103,6 +1174,7 @@ mod tests {
             status: 200,
             content_type: None,
             content_length: None,
+            headers: &[],
         })
         .unwrap();
         let mut out = [0u8; 256];
@@ -1117,7 +1189,8 @@ mod tests {
             s.respond(Response {
                 status: 200,
                 content_type: None,
-                content_length: None
+                content_length: None,
+                headers: &[],
             }),
             Err(RespondError::NotNow)
         );
@@ -1143,6 +1216,7 @@ mod tests {
         status: 200,
         content_type: None,
         content_length: Some(2),
+        headers: &[],
     };
 
     #[test]
@@ -1241,7 +1315,15 @@ mod tests {
     /// A server that has answered one request, at `T0`, and keeps the
     /// connection.
     fn kept(t: Timeouts) -> Server<[u8; 1024]> {
-        let mut s = Server::new([0u8; 1024], Config::default().with_timeouts(t), T0).unwrap();
+        let mut s = Server::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            Config::default().with_timeouts(t),
+            T0,
+        )
+        .unwrap();
         s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
         s.respond(OK2).unwrap();
         let mut out = [0u8; 256];
@@ -1304,13 +1386,169 @@ mod tests {
         assert!(!tx.more);
     }
 
+    /// A server whose answers are composed in `out` bytes.
+    fn server_out(out: usize) -> Server<Vec<u8>> {
+        let mut s = Server::new(
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; out],
+            },
+            Config::default(),
+            T0,
+        )
+        .unwrap();
+        s.rx(T0, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        s
+    }
+
+    #[test]
+    fn the_applications_headers_follow_the_servers() {
+        let mut s = server_out(MIN_OUT);
+        s.respond(Response {
+            headers: &[(b"x-a", b"1"), (b"Cache-Control", b"max-age=60, \tpublic")],
+            ..OK2
+        })
+        .unwrap();
+        let mut out = [0u8; 256];
+        let tx = s.tx(T0, &mut out, &mut Text(b"ok"));
+        assert_eq!(
+            &out[..tx.written],
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\
+              x-a: 1\r\nCache-Control: max-age=60, \tpublic\r\n\r\nok"
+        );
+    }
+
+    #[test]
+    fn a_header_that_could_end_its_line_or_reframe_is_refused_and_the_request_waits() {
+        for (h, why) in [
+            ((&b""[..], &b"v"[..]), HeaderRefused::Name),
+            ((b"a b", b"v"), HeaderRefused::Name),
+            ((b"a:", b"v"), HeaderRefused::Name),
+            ((b"a\r\nb", b"v"), HeaderRefused::Name),
+            ((b"a", b"v\r\nInjected: 1"), HeaderRefused::Value),
+            ((b"a", b"v\n"), HeaderRefused::Value),
+            ((b"a", b"v\0"), HeaderRefused::Value),
+            ((b"Content-Length", b"1"), HeaderRefused::Reserved),
+            ((b"TRANSFER-ENCODING", b"chunked"), HeaderRefused::Reserved),
+            ((b"connection", b"keep-alive"), HeaderRefused::Reserved),
+            ((b"Upgrade", b"websocket"), HeaderRefused::Reserved),
+            ((b"content-type", b"text/html"), HeaderRefused::Reserved),
+        ] {
+            let mut s = server_out(MIN_OUT);
+            assert_eq!(
+                s.respond(Response {
+                    headers: &[(b"ok", b"1"), h],
+                    ..OK2
+                }),
+                Err(RespondError::Header(why)),
+                "{h:?}"
+            );
+            // nothing was composed, and the request can still be answered
+            assert!(!s.wants_write());
+            assert!(s.is_awaiting_answer());
+            s.respond(OK2).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_head_is_as_long_as_its_storage_allows() {
+        // npro.rs' vhost headers come to over a kilobyte
+        let csp = [b'a'; 1500];
+        let headers: [(&[u8], &[u8]); 1] = [(b"content-security-policy", &csp)];
+        let mut s = server_out(MIN_OUT);
+        assert_eq!(
+            s.respond(Response {
+                headers: &headers,
+                ..OK2
+            }),
+            Err(RespondError::TooLong)
+        );
+        assert!(!s.wants_write());
+        assert!(s.is_awaiting_answer());
+        let mut roomy = server_out(4096);
+        roomy
+            .respond(Response {
+                headers: &headers,
+                ..OK2
+            })
+            .unwrap();
+        let mut out = vec![0u8; 4096];
+        let tx = roomy.tx(T0, &mut out, &mut Text(b"ok"));
+        assert!(out[..tx.written].ends_with(b"\r\n\r\nok"));
+        assert!(
+            out[..tx.written]
+                .windows(csp.len())
+                .any(|w| w == csp.as_slice())
+        );
+    }
+
+    #[test]
+    fn out_storage_is_at_least_min_out() {
+        let made = |n| {
+            Server::new(
+                Storage {
+                    table: vec![0u8; 1024],
+                    out: vec![0u8; n],
+                },
+                Config::default(),
+                T0,
+            )
+            .map(|_| ())
+        };
+        assert_eq!(made(MIN_OUT - 1), Err(NewError::OutTooSmall));
+        assert_eq!(made(MIN_OUT), Ok(()));
+    }
+
+    #[test]
+    fn every_page_the_server_refuses_with_fits_in_min_out() {
+        for (code, text) in [
+            (400, &b""[..]),
+            (403, b""),
+            (413, b""),
+            (414, b"Oversized request URI"),
+            (417, b""),
+            (431, b"Oversized headers"),
+            (501, b""),
+            (505, b""),
+        ] {
+            for v in [Version::Http10, Version::Http11] {
+                let mut own = Own::new([0u8; MIN_OUT]);
+                assert_eq!(
+                    own.compose(|o| status_page(o, v, code, text, None)),
+                    Ok(()),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_upgrade_refusal_too_long_leaves_the_request_unanswered() {
+        let mut s = server_out(MIN_OUT);
+        let long = [b'v'; MIN_OUT];
+        assert_eq!(
+            s.refuse_upgrade(T0, 426, Some((b"x", &long))),
+            Err(RespondError::TooLong)
+        );
+        assert!(s.is_awaiting_answer());
+        assert!(!s.wants_write());
+    }
+
     #[test]
     fn the_storage_comes_back() {
-        let mut s = Server::new([7u8; 64], Config::default(), T0).unwrap();
+        let mut s = Server::new(
+            Storage {
+                table: [7u8; 512],
+                out: [0u8; 512],
+            },
+            Config::default(),
+            T0,
+        )
+        .unwrap();
         s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
         // the same storage, holding what the request's head was parsed into
-        let storage: [u8; 64] = s.into_storage();
-        assert!(storage.windows(2).any(|w| w == b"/\0"));
+        let storage: Storage<[u8; 512]> = s.into_storage();
+        assert!(storage.table.windows(2).any(|w| w == b"/\0"));
     }
 
     #[test]

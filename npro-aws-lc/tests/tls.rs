@@ -10,6 +10,7 @@ use std::sync::Arc;
 use npro_core::random::Random;
 use npro_core::random::Unavailable;
 use npro_core::time::Instant;
+use npro_h1::Storage;
 use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
 use npro_h1::server::{Config, Event as H1s, Response, Server, TxSource};
 use npro_io::conn::{Conn, Event, RoleMut};
@@ -81,7 +82,10 @@ fn bufs() -> (Buffers<Vec<u8>>, NetBuffers<Vec<u8>>) {
 
 fn client_driver(layer: RustlsClient) -> C<RustlsClient> {
     let c = Client::new(
-        vec![0u8; 1024],
+        Storage {
+            table: vec![0u8; 1024],
+            out: vec![0u8; 512],
+        },
         Request {
             method: b"GET",
             path: b"/",
@@ -100,7 +104,15 @@ fn client_driver(layer: RustlsClient) -> C<RustlsClient> {
 }
 
 fn server_driver(layer: RustlsServer) -> C<RustlsServer> {
-    let s = Server::new(vec![0u8; 1024], Config::default(), T0).unwrap();
+    let s = Server::new(
+        Storage {
+            table: vec![0u8; 1024],
+            out: vec![0u8; 512],
+        },
+        Config::default(),
+        T0,
+    )
+    .unwrap();
     let (b, n) = bufs();
     Driver::with_tls(Conn::h1_server(s), b, layer, n, T0)
 }
@@ -174,6 +186,7 @@ fn get(mut c: C<RustlsClient>, mut s: C<RustlsServer>) -> Run {
                     status: 200,
                     content_type: None,
                     content_length: None,
+                    headers: &[],
                 })
                 .unwrap();
                 step.request_write();

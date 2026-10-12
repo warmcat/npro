@@ -35,6 +35,7 @@
 //! ```
 //! use npro_core::random::SeededRandom;
 //! use npro_core::time::Instant;
+//! use npro_h1::Storage;
 //! use npro_h1::server::{Config, Event as H1, Response, Server, TxSource};
 //! use npro_io::conn::{Conn, Event, RoleMut};
 //! use npro_io::driver::{Buffers, Driver, Want};
@@ -51,7 +52,7 @@
 //!
 //! let now = Instant::from_micros(1_000_000);
 //! let conn: Conn<_, SeededRandom> =
-//!     Conn::h1_server(Server::new([0u8; 1024], Config::default(), now)?);
+//!     Conn::h1_server(Server::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Config::default(), now)?);
 //! let (mut rx, mut tx) = ([0u8; 256], [0u8; 256]);
 //! let bufs = Buffers { rx: &mut rx[..], tx: &mut tx[..], inflate: &mut [][..] };
 //! let mut d = Driver::new(conn, bufs);
@@ -67,7 +68,7 @@
 //! while let Some(mut step) = d.poll_rx(now) {
 //!     if step.event() == Some(Event::H1Server(H1::Request)) {
 //!         let RoleMut::H1Server(s) = step.conn().role_mut() else { unreachable!() };
-//!         s.respond(Response { status: 200, content_type: None, content_length: Some(2) })?;
+//!         s.respond(Response { status: 200, content_type: None, content_length: Some(2), headers: &[] })?;
 //!         step.request_write();
 //!     }
 //! }
@@ -834,6 +835,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use npro_core::random::SeededRandom;
+    use npro_h1::Storage;
     use npro_h1::client::Event as H1c;
     use npro_h1::client::{Client, Connection, Request, RequestBody, Scheme};
     use npro_h1::server::{Config, Event as H1, Response, Server};
@@ -855,7 +857,15 @@ mod tests {
     }
 
     fn server(rx: usize, tx: usize) -> D {
-        let s = Server::new(vec![0u8; 1024], Config::default(), T0).unwrap();
+        let s = Server::new(
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; 512],
+            },
+            Config::default(),
+            T0,
+        )
+        .unwrap();
         Driver::new(Conn::h1_server(s), bufs(rx, tx))
     }
 
@@ -926,6 +936,7 @@ mod tests {
                     status: 200,
                     content_type: None,
                     content_length: Some(2),
+                    headers: &[],
                 })
                 .unwrap();
                 step.request_write();
@@ -1068,7 +1079,10 @@ mod tests {
     #[test]
     fn a_response_body_ending_with_the_read_is_ended() {
         let c = Client::new(
-            vec![0u8; 1024],
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; 512],
+            },
             Request {
                 method: b"GET",
                 path: b"/",
@@ -1115,7 +1129,14 @@ mod tests {
             headers: &[],
             body: RequestBody::None,
         };
-        let c = Client::new(vec![0u8; 1024], req(b"/one")).unwrap();
+        let c = Client::new(
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; 512],
+            },
+            req(b"/one"),
+        )
+        .unwrap();
         let mut d: D = Driver::new(Conn::h1_client(c), bufs(256, 256));
         let ended = |drv: &mut D| {
             let mut ended = false;
@@ -1161,7 +1182,10 @@ mod tests {
     #[test]
     fn the_fin_comes_after_what_came_before_it() {
         let c = Client::new(
-            vec![0u8; 1024],
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; 512],
+            },
             Request {
                 method: b"GET",
                 path: b"/",
@@ -1252,6 +1276,7 @@ mod tls_tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use npro_core::random::SeededRandom;
+    use npro_h1::Storage;
     use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
     use npro_h1::server::{Config, Event as H1s, Response, Server};
 
@@ -1480,7 +1505,10 @@ mod tls_tests {
     fn client_with(method: &[u8], body: RequestBody) -> Conn<Vec<u8>, SeededRandom> {
         Conn::h1_client(
             Client::new(
-                vec![0u8; 1024],
+                Storage {
+                    table: vec![0u8; 1024],
+                    out: vec![0u8; 512],
+                },
                 Request {
                     method,
                     path: b"/",
@@ -1498,7 +1526,17 @@ mod tls_tests {
     }
 
     fn server() -> Conn<Vec<u8>, SeededRandom> {
-        Conn::h1_server(Server::new(vec![0u8; 1024], Config::default(), T0).unwrap())
+        Conn::h1_server(
+            Server::new(
+                Storage {
+                    table: vec![0u8; 1024],
+                    out: vec![0u8; 512],
+                },
+                Config::default(),
+                T0,
+            )
+            .unwrap(),
+        )
     }
 
     /// The server's payload.
@@ -1563,6 +1601,7 @@ mod tls_tests {
                         status: 200,
                         content_type: None,
                         content_length: None,
+                        headers: &[],
                     })
                     .unwrap();
                     step.request_write();
@@ -1668,7 +1707,14 @@ mod tls_tests {
             head: Duration::from_secs(60),
             ..npro_h1::server::Timeouts::DEFAULT
         };
-        let srv = Server::new(vec![0u8; 1024], Config::default().with_timeouts(t), T0);
+        let srv = Server::new(
+            Storage {
+                table: vec![0u8; 1024],
+                out: vec![0u8; 512],
+            },
+            Config::default().with_timeouts(t),
+            T0,
+        );
         let mut s = tls(Conn::h1_server(srv.unwrap()), Toy::new(Side::Server));
         let at = T0.checked_add(HANDSHAKE_TIMEOUT).unwrap();
         let Want::Io(io) = s.want(T0, &mut Text(Vec::new())) else {

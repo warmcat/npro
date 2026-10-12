@@ -19,6 +19,7 @@
 #[cfg(test)]
 mod h1_client_replay {
     use npro_core::time::Instant;
+    use npro_h1::Storage;
     use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
     use npro_h1::server::NoPayload;
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -65,7 +66,10 @@ mod h1_client_replay {
             b"GET"
         };
         let mut c = Client::new(
-            vec![0u8; DEFAULT_CAPACITY],
+            Storage {
+                table: vec![0u8; DEFAULT_CAPACITY],
+                out: vec![0u8; 512],
+            },
             Request {
                 method,
                 path: b"/x",

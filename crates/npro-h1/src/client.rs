@@ -60,11 +60,23 @@ use core::time::Duration;
 
 use npro_core::time::Instant;
 
+use crate::Storage;
 use crate::chunked::{self, Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
 use crate::head::{self, Head, Progress, Refused, Side};
-use crate::own::Own;
-pub use crate::own::{MAX_OWN, RespondError};
+pub use crate::own::{HeaderRefused, RespondError};
+use crate::own::{Own, check_header};
+
+/// The headers the client writes itself, which the application may not:
+/// `Host`, `Connection`, `Upgrade`, `Content-Length` and
+/// `Transfer-Encoding`.
+const RESERVED: [&[u8]; 5] = [
+    b"host",
+    b"connection",
+    b"upgrade",
+    b"content-length",
+    b"transfer-encoding",
+];
 use crate::server::TxSource;
 use crate::table::{CapacityTooLarge, Full, HeaderTable};
 use crate::token::Token;
@@ -208,77 +220,6 @@ impl core::fmt::Display for ChunkError {
 }
 
 impl core::error::Error for ChunkError {}
-
-/// Why one of the application's headers is refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderRefused {
-    /// Its name is empty or not an RFC 9110 token.
-    Name,
-    /// Its value has a CR, LF or NUL.
-    Value,
-    /// It is one the client writes itself: `Host`, `Connection`,
-    /// `Upgrade`, `Content-Length` or `Transfer-Encoding`.  Sent by the
-    /// application as well, the server could read the request's framing
-    /// differently from how the client sends it.
-    Reserved,
-}
-
-impl core::fmt::Display for HeaderRefused {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Name => "a header name is not a token",
-            Self::Value => "a header value has a CR, LF or NUL",
-            Self::Reserved => "a header the client writes itself",
-        })
-    }
-}
-
-impl core::error::Error for HeaderRefused {}
-
-/// The headers the client writes itself, which the application may not.
-const RESERVED: [&[u8]; 5] = [
-    b"host",
-    b"connection",
-    b"upgrade",
-    b"content-length",
-    b"transfer-encoding",
-];
-
-/// Whether `c` may be in an RFC 9110 token: `tchar`.
-const fn is_tchar(c: u8) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
-
-/// Checks one of the application's headers.
-fn check_header(name: &[u8], value: &[u8]) -> Result<(), HeaderRefused> {
-    if name.is_empty() || !name.iter().all(|c| is_tchar(*c)) {
-        return Err(HeaderRefused::Name);
-    }
-    if value.iter().any(|c| matches!(c, b'\r' | b'\n' | b'\0')) {
-        return Err(HeaderRefused::Value);
-    }
-    if RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r)) {
-        return Err(HeaderRefused::Reserved);
-    }
-    Ok(())
-}
 
 /// What becomes of the connection after the request: the last of the
 /// request's headers.
@@ -520,11 +461,12 @@ enum Asked {
 ///
 /// ```
 /// use npro_core::time::Instant;
+/// use npro_h1::Storage;
 /// use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
 /// use npro_h1::server::NoPayload;
 ///
 /// let now = Instant::from_micros(1_000_000);
-/// let mut c = Client::new([0u8; 1024], Request {
+/// let mut c = Client::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Request {
 ///     method: b"GET",
 ///     path: b"/x",
 ///     host: Some(b"example.com"),
@@ -552,7 +494,7 @@ pub struct Client<S> {
     head: Head<S>,
     asked: Asked,
     phase: Phase,
-    own: Own,
+    own: Own<S>,
     status: Option<u16>,
     /// How long the server has to answer.
     timeout: Duration,
@@ -590,7 +532,7 @@ pub enum NewError {
     Capacity(CapacityTooLarge),
     /// The request does not fit in the table.
     Table(Full),
-    /// The request's head does not fit in [`MAX_OWN`].
+    /// The request's head does not fit in [`Storage::out`].
     Head(RespondError),
     /// One of the application's headers is refused.
     Header(HeaderRefused),
@@ -615,16 +557,19 @@ impl core::error::Error for NewError {}
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     /// A connection to make `req`, keeping it and its response in
-    /// `storage`, as C keeps a client's request in the ah it parses the
-    /// response into.
+    /// `storage`'s table, as C keeps a client's request in the ah it
+    /// parses the response into, and composing its head in its `out`.
     ///
     /// # Errors
     ///
     /// [`NewError`] if the storage is too large, the request does not fit,
     /// or one of its headers is refused.
-    pub fn new(storage: S, req: Request<'_>) -> Result<Self, NewError> {
-        let (asked, up, own) = prepared(&req)?;
-        let mut t = HeaderTable::new(storage).map_err(NewError::Capacity)?;
+    pub fn new(storage: Storage<S>, req: Request<'_>) -> Result<Self, NewError> {
+        let (asked, up) = prepared(&req)?;
+        let mut own = Own::new(storage.out);
+        own.compose(|o| request_head(o, &req))
+            .map_err(NewError::Head)?;
+        let mut t = HeaderTable::new(storage.table).map_err(NewError::Capacity)?;
         tabled(&mut t, &req)?;
         Ok(Self {
             head: Head::with_table(t, Side::Client, head::Config::new()),
@@ -651,7 +596,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         if !matches!(self.phase, Phase::Idle { .. }) {
             return Err(NextError::NotIdle);
         }
-        let (asked, up, own) = prepared(&req).map_err(NextError::Request)?;
+        let (asked, up) = prepared(&req).map_err(NextError::Request)?;
+        // idle, nothing is held: a head that does not fit leaves it so
+        self.own
+            .compose(|o| request_head(o, &req))
+            .map_err(|e| NextError::Request(NewError::Head(e)))?;
         self.head.reset();
         if let Err(e) = tabled(self.head.table_mut(), &req) {
             self.phase = Phase::Closed;
@@ -659,7 +608,6 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         }
         self.asked = asked;
         self.phase = Phase::Asking { up };
-        self.own = own;
         self.status = None;
         Ok(())
     }
@@ -706,7 +654,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         if self.next_deadline().is_none_or(|d| now < d) {
             return;
         }
-        self.own = Own::new();
+        self.own.clear();
         self.phase = match self.phase {
             Phase::Idle { .. } => Phase::Closed,
             Phase::Asking { .. }
@@ -721,11 +669,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         };
     }
 
-    /// Gives back the storage the connection's header table was made in,
-    /// as [`crate::server::Server::into_storage`] does.
+    /// Gives back the storage the connection was made in, as
+    /// [`crate::server::Server::into_storage`] does.
     #[must_use]
-    pub fn into_storage(self) -> S {
-        self.head.into_table().into_storage()
+    pub fn into_storage(self) -> Storage<S> {
+        Storage {
+            table: self.head.into_table().into_storage(),
+            out: self.own.into_storage(),
+        }
     }
 
     /// The response's headers, after the request's own tokens.
@@ -889,12 +840,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     ///
     /// ```
     /// use npro_h1::client::{Client, Connection, Event, RedirectMethod, Request, RequestBody, Scheme};
+    /// use npro_h1::Storage;
     /// use npro_h1::server::NoPayload;
     /// use npro_h1::uri;
     /// use npro_core::time::Instant;
     ///
     /// let now = Instant::from_micros(1_000_000);
-    /// let mut c = Client::new([0u8; 1024], Request {
+    /// let mut c = Client::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Request {
     ///     method: b"POST",
     ///     path: b"/a/form",
     ///     host: Some(b"example.com"),
@@ -1259,9 +1211,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
 
 /// What a request is, checked, before any table is touched: what it
 /// asked, its body, and its head.
-fn prepared(req: &Request<'_>) -> Result<(Asked, Option<Upload>, Own), NewError> {
+fn prepared(req: &Request<'_>) -> Result<(Asked, Option<Upload>), NewError> {
     for (name, value) in req.headers {
-        check_header(name, value).map_err(NewError::Header)?;
+        check_header(name, value, &RESERVED).map_err(NewError::Header)?;
     }
     let up = match req.body {
         RequestBody::None | RequestBody::Length(0) => None,
@@ -1276,7 +1228,7 @@ fn prepared(req: &Request<'_>) -> Result<(Asked, Option<Upload>, Own), NewError>
         Connection::KeepAlive => Asked::KeepAlive,
         Connection::Upgrade(_) => Asked::Upgrade,
     };
-    Ok((asked, up, request_head(req).map_err(NewError::Head)?))
+    Ok((asked, up))
 }
 
 /// Puts the request's own tokens in the emptied table `t`, then marks
@@ -1372,8 +1324,10 @@ fn upload(up: Upload, room: &mut [u8], src: &mut dyn TxSource) -> (usize, Option
 }
 
 /// C's request head.
-fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
-    let mut o = Own::new();
+fn request_head<S: AsRef<[u8]> + AsMut<[u8]>>(
+    o: &mut Own<S>,
+    r: &Request<'_>,
+) -> Result<(), RespondError> {
     o.push(r.method)?;
     o.push(b" ")?;
     o.push(r.path)?;
@@ -1399,12 +1353,7 @@ fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
         Connection::KeepAlive => {}
         Connection::Upgrade(lines) => o.push(lines)?,
     }
-    for (name, value) in r.headers {
-        o.push(name)?;
-        o.push(b": ")?;
-        o.push(value)?;
-        o.push(b"\r\n")?;
-    }
+    o.push_headers(r.headers, &RESERVED)?;
     match r.body {
         RequestBody::None => {}
         RequestBody::Length(n) => {
@@ -1414,8 +1363,7 @@ fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
         }
         RequestBody::Chunked => o.push(b"Transfer-Encoding: chunked\r\n")?,
     }
-    o.push(b"\r\n")?;
-    Ok(o)
+    o.push(b"\r\n")
 }
 
 /// C's `atoi()`: leading white space, a sign, then digits, as far as they
@@ -1461,7 +1409,10 @@ mod tests {
 
     fn get(method: &'static [u8]) -> Client<[u8; 1024]> {
         let mut c = Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method,
                 path: b"/x",
@@ -1510,7 +1461,10 @@ mod tests {
     #[test]
     fn an_upgrades_response_is_handed_over_unframed() {
         let mut c = Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"GET",
                 path: b"/x",
@@ -1586,7 +1540,10 @@ mod tests {
 
     fn with_headers(headers: &[(&[u8], &[u8])]) -> Result<Client<[u8; 1024]>, NewError> {
         Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"GET",
                 path: b"/x",
@@ -1651,7 +1608,10 @@ mod tests {
 
     fn unsent() -> Client<[u8; 1024]> {
         Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"GET",
                 path: b"/x",
@@ -1753,7 +1713,10 @@ mod tests {
 
     fn post(body: RequestBody) -> Client<[u8; 1024]> {
         Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"POST",
                 path: b"/x",
@@ -1884,7 +1847,10 @@ mod tests {
     #[test]
     fn an_upgrade_has_no_body() {
         let r = Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"GET",
                 path: b"/x",
@@ -1946,7 +1912,15 @@ mod tests {
     /// The body npro's own server takes from `wire`, which must be one
     /// request and nothing more.
     fn served(wire: &[u8]) -> Vec<u8> {
-        let mut s = Server::new([0u8; 1024], server::Config::default(), T0).unwrap();
+        let mut s = Server::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            server::Config::default(),
+            T0,
+        )
+        .unwrap();
         let mut input = wire;
         let mut body = Vec::new();
         loop {
@@ -2160,7 +2134,14 @@ mod tests {
 
     #[test]
     fn a_connection_kept_alive_is_kept_warm_for_the_next_request() {
-        let mut c = Client::new([0u8; 1024], kept(b"/one")).unwrap();
+        let mut c = Client::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            kept(b"/one"),
+        )
+        .unwrap();
         let (req, body) = exchange(
             &mut c,
             at(1),
@@ -2197,9 +2178,15 @@ mod tests {
 
     #[test]
     fn a_warm_connection_the_server_closes_is_released() {
-        let mut c = Client::new([0u8; 1024], kept(b"/"))
-            .unwrap()
-            .with_keep_warm(Duration::from_secs(30));
+        let mut c = Client::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            kept(b"/"),
+        )
+        .unwrap()
+        .with_keep_warm(Duration::from_secs(30));
         assert_eq!(
             exchange(&mut c, at(1), b"HTTP/1.1 204 No Content\r\n\r\n").1,
             b""
@@ -2212,7 +2199,14 @@ mod tests {
 
     #[test]
     fn bytes_on_a_warm_connection_fail_it() {
-        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        let mut c = Client::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            kept(b"/"),
+        )
+        .unwrap();
         assert_eq!(
             exchange(
                 &mut c,
@@ -2241,7 +2235,7 @@ mod tests {
             (Connection::KeepAlive, b"HTTP/1.1 200 OK\r\nConnection: Keep-Alive, CLOSE\r\nContent-Length: 0\r\n\r\n"),
             (Connection::KeepAlive, b"HTTP/1.1 200 OK\r\nConnection: x\r\nConnection: close \r\nContent-Length: 0\r\n\r\n"),
         ] {
-            let mut c = Client::new([0u8; 1024], Request { connection: request, ..kept(b"/") }).unwrap();
+            let mut c = Client::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Request { connection: request, ..kept(b"/") }).unwrap();
             assert_eq!(exchange(&mut c, at(1), response).1, b"");
             assert!(c.is_done());
             assert_eq!(c.next_deadline(), None, "{}", response.escape_ascii());
@@ -2252,7 +2246,14 @@ mod tests {
             assert_eq!(c.close(), Some(Close::Release));
         }
         // nor is a body that runs to the close
-        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        let mut c = Client::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            kept(b"/"),
+        )
+        .unwrap();
         assert_ne!(sent(&mut c, at(1), 1024, &mut NoPayload), b"");
         assert_eq!(
             c.rx(at(1), b"HTTP/1.1 200 OK\r\n\r\n").unwrap().event,
@@ -2264,7 +2265,14 @@ mod tests {
 
     #[test]
     fn a_next_request_refused_leaves_the_connection_warm() {
-        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        let mut c = Client::new(
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
+            kept(b"/"),
+        )
+        .unwrap();
         assert_eq!(c.next(kept(b"/")), Err(NextError::NotIdle));
         assert_eq!(
             exchange(
@@ -2287,7 +2295,15 @@ mod tests {
         );
         assert_eq!(c.next_deadline(), Some(at(6)));
         // one that does not fit in the table releases it
-        let mut small = Client::new([0u8; 64], kept(b"/")).unwrap();
+        let (mut table, mut head) = ([0u8; 64], [0u8; 512]);
+        let mut small = Client::new(
+            Storage {
+                table: &mut table[..],
+                out: &mut head[..],
+            },
+            kept(b"/"),
+        )
+        .unwrap();
         let mut out = [0u8; 256];
         let _ = small.tx(at(1), &mut out, &mut NoPayload);
         let rx = small

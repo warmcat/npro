@@ -29,6 +29,7 @@
 mod ws_client_replay {
     use npro_core::random::SeededRandom;
     use npro_core::time::Instant;
+    use npro_h1::Storage;
     use npro_h1::client::{Client, Connection, Event as H1Event, Request, RequestBody, Scheme};
     use npro_h1::server::{NoPayload, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -191,7 +192,10 @@ mod ws_client_replay {
             .request_lines(Some(OFFERED), c.extensions, &mut lines)
             .unwrap();
         let mut client = Client::new(
-            vec![0u8; DEFAULT_CAPACITY],
+            Storage {
+                table: vec![0u8; DEFAULT_CAPACITY],
+                out: vec![0u8; 512],
+            },
             Request {
                 method: b"GET",
                 path: b"/echo",

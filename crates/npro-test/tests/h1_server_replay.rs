@@ -22,6 +22,7 @@ mod h1_server_replay {
     use core::num::NonZeroU16;
 
     use npro_core::time::Instant;
+    use npro_h1::Storage;
     use npro_h1::head;
     use npro_h1::server::{Config, Event, Response, Server, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -82,6 +83,7 @@ mod h1_server_replay {
                 status: 200,
                 content_type: Some(b"text/plain"),
                 content_length: Some(len),
+                headers: &[],
             })
             .unwrap();
             self.out = payload.to_vec();
@@ -162,8 +164,15 @@ mod h1_server_replay {
     fn replay(t: &Transcript, cfg: head::Config, mut app: UriApp, rxs: usize) {
         let start = t.steps.first().map_or(0, |s| s.t_us);
         let time = |t_us: u64| Instant::from_micros(t.t0_us.checked_add(t_us).unwrap());
-        let mut s =
-            Server::new(vec![0u8; DEFAULT_CAPACITY], Config::new(cfg), time(start)).unwrap();
+        let mut s = Server::new(
+            Storage {
+                table: vec![0u8; DEFAULT_CAPACITY],
+                out: vec![0u8; 512],
+            },
+            Config::new(cfg),
+            time(start),
+        )
+        .unwrap();
         let mut steps = t.steps.iter().peekable();
         for _ in 0..rxs {
             let Some(step) = steps.next() else {

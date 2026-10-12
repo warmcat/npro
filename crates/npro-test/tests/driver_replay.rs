@@ -24,6 +24,7 @@ mod driver_replay {
 
     use npro_core::random::SeededRandom;
     use npro_core::time::Instant;
+    use npro_h1::Storage;
     use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
     use npro_h1::head;
     use npro_h1::server::{Config, Event as H1s, Response, Server, TxSource};
@@ -119,6 +120,7 @@ mod driver_replay {
                     status: 200,
                     content_type: Some(b"text/plain"),
                     content_length: Some(len),
+                    headers: &[],
                 })
                 .unwrap();
             self.payload(payload.to_vec());
@@ -188,7 +190,7 @@ mod driver_replay {
                         ws = ws.with_pmd(p.params());
                     }
                     let storage = conn.accept_ws(ws).unwrap();
-                    assert_eq!(storage.len(), DEFAULT_CAPACITY);
+                    assert_eq!(storage.table.len(), DEFAULT_CAPACITY);
                 }
                 Err(r) => {
                     let RoleMut::H1Server(server) = conn.role_mut() else {
@@ -414,7 +416,10 @@ mod driver_replay {
             let t = transcript(&all, case);
             let start = t.steps.first().map_or(0, |s| s.t_us);
             let s = Server::new(
-                vec![0u8; DEFAULT_CAPACITY],
+                Storage {
+                    table: vec![0u8; DEFAULT_CAPACITY],
+                    out: vec![0u8; 512],
+                },
                 Config::new(head::Config::new()),
                 Instant::from_micros(t.t0_us.checked_add(start).unwrap()),
             )
@@ -460,7 +465,10 @@ mod driver_replay {
                 .with_limit(Token::UserAgent, NonZeroU16::new(16).unwrap());
             let start = t.steps.first().map_or(0, |s| s.t_us);
             let s = Server::new(
-                vec![0u8; DEFAULT_CAPACITY],
+                Storage {
+                    table: vec![0u8; DEFAULT_CAPACITY],
+                    out: vec![0u8; 512],
+                },
                 Config::new(cfg),
                 Instant::from_micros(t.t0_us.checked_add(start).unwrap()),
             )
@@ -515,7 +523,10 @@ mod driver_replay {
                 .request_lines(Some(b"echo"), extensions, &mut lines)
                 .unwrap();
             let c = Client::new(
-                vec![0u8; DEFAULT_CAPACITY],
+                Storage {
+                    table: vec![0u8; DEFAULT_CAPACITY],
+                    out: vec![0u8; 512],
+                },
                 Request {
                     method: b"GET",
                     path: b"/echo",
@@ -559,7 +570,10 @@ mod driver_replay {
                 Some(StepKind::Tx(r)) if r.starts_with(b"HEAD ")
             );
             let c = Client::new(
-                vec![0u8; DEFAULT_CAPACITY],
+                Storage {
+                    table: vec![0u8; DEFAULT_CAPACITY],
+                    out: vec![0u8; 512],
+                },
                 Request {
                     method: if head { b"HEAD" } else { b"GET" },
                     path: b"/x",

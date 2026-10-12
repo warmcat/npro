@@ -340,6 +340,7 @@ impl core::error::Error for ClientRefusal {}
 /// ```
 /// use npro_core::random::SeededRandom;
 /// use npro_core::time::Instant;
+/// use npro_h1::Storage;
 /// use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
 /// use npro_h1::server::NoPayload;
 /// use npro_ws::handshake::{ClientKey, MAX_REQUEST_LINES};
@@ -351,7 +352,7 @@ impl core::error::Error for ClientRefusal {}
 /// let mut lines = [0u8; MAX_REQUEST_LINES + 32];
 /// let n = key.request_lines(Some(b"echo"), None, &mut lines).unwrap();
 /// let now = Instant::from_micros(1_000_000);
-/// let mut c = Client::new([0u8; 1024], Request {
+/// let mut c = Client::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Request {
 ///     method: b"GET",
 ///     path: b"/echo",
 ///     host: Some(b"sansio"),
@@ -553,6 +554,7 @@ mod tests {
     /// When the tests' connections do all they do.
     const T0: Instant = Instant::from_micros(1_000_000);
     use npro_core::random::SeededRandom;
+    use npro_h1::Storage;
     use npro_h1::client::{Client, Connection, Request, RequestBody, Scheme};
     use npro_h1::server::NoPayload;
 
@@ -586,7 +588,10 @@ mod tests {
             .request_lines(Some(b"echo, chat"), None, &mut lines)
             .unwrap();
         let mut c = Client::new(
-            [0u8; 1024],
+            Storage {
+                table: [0u8; 1024],
+                out: [0u8; 1024],
+            },
             Request {
                 method: b"GET",
                 path: b"/",

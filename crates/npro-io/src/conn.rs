@@ -24,6 +24,7 @@
 use npro_core::close::Close;
 use npro_core::random::Random;
 use npro_core::time::Instant;
+use npro_h1::Storage;
 use npro_h1::client::{self, Client};
 use npro_h1::server::{self, Server, TxSource};
 use npro_ws::conn::{self as ws, AsClient, AsServer, Ws};
@@ -50,13 +51,14 @@ enum Inner<S, R> {
 /// ```
 /// use npro_core::random::SeededRandom;
 /// use npro_core::time::Instant;
+/// use npro_h1::Storage;
 /// use npro_h1::server::{Config, Server};
 /// use npro_io::conn::{Conn, Event, Role};
 /// use npro_ws::conn::Ws;
 /// use npro_ws::handshake::{self, MAX_101};
 ///
 /// let now = Instant::from_micros(1_000_000);
-/// let server = Server::new([0u8; 1024], Config::default(), now)?;
+/// let server = Server::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Config::default(), now)?;
 /// // a server's connection: the random is a ws client's, unused here
 /// let mut conn: Conn<_, SeededRandom> = Conn::h1_server(server);
 ///
@@ -74,7 +76,7 @@ enum Inner<S, R> {
 /// let mut first = [0u8; MAX_101];
 /// let n = handshake::response_101(&a, b"chat", b"", &mut first).unwrap();
 /// let storage = conn.accept_ws(Ws::server(&first[..n], now))?;
-/// assert_eq!(storage.len(), 1024);
+/// assert_eq!((storage.table.len(), storage.out.len()), (1024, 1024));
 /// assert!(matches!(conn.role(), Role::WsServer(_)));
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
@@ -342,14 +344,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
 
     /// The h1 server's request in hand asked for ws, and the application
     /// takes it: the connection becomes `ws`, made with the 101 to go
-    /// first and the extensions agreed.  The header table's storage comes
+    /// first and the extensions agreed.  The h1 role's storage comes
     /// back.
     ///
     /// # Errors
     ///
     /// [`NotNow`], and the connection is as it was, if it is not an h1
     /// server with a request awaiting its answer.
-    pub fn accept_ws(&mut self, ws: Ws<AsServer>) -> Result<S, NotNow> {
+    pub fn accept_ws(&mut self, ws: Ws<AsServer>) -> Result<Storage<S>, NotNow> {
         match &self.inner {
             Inner::H1Server(s) if s.is_awaiting_answer() => {}
             Inner::H1Server(_) | Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_) => {
@@ -369,13 +371,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
     /// The h1 client's request for ws was answered with a final response,
     /// which the application checked
     /// ([`npro_ws::handshake::ClientKey::check`]): the connection becomes
-    /// `ws`.  The header table's storage comes back.
+    /// `ws`.  The h1 role's storage comes back.
     ///
     /// # Errors
     ///
     /// [`NotNow`], and the connection is as it was, if it is not an h1
     /// client whose request for an upgrade has had its final response.
-    pub fn upgraded_ws(&mut self, ws: Ws<AsClient<R>>) -> Result<S, NotNow> {
+    pub fn upgraded_ws(&mut self, ws: Ws<AsClient<R>>) -> Result<Storage<S>, NotNow> {
         match &self.inner {
             Inner::H1Client(c) if c.is_upgraded() => {}
             Inner::H1Server(_) | Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_) => {
@@ -405,7 +407,17 @@ mod tests {
     type ServerConn = Conn<[u8; 1024], SeededRandom>;
 
     fn server() -> ServerConn {
-        Conn::h1_server(Server::new([0u8; 1024], Config::default(), T0).unwrap())
+        Conn::h1_server(
+            Server::new(
+                Storage {
+                    table: [0u8; 1024],
+                    out: [0u8; 1024],
+                },
+                Config::default(),
+                T0,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -447,6 +459,7 @@ mod tests {
             status: 200,
             content_type: None,
             content_length: Some(0),
+            headers: &[],
         })
         .unwrap();
         assert_eq!(c.accept_ws(Ws::server(b"", T0)), Err(NotNow));
@@ -454,7 +467,10 @@ mod tests {
         // nor from a client
         let mut client: ServerConn = Conn::h1_client(
             Client::new(
-                [0u8; 1024],
+                Storage {
+                    table: [0u8; 1024],
+                    out: [0u8; 1024],
+                },
                 Request {
                     method: b"GET",
                     path: b"/",
@@ -476,7 +492,10 @@ mod tests {
     fn a_client_becomes_ws_only_after_its_final_response() {
         let mut c: ServerConn = Conn::h1_client(
             Client::new(
-                [0u8; 1024],
+                Storage {
+                    table: [0u8; 1024],
+                    out: [0u8; 1024],
+                },
                 Request {
                     method: b"GET",
                     path: b"/",
@@ -512,7 +531,10 @@ mod tests {
     fn a_failed_client_takes_nothing_and_asks_to_abort() {
         let mut c: ServerConn = Conn::h1_client(
             Client::new(
-                [0u8; 1024],
+                Storage {
+                    table: [0u8; 1024],
+                    out: [0u8; 1024],
+                },
                 Request {
                     method: b"GET",
                     path: b"/",

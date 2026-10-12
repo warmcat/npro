@@ -14,6 +14,10 @@
 //! - [`client`]: an h1 client connection's transaction;
 //! - [`uri`]: a URL a client connects to, and a reference resolved
 //!   against one.
+//!
+//! Both connections work in the caller's [`Storage`]: the header table the
+//! peer's head is parsed into, and the buffer the connection's own head is
+//! composed in.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -27,3 +31,5 @@ pub mod server;
 pub mod table;
 pub mod token;
 pub mod uri;
+
+pub use own::Storage;
