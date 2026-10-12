@@ -24,7 +24,7 @@ mod h1;
 mod targets;
 mod ws;
 
-pub use h1::{chunked, h1_request, h1_response};
+pub use h1::{chunked, h1_request, h1_response, uri};
 pub use targets::{base64, sha1, transcript, utf8};
 pub use ws::{ws_client, ws_pmd, ws_server};
 
@@ -55,6 +55,8 @@ pub enum Target {
     H1Response,
     /// [`chunked`]: the chunked transfer coding's decoder.
     Chunked,
+    /// [`uri`]: a URL parsed, or a reference resolved.
+    Uri,
     /// [`ws_server`]: the ws frame parser, as a server.
     WsServer,
     /// [`ws_client`]: the ws frame parser, as a client.
@@ -66,7 +68,7 @@ pub enum Target {
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -74,6 +76,7 @@ impl Target {
         Self::H1Request,
         Self::H1Response,
         Self::Chunked,
+        Self::Uri,
         Self::WsServer,
         Self::WsClient,
         Self::WsPmd,
@@ -90,6 +93,7 @@ impl Target {
             Self::H1Request => "h1-request",
             Self::H1Response => "h1-response",
             Self::Chunked => "chunked",
+            Self::Uri => "uri",
             Self::WsServer => "ws-server",
             Self::WsClient => "ws-client",
             Self::WsPmd => "ws-pmd",
@@ -111,6 +115,7 @@ impl Target {
             Self::H1Request => h1_request(data),
             Self::H1Response => h1_response(data),
             Self::Chunked => chunked(data),
+            Self::Uri => uri(data),
             Self::WsServer => ws_server(data),
             Self::WsClient => ws_client(data),
             Self::WsPmd => ws_pmd(data),

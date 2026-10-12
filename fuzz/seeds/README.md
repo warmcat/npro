@@ -23,6 +23,9 @@ The protocol crates' targets start from the C library's corpora
   `crates/npro-test/h1/requests/`, named as there;
 - `h1-response` and `chunked`: some of `crates/npro-test/h1/responses/`
   and `chunked/`;
+- `uri`: written for it, a control byte first, its top bit set for a
+  reference resolved rather than a URL parsed: RFC 3986's examples, an
+  IPv6 literal with a port, and some it refuses;
 - `ws-server`: C's `fuzz/fuzz-ws/seeds`, each behind a control byte of 0,
   named as there;
 - `ws-pmd`: C's `fuzz/fuzz-ws-pmd/seeds`, each behind a control byte of

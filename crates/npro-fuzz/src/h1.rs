@@ -1,5 +1,5 @@
-//! The h1 targets: the head parser as a server and as a client, and the
-//! dechunker.
+//! The h1 targets: the head parser as a server and as a client, the
+//! dechunker, and URLs.
 
 use core::num::NonZeroU16;
 
@@ -7,6 +7,7 @@ use npro_h1::chunked::{Chunk, Dechunk, SKIP_MAX};
 use npro_h1::head::{Config, Head, Progress, Refused, Side, UnknownMethod};
 use npro_h1::table::{DEFAULT_CAPACITY, HeaderTable};
 use npro_h1::token::Token;
+use npro_h1::uri::{self, Scheme, Uri, UriError};
 
 use crate::targets::{Pieces, control, finding};
 
@@ -373,6 +374,152 @@ pub fn chunked(data: &[u8]) {
         finding(
             "chunked",
             format_args!("in pieces {pieces:?}, the grammar says {want:?}"),
+        );
+    }
+}
+
+/// The bases the `uri` target resolves against, chosen by the control
+/// byte: RFC 3986 5.4's, one with an IPv6 literal and a port, one with an
+/// empty path.
+const BASES: [&[u8]; 3] = [b"http://a/b/c/d;p?q", b"wss://[::1]:9/x/", b"https://h"];
+
+/// What every URL npro keeps must be: a host of unreserved characters or
+/// an IPv6 literal, a port, and a target from `/` with no dot segments in
+/// its path and only RFC 3986's characters, each `%` followed by two hex
+/// digits.
+fn well_formed(u: &Uri<'_>) -> Result<(), &'static str> {
+    let host = u.authority_host();
+    let host_ok = match host.strip_prefix(b"[").and_then(|h| h.strip_suffix(b"]")) {
+        Some(v6) => {
+            !v6.is_empty()
+                && v6
+                    .iter()
+                    .all(|c| c.is_ascii_hexdigit() || b":.".contains(c))
+        }
+        None => {
+            !host.is_empty()
+                && host
+                    .iter()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(c))
+        }
+    };
+    if !host_ok {
+        return Err("a host that is not a name or literal");
+    }
+    if u.port() == 0 {
+        return Err("port 0");
+    }
+    if !u.target().starts_with(b"/") || !u.path().starts_with(b"/") {
+        return Err("a target not from /");
+    }
+    if u.path()
+        .split(|c| *c == b'/')
+        .any(|s| s == b"." || s == b"..")
+    {
+        return Err("a dot segment left in the path");
+    }
+    let mut it = u.target().iter();
+    while let Some(c) = it.next() {
+        let ok = match c {
+            b'%' => {
+                matches!((it.next(), it.next()), (Some(a), Some(b)) if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
+            }
+            c => c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(c),
+        };
+        if !ok {
+            return Err("a character not allowed in a target");
+        }
+    }
+    Ok(())
+}
+
+/// The URL as text, from its parts.
+fn written(u: &Uri<'_>) -> Vec<u8> {
+    let scheme: &[u8] = match u.scheme() {
+        Scheme::Http => b"http",
+        Scheme::Https => b"https",
+        Scheme::Ws => b"ws",
+        Scheme::Wss => b"wss",
+    };
+    [
+        scheme,
+        b"://",
+        u.authority_host(),
+        b":",
+        u.port().to_string().as_bytes(),
+        u.target(),
+    ]
+    .concat()
+}
+
+/// [`npro_h1::uri`]: a URL parsed, or with the control byte's top bit, a
+/// reference resolved against one of three bases.  What is kept must be
+/// well formed (a name or IPv6 literal for a host, a port, a target from
+/// `/` with no dot segments and only RFC 3986's characters); written out
+/// again it must parse to itself, and
+/// resolving the empty reference against it must give it back; and in
+/// storage one byte smaller than it takes it must be refused, not cut
+/// short.
+pub fn uri(data: &[u8]) {
+    let (ctl, input) = control(data);
+    let mut b = [0u8; 64];
+    let base = BASES
+        .get(
+            usize::from(ctl & 0x7f)
+                .checked_rem(BASES.len())
+                .unwrap_or(0),
+        )
+        .and_then(|b0| uri::parse(b0, &mut b).ok())
+        .unwrap_or_else(|| finding("uri", format_args!("a base did not parse")));
+    let resolving = ctl & 0x80 != 0;
+    let kept = |storage: &mut [u8]| -> Result<(Scheme, Vec<u8>, u16, Vec<u8>), UriError> {
+        let u = if resolving {
+            uri::resolve(&base, input, storage)?
+        } else {
+            uri::parse(input, storage)?
+        };
+        Ok((
+            u.scheme(),
+            u.authority_host().to_vec(),
+            u.port(),
+            u.target().to_vec(),
+        ))
+    };
+    let mut storage = vec![0u8; input.len().saturating_add(256)];
+    let got = if resolving {
+        uri::resolve(&base, input, &mut storage)
+    } else {
+        uri::parse(input, &mut storage)
+    };
+    let Ok(u) = got else {
+        return;
+    };
+    if let Err(why) = well_formed(&u) {
+        finding("uri", format_args!("{why}: {u:?}"));
+    }
+    let text = written(&u);
+    let mut again = vec![0u8; text.len()];
+    match uri::parse(&text, &mut again) {
+        Ok(v) if v == u => {}
+        other => finding(
+            "uri",
+            format_args!(
+                "{u:?} written as {} parses to {other:?}",
+                text.escape_ascii()
+            ),
+        ),
+    }
+    let mut same = vec![0u8; text.len()];
+    match uri::resolve(&u, b"", &mut same) {
+        Ok(v) if v == u => {}
+        other => finding("uri", format_args!("{u:?} resolves \"\" to {other:?}")),
+    }
+    let need = u.authority_host().len().saturating_add(u.target().len());
+    let mut short = vec![0u8; need.saturating_sub(1)];
+    if need > 0 && kept(&mut short) != Err(UriError::TooLong) {
+        finding(
+            "uri",
+            format_args!("{u:?} kept in {} bytes", need.saturating_sub(1)),
         );
     }
 }

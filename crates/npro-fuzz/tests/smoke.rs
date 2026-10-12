@@ -227,6 +227,11 @@ fn chunked() {
 }
 
 #[test]
+fn uri() {
+    smoke(Target::Uri, seeded).unwrap();
+}
+
+#[test]
 fn ws_server() {
     smoke(Target::WsServer, seeded).unwrap();
 }
@@ -252,6 +257,7 @@ fn every_target_has_a_smoke_test() {
         "h1-request",
         "h1-response",
         "chunked",
+        "uri",
         "ws-server",
         "ws-client",
         "ws-pmd",

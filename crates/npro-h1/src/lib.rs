@@ -11,7 +11,9 @@
 //!   and server;
 //! - [`fields`]: what a few header values mean, as C reads them;
 //! - [`server`]: an h1 server connection's transactions;
-//! - [`client`]: an h1 client connection's transaction.
+//! - [`client`]: an h1 client connection's transaction;
+//! - [`uri`]: a URL a client connects to, and a reference resolved
+//!   against one.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -24,3 +26,4 @@ mod own;
 pub mod server;
 pub mod table;
 pub mod token;
+pub mod uri;
