@@ -250,21 +250,35 @@ does not link it.
 ## What the layers below lack
 
 SS asks for these, and each is its own commit in its own crate, ahead of
-the SS commit that needs it:
+the SS commit that needs it.  Done (2026-10-12):
 
-- **h1 client**: a request body, by Content-Length and chunked (C's
-  client sends one with neither, chunked: port plan 1a); redirects, as a
-  restart of the same connection; keep-alive, with the kept-warm
-  `IDLING` and its deadline, so a second request to the endpoint reuses
-  the connection.
-- **h1 server**: the response's headers from metadata, and a request's
-  metadata (path, method, `Authorization`, url arguments) cleared per
-  transaction, as C's are.
+- **h1 client**: a request body, by Content-Length and chunked;
+  redirects; keep-alive, kept warm for the next request; the
+  application's headers.
+- **h1 server**: the application's headers on a response, in storage
+  the caller sizes (npro.rs' vhost headers alone are over a kilobyte);
+  a 101 of its own for an upgrade it does not carry as ws
+  (`Server::switch`).  A request's headers are already the
+  transaction's alone: the table is emptied for the next request, and
+  npro-ss copies what it keeps as metadata.
+- **raw**: the role, and h1 switching to it from either end, for a
+  proxy passing ws through.
+- **npro-io**: the tls handshake, flush and `SHUTDOWN_FLUSH` deadlines
+  were already the driver's, and so is backpressure: what the
+  application does not take stays in the rx buffer, and once that is
+  full nothing more is read.  The connect's deadline is npro-ss's,
+  which asks for the connect.
+- **The request path** a file is served from is already safe: the h1
+  parser decodes it and takes out `//`, `/./` and `/../`, never above
+  the root, as C's `lws_parse_urldecode()` does, and the `h1-request`
+  fuzz target checks every path it accepts is so.  Mapping it onto a
+  mount, and what the file system may still do (symlinks, `\` on
+  Windows), are the file service's.
+
+Still to do:
+
 - **ws**: the application's own close with a code; a configured frame
   and message maximum.  Both are "not yet" in phase 1e.
-- **raw**: a role, which `Conn` does not have yet.
-- **npro-io**: the connect, tls handshake and `SHUTDOWN_FLUSH`
-  deadlines, which io-model.md left to the driver.
 - **dns**: the adapter's for now, by the platform's resolver (with std,
   `ToSocketAddrs`, which blocks, so off the loop's thread).  Porting C's
   async dns, with its dnssec validation, is its own phase, later.
