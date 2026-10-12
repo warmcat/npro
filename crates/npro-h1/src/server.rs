@@ -502,6 +502,32 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         self.phase = Phase::Closed(close);
     }
 
+    /// The application drops the connection: nothing more is written,
+    /// whatever was composed or owed, and the connection asks to be
+    /// aborted, as C closes a connection whose user returned -1.  A
+    /// connection already closing keeps its close.
+    ///
+    /// ```
+    /// use npro_core::time::Instant;
+    /// use npro_h1::Storage;
+    /// use npro_h1::server::{Close, Config, Server};
+    ///
+    /// let now = Instant::from_micros(1_000_000);
+    /// let mut s = Server::new(Storage { table: [0u8; 1024], out: [0u8; 1024] }, Config::default(), now)?;
+    /// s.rx(now, b"GET / HTTP/1.1\r\n\r\n");
+    /// s.abort();
+    /// assert_eq!(s.close(), Some(Close::Abort));
+    /// assert!(!s.wants_write());
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    pub const fn abort(&mut self) {
+        if let Phase::Closed(_) = self.phase {
+            return;
+        }
+        self.own.clear();
+        self.phase = Phase::Closed(Close::Abort);
+    }
+
     /// The peer closed its side: C's zero-length rx, which its h1 server
     /// answers by closing.  What the connection already composed goes, then
     /// it shuts down; payload the application has yet to give is not
@@ -1300,6 +1326,23 @@ mod tests {
         content_length: Some(2),
         headers: &[],
     };
+
+    #[test]
+    fn aborted_it_writes_nothing_more_and_a_close_already_asked_stands() {
+        let mut s = server();
+        s.rx(T0, b"GET / HTTP/1.1\r\n\r\n");
+        s.respond(OK2).unwrap();
+        s.abort();
+        assert_eq!(s.close(), Some(Close::Abort));
+        let mut out = [0u8; 256];
+        assert_eq!(s.tx(T0, &mut out, &mut Text(b"ok")).written, 0);
+        assert_eq!(s.next_deadline(), None);
+        // one whose peer closed asked for a shutdown already: that stands
+        let mut closed = server();
+        closed.rx_closed();
+        closed.abort();
+        assert_eq!(closed.close(), Some(Close::Shutdown));
+    }
 
     #[test]
     fn a_head_must_be_whole_by_its_deadline_however_it_trickles() {
