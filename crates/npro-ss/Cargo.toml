@@ -1,0 +1,28 @@
+[package]
+name        = "npro-ss"
+description = "npro's Secure Streams (SS2): streams over npro's protocols, sans-IO, configured by policy"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "http", "websocket"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core.workspace = true
+npro-h1.workspace   = true
+npro-ws.workspace   = true
+npro-io.workspace   = true
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+
+[features]
+# permessage-deflate on ws streams: needs alloc, as npro-ws' pmd does
+pmd = ["npro-io/pmd", "npro-ws/pmd"]
+
+[lints]
+workspace = true

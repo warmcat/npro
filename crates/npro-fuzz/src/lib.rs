@@ -22,11 +22,13 @@
 
 mod h1;
 mod json;
+mod ss;
 mod targets;
 mod ws;
 
 pub use h1::{chunked, h1_request, h1_response, uri};
 pub use json::json;
+pub use ss::ss_server;
 pub use targets::{base64, sha1, transcript, utf8};
 pub use ws::{ws_client, ws_pmd, ws_server};
 
@@ -68,11 +70,13 @@ pub enum Target {
     /// [`ws_pmd`]: the ws frame parser with permessage-deflate, as a
     /// server.
     WsPmd,
+    /// [`ss_server`]: npro-ss's server streams, driven every which way.
+    SsServer,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -85,6 +89,7 @@ impl Target {
         Self::WsServer,
         Self::WsClient,
         Self::WsPmd,
+        Self::SsServer,
     ];
 
     /// The target's name.
@@ -103,6 +108,7 @@ impl Target {
             Self::WsServer => "ws-server",
             Self::WsClient => "ws-client",
             Self::WsPmd => "ws-pmd",
+            Self::SsServer => "ss-server",
         }
     }
 
@@ -126,6 +132,7 @@ impl Target {
             Self::WsServer => ws_server(data),
             Self::WsClient => ws_client(data),
             Self::WsPmd => ws_pmd(data),
+            Self::SsServer => ss_server(data),
         }
     }
 }

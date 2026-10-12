@@ -14,6 +14,7 @@ npro-core = { path = "../npro-core", features = ["replay"] }
 npro-h1   = { path = "../npro-h1" }
 npro-ws   = { path = "../npro-ws", features = ["pmd"] }
 npro-io   = { path = "../npro-io", features = ["pmd"] }
+npro-ss   = { path = "../npro-ss", features = ["pmd"] }
 
 [lints]
 workspace = true

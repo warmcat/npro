@@ -17,6 +17,11 @@
 //! and the h1 client reading a body; and C's `sansio-uri` vhost, its h1
 //! server answering with the request's path and arguments.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one uses npro-test, npro-core, npro-h1, npro-ws and npro-io"
+)]
+
 // held to clippy's rules for tests
 #[cfg(test)]
 mod driver_replay {

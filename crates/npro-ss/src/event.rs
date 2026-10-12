@@ -1,0 +1,365 @@
+//! What a stream is told, and the handles some events lend to answer them.
+//!
+//! [`crate::ss::Ss::poll_event`] gives one [`Event`] at a time: which
+//! stream, its `&mut U`, and what happened.  An event may lend a handle
+//! to act on it there and then: a request's [`Txn`] to read the request
+//! and answer it, or a [`Tx`] to fill with payload.  Anything else is a
+//! call made on the [`crate::ss::Ss`] after the event.
+
+use npro_core::random::Random;
+use npro_core::time::Instant;
+use npro_h1::server::{self, Response as H1Response, Server, TxSource};
+use npro_h1::table::{Fragments, HeaderTable};
+use npro_h1::token::{Lookup, Token, lookup};
+use npro_io::conn::RoleMut;
+use npro_io::driver::Driver;
+use npro_io::tls::RecordLayer;
+use npro_ws::conn::Kind as WsKind;
+
+use crate::id::StreamId;
+use crate::policy::Payload;
+
+/// Something that happened to a stream.
+#[derive(Debug)]
+pub struct Event<'a, U, S, R, T> {
+    /// The stream.
+    pub stream: StreamId,
+    /// The stream's own state, given when it was made.
+    pub user: &'a mut U,
+    /// What happened.
+    pub kind: Kind<'a, S, R, T>,
+}
+
+/// What happened to a stream.
+#[derive(Debug)]
+pub enum Kind<'a, S, R, T> {
+    /// A request's head is in, C's `SERVER_TXN`: read it, and answer it,
+    /// through the [`Txn`].
+    ServerTxn(Txn<'a, S>),
+    /// The request became ws, with this subprotocol, C's
+    /// `SERVER_UPGRADE`: from here the stream's payload is messages.
+    ServerUpgrade {
+        /// The subprotocol agreed, of the listener's.
+        protocol: &'a [u8],
+    },
+    /// The request asked for ws, and was refused as C refuses it: the
+    /// connection closes once the refusal has gone.
+    UpgradeRefused(Refusal),
+    /// The peer's payload: a piece of a request's body, or of a ws
+    /// message.
+    Rx {
+        /// The piece.
+        data: &'a [u8],
+        /// Whether it ends the body or the message.
+        end: End,
+    },
+    /// The stream asked to write, and can: fill the [`Tx`].
+    Tx(Tx<'a, S, R, T>),
+    /// A pong came, for a ping npro sent.
+    Pong,
+    /// The peer closed: the stream is told [`Kind::Disconnected`] once the
+    /// connection is done with.
+    PeerClose {
+        /// The ws close's status code, if it gave one.
+        code: Option<u16>,
+    },
+    /// The stream's connection is gone, and so is the stream: its id is
+    /// refused from here, and its `U` dropped before the next event.
+    Disconnected,
+}
+
+/// Whether a piece of payload ends what it is a piece of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// More of it follows.
+    More,
+    /// It is the last of the body or message.
+    Last,
+}
+
+/// Why an upgrade to ws was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// It was answered with this status, as C answers it.
+    Status(u16),
+    /// The connection was dropped, as C drops it: an extension offer too
+    /// long, or a 101 that would not fit.
+    Dropped,
+}
+
+/// The most headers a response carries, the listener's and the
+/// application's together.
+pub const MAX_HEADERS: usize = 64;
+
+/// An answer to a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Response<'a> {
+    /// The status.
+    pub status: u16,
+    /// Its `content-type`, if it has payload.
+    pub content_type: Option<&'a [u8]>,
+    /// How long its payload is, or `None` for as long as it goes on, which
+    /// the connection's close ends.
+    pub content_length: Option<u64>,
+    /// The application's own headers, after the listener's.  The ones the
+    /// connection writes itself (its framing, `connection`, `upgrade`) are
+    /// refused.
+    pub headers: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// Why a response was refused.  The request is still unanswered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespondError {
+    /// The stream is gone, or is not one a response is made on.
+    Gone,
+    /// More than [`MAX_HEADERS`], the listener's and the application's.
+    TooManyHeaders,
+    /// As the connection refused it.
+    Refused(server::RespondError),
+}
+
+impl core::fmt::Display for RespondError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Gone => f.write_str("no such stream, or not a server's"),
+            Self::TooManyHeaders => write!(f, "more than {MAX_HEADERS} headers"),
+            Self::Refused(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for RespondError {}
+
+/// A request in hand: [`Kind::ServerTxn`].
+#[derive(Debug)]
+pub struct Txn<'a, S> {
+    pub(crate) server: &'a mut Server<S>,
+    pub(crate) headers: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// The request methods, each with the token holding its target.
+const METHODS: [(Token, &[u8]); 8] = [
+    (Token::GetUri, b"GET"),
+    (Token::PostUri, b"POST"),
+    (Token::OptionsUri, b"OPTIONS"),
+    (Token::PutUri, b"PUT"),
+    (Token::PatchUri, b"PATCH"),
+    (Token::DeleteUri, b"DELETE"),
+    (Token::Connect, b"CONNECT"),
+    (Token::HeadUri, b"HEAD"),
+];
+
+/// The longest header name looked up.
+const MAX_NAME: usize = 64;
+
+impl<S: AsRef<[u8]> + AsMut<[u8]>> Txn<'_, S> {
+    const fn table(&self) -> &HeaderTable<S> {
+        self.server.request()
+    }
+
+    fn method_token(&self) -> Option<(Token, &'static [u8])> {
+        METHODS
+            .iter()
+            .copied()
+            .find(|(t, _)| self.table().is_present(*t))
+    }
+
+    /// The request's method, uppercase.
+    #[must_use]
+    pub fn method(&self) -> Option<&'static [u8]> {
+        self.method_token().map(|(_, m)| m)
+    }
+
+    /// The request's path, decoded and made safe as the parser does
+    /// (`//`, `/./` and `/../` taken out, never above the root), without
+    /// its arguments; for `CONNECT`, the authority.
+    #[must_use]
+    pub fn path(&self) -> Option<&[u8]> {
+        let (t, _) = self.method_token()?;
+        self.table().first(t)
+    }
+
+    /// The request's arguments, each decoded, in order: the query split at
+    /// `&`.
+    #[must_use]
+    pub fn args(&self) -> Fragments<'_> {
+        self.table().fragments(Token::UriArgs)
+    }
+
+    /// The value of the request's header `name`, any case, without its
+    /// `:`.  A header that came more than once gives its first; one that
+    /// npro knows by name is found as C's lextable finds it, any other
+    /// as C's custom headers are.
+    #[must_use]
+    pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
+        let mut key = [0u8; MAX_NAME];
+        let len = name.len().checked_add(1)?;
+        let key = key.get_mut(..len)?;
+        let (body, colon) = key.split_at_mut(name.len());
+        body.copy_from_slice(name);
+        body.make_ascii_lowercase();
+        colon.copy_from_slice(b":");
+        match lookup(key) {
+            Lookup::Matched(t) => self.table().first(t),
+            Lookup::Prefix | Lookup::Nothing => self.table().unknown(key),
+        }
+    }
+
+    /// Answers the request: the listener's headers, then the
+    /// application's.  Its payload, if it has any, is the stream's to
+    /// give when it is asked ([`Kind::Tx`]), the last of it saying so.
+    /// A stream that answers later, once it has the body, say, does so
+    /// with [`crate::ss::Ss::respond`].
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError`], and the request is still unanswered.
+    pub fn respond(&mut self, r: Response<'_>) -> Result<(), RespondError> {
+        respond(self.server, self.headers, r)
+    }
+}
+
+/// Answers `server`'s request with `r`, after the listener's `headers`.
+pub(crate) fn respond<S: AsRef<[u8]> + AsMut<[u8]>>(
+    server: &mut Server<S>,
+    headers: &[(&[u8], &[u8])],
+    r: Response<'_>,
+) -> Result<(), RespondError> {
+    let mut all: [(&[u8], &[u8]); MAX_HEADERS] = [(&[], &[]); MAX_HEADERS];
+    let n = headers
+        .len()
+        .checked_add(r.headers.len())
+        .filter(|n| *n <= MAX_HEADERS)
+        .ok_or(RespondError::TooManyHeaders)?;
+    for (slot, h) in all.iter_mut().zip(headers.iter().chain(r.headers)) {
+        *slot = *h;
+    }
+    server
+        .respond(H1Response {
+            status: r.status,
+            content_type: r.content_type,
+            content_length: r.content_length,
+            headers: all.get(..n).unwrap_or_default(),
+        })
+        .map_err(RespondError::Refused)
+}
+
+/// How much of its payload a stream gave, and whether that was the last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filled {
+    /// This much, and more is to come.
+    More(usize),
+    /// This much, and it is the last: the response's payload is over.
+    Last(usize),
+}
+
+/// What a stream wants to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxWant {
+    /// Nothing.
+    Idle,
+    /// Payload: the response's, or the ws message's going.
+    Wanted,
+    /// A ws message this long, to start once the one going is done.
+    Message(u64),
+}
+
+/// A stream's chance to write: [`Kind::Tx`].
+#[derive(Debug)]
+pub struct Tx<'a, S, R, T> {
+    pub(crate) driver: &'a mut Driver<S, R, S, T>,
+    pub(crate) want: &'a mut TxWant,
+    pub(crate) payload: Payload,
+    pub(crate) now: Instant,
+}
+
+/// The stream's payload, pulled by the connection through `f`.
+struct Pull<F> {
+    f: F,
+    /// The connection asked.
+    asked: bool,
+    /// The stream said it gave the last.
+    last: bool,
+    total: usize,
+}
+
+impl<F: FnMut(&mut [u8]) -> Filled> TxSource for Pull<F> {
+    fn fill(&mut self, buf: &mut [u8]) -> usize {
+        self.asked = true;
+        if self.last {
+            return 0;
+        }
+        let n = match (self.f)(buf) {
+            Filled::More(n) => n,
+            Filled::Last(n) => {
+                self.last = true;
+                n
+            }
+        }
+        .min(buf.len());
+        self.total = self.total.saturating_add(n);
+        n
+    }
+}
+
+impl<S, R, T> Tx<'_, S, R, T>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+    T: RecordLayer,
+{
+    /// Fills what the connection has room for from `f`, which is given
+    /// the room, as often as the connection takes more now, and says how
+    /// much of it it filled and whether that was the last.  Returns how
+    /// much it gave in all.
+    ///
+    /// What the connection owes of its own (a response's head) goes
+    /// first, then the payload.  The last of a response's payload ends its
+    /// transaction.  Giving nothing, or the connection taking no payload
+    /// now (a response not yet made, a connection closing), ends the
+    /// stream's asking to write: it asks again when it has more.
+    pub fn fill(self, f: impl FnMut(&mut [u8]) -> Filled) -> usize {
+        let Self {
+            driver,
+            want,
+            payload,
+            now,
+        } = self;
+        if let TxWant::Message(len) = *want {
+            if let RoleMut::WsServer(ws) = driver.conn().role_mut() {
+                let kind = match payload {
+                    Payload::Text => WsKind::Text,
+                    Payload::Binary => WsKind::Binary,
+                };
+                // busy with the one going: it goes on, this one waits
+                if ws.send(kind, len).is_ok() {
+                    *want = TxWant::Wanted;
+                }
+            }
+        }
+        let mut pull = Pull {
+            f,
+            asked: false,
+            last: false,
+            total: 0,
+        };
+        driver.request_write();
+        // what it wants of the adapter is the adapter's to ask
+        let _ = driver.want(now, &mut pull);
+        if pull.last {
+            if let RoleMut::H1Server(s) = driver.conn().role_mut() {
+                s.complete(now);
+            }
+            *want = TxWant::Idle;
+        } else if pull.asked && pull.total == 0 {
+            // it had nothing
+            *want = TxWant::Idle;
+        } else if !pull.asked && !driver.conn().wants_write() {
+            // the connection takes no payload now
+            *want = TxWant::Idle;
+        }
+        // otherwise it gave some, or the connection's own bytes went first
+        // and filled the room: it is asked again once there is more
+        pull.total
+    }
+}

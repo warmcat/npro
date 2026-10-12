@@ -38,6 +38,11 @@ The protocol crates' targets start from the C library's corpora
 - `ws-client`: C has no client corpus, so what the server sent after the
   101 in each of the `ws-client-*` transcripts but the pmd ones, behind a
   control byte of 0, named for the transcript.
+- `ss-server`: written for it, a control byte first, then the operations
+  `crates/npro-fuzz/src/ss.rs` reads: a GET answered, two pipelined and a
+  hangup, a POST's body, a stream destroyed, a head that times out, a ws
+  echo and close, ws with permessage-deflate, an upgrade refused, and the
+  slots running out.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

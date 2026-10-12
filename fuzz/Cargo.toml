@@ -108,3 +108,10 @@ unsafe_code     = "forbid"
 unexpected_cfgs = "deny"
 
 [workspace]
+
+[[bin]]
+name  = "ss-server"
+path  = "fuzz_targets/ss_server.rs"
+test  = false
+doc   = false
+bench = false

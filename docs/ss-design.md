@@ -247,6 +247,92 @@ them: in-tree, no serde, restartable, bounded depth, refusing a member
 named twice (ss-policy.md).  A program that builds its policy in Rust
 does not link it.
 
+### The server half, as built
+
+Phase 2 is in `npro-ss` (2026-10-12).  How it came out, where it
+differs from the sketch above, and why:
+
+- **A slot holds a stream and its connection.**  The caller gives a
+  table of slots, each with the storage of one connection (the h1
+  role's, the driver's buffers, and tls' records for a tls listener).
+  An accepted stream and its connection share a slot for their life;
+  when the connection is released its storage carries the next one.
+  This is also what lets `poll_event()` return an event borrowing a
+  stream's `U` and its connection together: one pass over the slots
+  borrows each slot once.  A loop over two separate tables, finding a
+  stream's connection by id, is a borrow the compiler holds over the
+  loop's next turn, and cannot be written in safe Rust.  For client
+  streams a warm connection is moved into the stream's slot when it
+  joins; that stream's id stays the same, through a map from stream ids
+  to slots, which comes with the client half.
+- **Ids carry a generation**: a `StreamId` or `ConnId` whose stream or
+  connection is gone is refused even once its slot carries another.
+- **The adapter drives connections by `ConnId`**, with the driver's
+  calls: `accepted()` on a listener, then `want()`, `read_done()`,
+  `received()`, `write_done()`, `half_closed()`, `timer()`, `hangup()`,
+  and `released()` once it closed the socket.  `listeners()` gives what
+  to bind.  An accept with no slot free is refused, and the adapter
+  closes the socket.
+- **An accepted stream's `U` is `U::default()`**, since the adapter
+  that accepts knows nothing of the application.
+- **The application loops on `poll_event()`**, each event naming the
+  stream, lending its `&mut U`, and saying what happened:
+  `ServerTxn(Txn)`, a request to read (method, path, arguments, headers
+  by name) and answer; `ServerUpgrade`; `UpgradeRefused`; `Rx` with
+  whether it is the last of a body or message; `Tx`; `Pong`;
+  `PeerClose`; `Disconnected`.  **Calls on the `Ss` come after the
+  event**: the event borrows it, so the compiler holds the application
+  to that.  Every event a connection makes is told to its stream, a
+  pong and the peer's close among them, which C's SS does not tell:
+  dropping one inside `poll_event()` and looking at the same connection
+  again is the same borrow the slots avoid.
+- **`Tx` is filled by a closure**, `tx.fill(|buf| ...)`, not the
+  sketch's `Tx { buf }` and `ev.wrote(n, eom)`.  The buffer it is
+  given is the room the role leaves after its framing: the response's
+  head, the ws frame header.  So the payload lands where it goes, with
+  no copy, the role pulling as its own `tx()` does.  The closure says
+  how much it gave and whether it was the last (`Filled::More`,
+  `Filled::Last`); the last of a response ends its transaction.  Giving
+  nothing ends the stream's asking to write, as C's
+  `LWSSSSRET_TX_DONT_SEND` does.
+- **A response** is made in `ServerTxn`, or later by `Ss::respond()`
+  (C's `lws_ss_server_ack()`), once the stream has the request's body,
+  say.  The listener's headers go first, then the application's, up to
+  64 in all.
+- **ws is the listener's**: if its policy takes ws, npro-ss answers a
+  request for it with the 101, or refuses it as C does, before the
+  stream hears; one that does not take ws gives the request to the
+  stream like any other.  A message's length is said first, by
+  `request_tx_len()`, as the frame header needs it; whether messages
+  are text or binary is the listener's (`ws_binary`).
+- **`destroy()`** ends the stream at once, and closes its connection by
+  its role's close: an h1 transaction is dropped, ws closes once what
+  was sent has gone.  The stream is not told `Disconnected`: it is gone
+  already.
+
+Not yet, in this half:
+
+- the request's path and headers are not given to a stream whose
+  request became ws: they would have to be copied into the stream's
+  metadata, which comes with routes, where they decide the service;
+- the 101 and the h1 role's own refusal pages carry none of the
+  listener's headers, where C adds the vhost's;
+- `Txn::header()` gives the first of a header sent more than once,
+  where C's `lws_hdr_copy()` joins them;
+- `destroy()` on ws closes with no close frame, where C sends one: the
+  application's own close with a code is still to do in npro-ws;
+- no tls listener is exercised by the tests yet: it is the record layer
+  the adapter gives, and comes with the first adapter;
+- there is no `until` across all connections: the adapter keeps the
+  earliest of each connection's.
+
+Tests: C's server transcripts (h1, ws, permessage-deflate) replay
+through an accepted stream as they do through the driver; unit tests
+for the rest; and the `ss-server` fuzz target, which drives the streams
+with a script of accepts, a peer's bytes, the application's answers,
+short writes, hangups, FINs and time, against a model of what each
+stream may be told.
+
 ## What the layers below lack
 
 SS asks for these, and each is its own commit in its own crate, ahead of
@@ -300,6 +386,7 @@ proxy needs, then the rest of phase 1.
 2. **`npro-ss`, server**: listeners, accepted streams, `SERVER_TXN`,
    metadata from the request and into the response, `SERVER_UPGRADE` to
    ws.  Tests: C's server transcripts replay through an accepted stream.
+   Done 2026-10-12: "The server half, as built", above.
 3. **The first adapter** with real sockets and the platform's dns, and
    `npro-json` for policies.
 4. **The utility**, with its `--help` and README, and the first

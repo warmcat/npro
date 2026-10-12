@@ -70,7 +70,9 @@ version = "0.0.2"
 dependencies = [
  "npro-core",
  "npro-h1",
+ "npro-io",
  "npro-json",
+ "npro-ss",
  "npro-test",
  "npro-ws",
 ]
@@ -97,12 +99,23 @@ name = "npro-json"
 version = "0.0.2"
 
 [[package]]
+name = "npro-ss"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-h1",
+ "npro-io",
+ "npro-ws",
+]
+
+[[package]]
 name = "npro-test"
 version = "0.0.2"
 dependencies = [
  "npro-core",
  "npro-h1",
  "npro-io",
+ "npro-ss",
  "npro-ws",
 ]
 
