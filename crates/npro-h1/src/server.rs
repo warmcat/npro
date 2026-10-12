@@ -35,7 +35,7 @@ use crate::Storage;
 use crate::chunked::{Chunk, Dechunk};
 use crate::fields::{content_length, transfer_encoding_is_chunked};
 use crate::head::{self, Answer, Head, Progress, Refused, Side, Version};
-use crate::own::{Own, decimal};
+use crate::own::{Own, check_header, decimal};
 use crate::table::{CapacityTooLarge, HeaderTable};
 use crate::token::Token;
 
@@ -306,6 +306,12 @@ enum Phase {
     /// Writing a refusal, which must have gone by the deadline, then
     /// shutting down.
     Refusing(Instant),
+    /// Writing a 101, which must have gone by the deadline: the request's
+    /// upgrade is agreed.
+    Switching(Instant),
+    /// The 101 has gone: from the byte after the request's head, the
+    /// connection is the upgraded protocol's, and this takes nothing more.
+    Switched,
     /// The connection is done with.
     Closed(Close),
 }
@@ -414,6 +420,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         )
     }
 
+    /// Whether the connection answered its request's upgrade with a 101
+    /// ([`Server::switch`]) and the 101 has gone: from the byte after the
+    /// request's head, the connection is the upgraded protocol's.
+    #[must_use]
+    pub const fn is_switched(&self) -> bool {
+        matches!(self.phase, Phase::Switched)
+    }
+
     /// Whether [`Server::rx`] has something to give without more input:
     /// the end of a request's body that came with the bytes already
     /// taken, or of one there was none of.  A caller that hands in input
@@ -441,7 +455,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     pub const fn close(&self) -> Option<Close> {
         match self.phase {
             Phase::Closed(c) => Some(c),
-            Phase::Head(_) | Phase::Request(_) | Phase::Refusing(_) => None,
+            Phase::Head(_)
+            | Phase::Request(_)
+            | Phase::Refusing(_)
+            | Phase::Switching(_)
+            | Phase::Switched => None,
         }
     }
 
@@ -451,12 +469,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     pub const fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
             Phase::Head(Wait::Idle(until)) => until,
-            Phase::Head(Wait::Head(until)) | Phase::Refusing(until) => Some(until),
+            Phase::Head(Wait::Head(until)) | Phase::Refusing(until) | Phase::Switching(until) => {
+                Some(until)
+            }
             Phase::Request(t) => match t.watch {
                 Watch::Content(until) | Watch::Response(until) => Some(until),
                 Watch::App => None,
             },
-            Phase::Closed(_) => None,
+            Phase::Closed(_) | Phase::Switched => None,
         }
     }
 
@@ -470,7 +490,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         }
         let close = match self.phase {
             Phase::Head(Wait::Idle(_)) => Close::Shutdown,
-            Phase::Head(Wait::Head(_)) | Phase::Request(_) | Phase::Refusing(_) => Close::Abort,
+            Phase::Head(Wait::Head(_))
+            | Phase::Request(_)
+            | Phase::Refusing(_)
+            | Phase::Switching(_) => Close::Abort,
+            // no deadline: not passed
+            Phase::Switched => return,
             Phase::Closed(c) => c,
         };
         self.own.clear();
@@ -483,10 +508,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     /// asked for.
     pub const fn rx_closed(&mut self) {
         match self.phase {
-            Phase::Head(_) | Phase::Request(_) | Phase::Refusing(_) => {
+            Phase::Head(_) | Phase::Request(_) | Phase::Refusing(_) | Phase::Switching(_) => {
                 self.phase = Phase::Closed(Close::Shutdown);
             }
-            Phase::Closed(_) => {}
+            // the upgraded protocol's to hear
+            Phase::Closed(_) | Phase::Switched => {}
         }
     }
 
@@ -499,7 +525,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         match self.phase {
             Phase::Head(w) => self.rx_head(now, w, input),
             Phase::Request(t) => self.rx_body(now, t, input),
-            Phase::Refusing(_) | Phase::Closed(_) => held,
+            // after a 101, the bytes are the upgraded protocol's
+            Phase::Refusing(_) | Phase::Switching(_) | Phase::Switched | Phase::Closed(_) => held,
         }
     }
 
@@ -603,7 +630,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 reply: Reply::Awaited,
                 ..
             }) => {}
-            Phase::Request(_) | Phase::Head(_) | Phase::Refusing(_) | Phase::Closed(_) => {
+            Phase::Request(_)
+            | Phase::Head(_)
+            | Phase::Refusing(_)
+            | Phase::Switching(_)
+            | Phase::Switched
+            | Phase::Closed(_) => {
                 return Err(RespondError::NotNow);
             }
         }
@@ -795,6 +827,52 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         Ok(())
     }
 
+    /// Agrees the request in hand's upgrade, to `upgrade`, at `now`: a 101
+    /// with `upgrade` and the application's `headers`, checked as
+    /// [`Response::headers`] are.  Once it has gone, within
+    /// [`Timeouts::response`] of `now`, the connection is the upgraded
+    /// protocol's ([`Server::is_switched`]), and this takes nothing more.
+    /// For a protocol the application carries itself, or passes through,
+    /// as a proxy does once the origin agreed; ws accepted here has its own
+    /// 101, from `npro_ws::handshake`.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError::NotNow`] unless an HTTP/1.1 request asking for an
+    /// upgrade is in hand, unanswered, with no body still to come;
+    /// [`RespondError::Header`] if `upgrade` or a header is refused; or
+    /// [`RespondError::TooLong`].  The request is then still unanswered.
+    pub fn switch(
+        &mut self,
+        now: Instant,
+        upgrade: &[u8],
+        headers: &[(&[u8], &[u8])],
+    ) -> Result<(), RespondError> {
+        let Phase::Request(t) = self.phase else {
+            return Err(RespondError::NotNow);
+        };
+        let asked = self.version == Version::Http11
+            && self.head.table().is_present(Token::Upgrade)
+            && t.reply == Reply::Awaited
+            && matches!(t.body, Body::Over | Body::EndDue);
+        if !asked {
+            return Err(RespondError::NotNow);
+        }
+        if upgrade.is_empty() {
+            return Err(RespondError::Header(HeaderRefused::Value));
+        }
+        check_header(b"upgrade", upgrade, &[]).map_err(RespondError::Header)?;
+        self.own.compose(|own| {
+            own.push(b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: ")?;
+            own.push(upgrade)?;
+            own.push(b"\r\n")?;
+            own.push_headers(headers, &RESERVED)?;
+            own.push(b"\r\n")
+        })?;
+        self.phase = Phase::Switching(now.saturating_add(self.config.timeouts.response));
+        Ok(())
+    }
+
     /// The application is done with the transaction, at `now`: C's
     /// `lws_http_transaction_completed()`.  The rest of the request's body
     /// is taken without it, and once the answer has gone, the connection
@@ -833,8 +911,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             self.phase = Phase::Request(t);
             self.settle(now);
         }
-        if matches!(self.phase, Phase::Refusing(_)) && !self.own.pending() {
-            self.phase = Phase::Closed(Close::Shutdown);
+        if !self.own.pending() {
+            match self.phase {
+                Phase::Refusing(_) => self.phase = Phase::Closed(Close::Shutdown),
+                Phase::Switching(_) => self.phase = Phase::Switched,
+                Phase::Head(_) | Phase::Request(_) | Phase::Switched | Phase::Closed(_) => {}
+            }
         }
         Tx {
             written,
@@ -1386,8 +1468,9 @@ mod tests {
         assert!(!tx.more);
     }
 
-    /// A server whose answers are composed in `out` bytes.
-    fn server_out(out: usize) -> Server<Vec<u8>> {
+    /// A server whose answers are composed in `out` bytes, with `head`
+    /// in hand.
+    fn server_with(out: usize, head: &[u8]) -> Server<Vec<u8>> {
         let mut s = Server::new(
             Storage {
                 table: vec![0u8; 1024],
@@ -1397,8 +1480,13 @@ mod tests {
             T0,
         )
         .unwrap();
-        s.rx(T0, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(s.rx(T0, head).event, Some(Event::Request));
         s
+    }
+
+    /// A server whose answers are composed in `out` bytes, a GET in hand.
+    fn server_out(out: usize) -> Server<Vec<u8>> {
+        server_with(out, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     }
 
     #[test]
@@ -1532,6 +1620,104 @@ mod tests {
         );
         assert!(s.is_awaiting_answer());
         assert!(!s.wants_write());
+    }
+
+    const UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n";
+
+    #[test]
+    fn a_switch_is_a_101_then_nothing_more_is_taken() {
+        let mut s = server();
+        assert_eq!(s.rx(T0, UPGRADE).event, Some(Event::Request));
+        s.switch(T0, b"x", &[(b"sec-websocket-accept", b"abc")])
+            .unwrap();
+        assert!(!s.is_switched());
+        assert!(!s.is_awaiting_answer());
+        assert_eq!(
+            s.next_deadline(),
+            Some(T0.saturating_add(Timeouts::DEFAULT.response))
+        );
+        // what follows is the upgraded protocol's, not taken here
+        assert_eq!(s.rx(T0, b"\x81\x00").consumed, 0);
+        let mut out = [0u8; 256];
+        let tx = s.tx(T0, &mut out, &mut Text(b"never"));
+        assert_eq!(
+            &out[..tx.written],
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: x\r\n\
+              sec-websocket-accept: abc\r\n\r\n"
+        );
+        assert!(s.is_switched());
+        assert_eq!((s.next_deadline(), s.close()), (None, None));
+        assert_eq!(s.rx(T0, b"\x81\x00").consumed, 0);
+        assert_eq!(s.tx(T0, &mut out, &mut Text(b"never")).written, 0);
+        // its peer's close is the upgraded protocol's to hear
+        s.rx_closed();
+        assert_eq!(s.close(), None);
+    }
+
+    #[test]
+    fn a_switch_must_be_asked_for_by_an_unanswered_http11_request_without_a_body_to_come() {
+        for head in [
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            b"GET / HTTP/1.0\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n",
+            b"POST / HTTP/1.1\r\nUpgrade: x\r\nConnection: upgrade\r\nContent-Length: 5\r\n\r\n",
+        ] {
+            let mut s = server();
+            assert_eq!(s.rx(T0, head).event, Some(Event::Request));
+            assert_eq!(
+                s.switch(T0, b"x", &[]),
+                Err(RespondError::NotNow),
+                "{}",
+                head.escape_ascii()
+            );
+            assert!(s.is_awaiting_answer());
+        }
+        let mut s = server();
+        assert_eq!(s.switch(T0, b"x", &[]), Err(RespondError::NotNow));
+        s.rx(T0, UPGRADE);
+        s.respond(OK2).unwrap();
+        assert_eq!(s.switch(T0, b"x", &[]), Err(RespondError::NotNow));
+    }
+
+    #[test]
+    fn a_switch_refused_leaves_the_request_unanswered() {
+        for (upgrade, headers, why) in [
+            (
+                &b""[..],
+                &[][..],
+                RespondError::Header(HeaderRefused::Value),
+            ),
+            (
+                b"x\r\nInjected: 1",
+                &[],
+                RespondError::Header(HeaderRefused::Value),
+            ),
+            (
+                b"x",
+                &[(&b"Connection"[..], &b"close"[..])],
+                RespondError::Header(HeaderRefused::Reserved),
+            ),
+            (
+                b"x",
+                &[(b"a b", b"1")],
+                RespondError::Header(HeaderRefused::Name),
+            ),
+            (b"x", &[(b"a", &[b'v'; MIN_OUT][..])], RespondError::TooLong),
+        ] {
+            let mut s = server_with(MIN_OUT, UPGRADE);
+            assert_eq!(s.switch(T0, upgrade, headers), Err(why));
+            assert!(s.is_awaiting_answer());
+            assert!(!s.wants_write());
+        }
+    }
+
+    #[test]
+    fn a_101_that_does_not_go_by_its_deadline_is_aborted() {
+        let mut s = server();
+        s.rx(T0, UPGRADE);
+        s.switch(T0, b"x", &[]).unwrap();
+        let until = s.next_deadline().unwrap();
+        s.deadline_passed(until);
+        assert_eq!(s.close(), Some(Close::Abort));
     }
 
     #[test]
