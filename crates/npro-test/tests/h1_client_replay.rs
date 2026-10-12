@@ -73,6 +73,7 @@ mod h1_client_replay {
                 scheme: Scheme::Http,
                 no_cache: true,
                 connection: Connection::Close,
+                headers: &[],
             },
         )
         .unwrap();

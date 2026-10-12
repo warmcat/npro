@@ -6,7 +6,8 @@
 //! C's order: the request line, `Pragma` and `Cache-Control` unless asked
 //! not to, `Host`, `Origin`, then `connection: close`, or nothing for a
 //! connection kept for another request, or the header lines asking for an
-//! upgrade ([`Connection`]).
+//! upgrade ([`Connection`]), then the application's own headers, as C's
+//! `LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER` adds them.
 //!
 //! [`Client::rx`] takes the response, at most one thing each call: its head
 //! ([`Event::Response`]), a piece of its body, borrowed from the input
@@ -87,6 +88,83 @@ pub struct Request<'a> {
     pub no_cache: bool,
     /// What becomes of the connection after this request.
     pub connection: Connection<'a>,
+    /// The application's own headers, names and values, sent last.  A name
+    /// must be a token, and a value must have no CR, LF or NUL, so neither
+    /// can end its line early; the headers the request's framing and
+    /// connection depend on are the client's to write, and refused here
+    /// ([`HeaderRefused`]).
+    pub headers: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// Why one of the application's headers is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderRefused {
+    /// Its name is empty or not an RFC 9110 token.
+    Name,
+    /// Its value has a CR, LF or NUL.
+    Value,
+    /// It is one the client writes itself: `Host`, `Connection`,
+    /// `Upgrade`, `Content-Length` or `Transfer-Encoding`.  Sent by the
+    /// application as well, the server could read the request's framing
+    /// differently from how the client sends it.
+    Reserved,
+}
+
+impl core::fmt::Display for HeaderRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Name => "a header name is not a token",
+            Self::Value => "a header value has a CR, LF or NUL",
+            Self::Reserved => "a header the client writes itself",
+        })
+    }
+}
+
+impl core::error::Error for HeaderRefused {}
+
+/// The headers the client writes itself, which the application may not.
+const RESERVED: [&[u8]; 5] = [
+    b"host",
+    b"connection",
+    b"upgrade",
+    b"content-length",
+    b"transfer-encoding",
+];
+
+/// Whether `c` may be in an RFC 9110 token: `tchar`.
+const fn is_tchar(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Checks one of the application's headers.
+fn check_header(name: &[u8], value: &[u8]) -> Result<(), HeaderRefused> {
+    if name.is_empty() || !name.iter().all(|c| is_tchar(*c)) {
+        return Err(HeaderRefused::Name);
+    }
+    if value.iter().any(|c| matches!(c, b'\r' | b'\n' | b'\0')) {
+        return Err(HeaderRefused::Value);
+    }
+    if RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r)) {
+        return Err(HeaderRefused::Reserved);
+    }
+    Ok(())
 }
 
 /// What becomes of the connection after the request: the last of the
@@ -230,6 +308,7 @@ enum Asked {
 ///     scheme: Scheme::Http,
 ///     no_cache: false,
 ///     connection: Connection::Close,
+///     headers: &[],
 /// })?;
 /// let mut out = [0u8; 256];
 /// let n = c.tx(now, &mut out);
@@ -263,6 +342,8 @@ pub enum NewError {
     Table(Full),
     /// The request's head does not fit in [`MAX_OWN`].
     Head(RespondError),
+    /// One of the application's headers is refused.
+    Header(HeaderRefused),
 }
 
 impl core::fmt::Display for NewError {
@@ -271,6 +352,7 @@ impl core::fmt::Display for NewError {
             Self::Capacity(e) => write!(f, "{e}"),
             Self::Table(e) => write!(f, "{e}"),
             Self::Head(e) => write!(f, "{e}"),
+            Self::Header(e) => write!(f, "{e}"),
         }
     }
 }
@@ -284,9 +366,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     ///
     /// # Errors
     ///
-    /// [`NewError`] if the storage is too large, or the request does not
-    /// fit.
+    /// [`NewError`] if the storage is too large, the request does not fit,
+    /// or one of its headers is refused.
     pub fn new(storage: S, req: Request<'_>) -> Result<Self, NewError> {
+        for (name, value) in req.headers {
+            check_header(name, value).map_err(NewError::Header)?;
+        }
         let mut t = HeaderTable::new(storage).map_err(NewError::Capacity)?;
         for (tok, v) in [
             (Token::ClientUri, Some(req.path)),
@@ -662,6 +747,12 @@ fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
         Connection::KeepAlive => {}
         Connection::Upgrade(lines) => o.push(lines)?,
     }
+    for (name, value) in r.headers {
+        o.push(name)?;
+        o.push(b": ")?;
+        o.push(value)?;
+        o.push(b"\r\n")?;
+    }
     o.push(b"\r\n")?;
     Ok(o)
 }
@@ -714,6 +805,7 @@ mod tests {
                 scheme: Scheme::Http,
                 no_cache: true,
                 connection: Connection::Close,
+                headers: &[],
             },
         )
         .unwrap();
@@ -761,6 +853,7 @@ mod tests {
                 scheme: Scheme::Http,
                 no_cache: false,
                 connection: Connection::Upgrade(b"Upgrade: x\r\nConnection: Upgrade\r\n"),
+                headers: &[],
             },
         )
         .unwrap();
@@ -824,6 +917,57 @@ mod tests {
         assert_eq!(&body[..n], b"abc");
     }
 
+    fn with_headers(headers: &[(&[u8], &[u8])]) -> Result<Client<[u8; 1024]>, NewError> {
+        Client::new(
+            [0u8; 1024],
+            Request {
+                method: b"GET",
+                path: b"/x",
+                host: Some(b"h"),
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Close,
+                headers,
+            },
+        )
+    }
+
+    #[test]
+    fn the_applications_headers_go_last_as_cs_append_does() {
+        let mut c = with_headers(&[(b"x-a", b"1"), (b"Cookie", b"k=v; \tj=\xff")]).unwrap();
+        let mut out = [0u8; 512];
+        let n = c.tx(T0, &mut out);
+        assert_eq!(
+            &out[..n],
+            b"GET /x HTTP/1.1\r\nHost: h\r\nconnection: close\r\nx-a: 1\r\nCookie: k=v; \tj=\xff\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_header_that_could_end_its_line_or_reframe_is_refused() {
+        for (h, why) in [
+            ((&b""[..], &b"v"[..]), HeaderRefused::Name),
+            ((b"a b", b"v"), HeaderRefused::Name),
+            ((b"a:", b"v"), HeaderRefused::Name),
+            ((b"a\r\nb", b"v"), HeaderRefused::Name),
+            ((b"a", b"v\r\nInjected: 1"), HeaderRefused::Value),
+            ((b"a", b"v\n"), HeaderRefused::Value),
+            ((b"a", b"v\0"), HeaderRefused::Value),
+            ((b"Content-Length", b"1"), HeaderRefused::Reserved),
+            ((b"TRANSFER-ENCODING", b"chunked"), HeaderRefused::Reserved),
+            ((b"host", b"x"), HeaderRefused::Reserved),
+            ((b"Connection", b"close"), HeaderRefused::Reserved),
+            ((b"upgrade", b"websocket"), HeaderRefused::Reserved),
+        ] {
+            assert_eq!(
+                with_headers(&[(b"ok", b"1"), h]).err(),
+                Some(NewError::Header(why)),
+                "{h:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_status_is_cs_atoi() {
         assert_eq!(atoi(b"200 OK"), 200);
@@ -848,6 +992,7 @@ mod tests {
                 scheme: Scheme::Http,
                 no_cache: false,
                 connection: Connection::Close,
+                headers: &[],
             },
         )
         .unwrap()

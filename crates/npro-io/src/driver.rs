@@ -1054,6 +1054,7 @@ mod tests {
                 scheme: Scheme::Http,
                 no_cache: false,
                 connection: Connection::Close,
+                headers: &[],
             },
         )
         .unwrap();
@@ -1367,6 +1368,7 @@ mod tls_tests {
                     scheme: Scheme::Https,
                     no_cache: false,
                     connection: Connection::Close,
+                    headers: &[],
                 },
             )
             .unwrap(),

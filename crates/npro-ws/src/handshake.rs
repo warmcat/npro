@@ -358,6 +358,7 @@ impl core::error::Error for ClientRefusal {}
 ///     scheme: Scheme::Http,
 ///     no_cache: false,
 ///     connection: Connection::Upgrade(&lines[..n]),
+///     headers: &[],
 /// })?;
 /// let mut out = [0u8; 512];
 /// let n = c.tx(now, &mut out);
@@ -591,6 +592,7 @@ mod tests {
                 scheme: Scheme::Http,
                 no_cache: false,
                 connection: Connection::Upgrade(&lines[..n]),
+                headers: &[],
             },
         )
         .unwrap();

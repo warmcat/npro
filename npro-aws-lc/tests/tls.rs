@@ -90,6 +90,7 @@ fn client_driver(layer: RustlsClient) -> C<RustlsClient> {
             scheme: Scheme::Https,
             no_cache: false,
             connection: Connection::Close,
+            headers: &[],
         },
     )
     .unwrap();

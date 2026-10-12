@@ -524,6 +524,7 @@ mod driver_replay {
                     scheme: Scheme::Http,
                     no_cache: true,
                     connection: Connection::Upgrade(&lines[..n]),
+                    headers: &[],
                 },
             )
             .unwrap();
@@ -566,6 +567,7 @@ mod driver_replay {
                     scheme: Scheme::Http,
                     no_cache: true,
                     connection: Connection::Close,
+                    headers: &[],
                 },
             )
             .unwrap();

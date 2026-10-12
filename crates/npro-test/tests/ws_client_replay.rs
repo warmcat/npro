@@ -200,6 +200,7 @@ mod ws_client_replay {
                 scheme: Scheme::Http,
                 no_cache: true,
                 connection: Connection::Upgrade(&lines[..lines_len]),
+                headers: &[],
             },
         )
         .unwrap();

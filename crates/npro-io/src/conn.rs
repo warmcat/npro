@@ -461,6 +461,7 @@ mod tests {
                     scheme: Scheme::Http,
                     no_cache: false,
                     connection: Connection::Upgrade(b""),
+                    headers: &[],
                 },
             )
             .unwrap(),
@@ -481,6 +482,7 @@ mod tests {
                     scheme: Scheme::Http,
                     no_cache: false,
                     connection: Connection::Upgrade(b""),
+                    headers: &[],
                 },
             )
             .unwrap(),
@@ -515,6 +517,7 @@ mod tests {
                     scheme: Scheme::Http,
                     no_cache: false,
                     connection: Connection::Close,
+                    headers: &[],
                 },
             )
             .unwrap(),
