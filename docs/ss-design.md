@@ -10,8 +10,7 @@ ss-policy.md (C's SS policy and lejp-conf blended into one), and the
 serialised form for remote devices (SSPC, below).  Its main departure
 from C's SS is that the policy is flexible and mostly invisible: a
 program that names a URL needs none, and one that has a policy is not
-shaped by it.  The crate is `npro-ss`, a name not yet reserved on
-crates.io.
+shaped by it.  The crate is `npro-ss`, reserved on crates.io.
 
 ## Why it comes before the examples
 

@@ -91,7 +91,8 @@ These came from real incidents, not taste.
     Rust crates, read `npro`, `npro-core`, `npro-h1`.
   - Reserved on crates.io by Andy: `npro`, `npro-core`, `npro-h1`,
     `npro-ws`, `npro-h2`, `npro-h3`, `npro-quic`, `npro-wt`, `npro-io`,
-    `npro-mqtt` and `npro-http`.
+    `npro-mqtt`, `npro-http`, `npro-json` and `npro-ss`, all owned by
+    `lws-team`.
   - The `lws` crate is kept, not deleted.  Its 0.0.2 points at npro, and
     goes out once npro.rs and the npro git repository are up.
 - The port plan, phases, exit checks and the running assessment of the C
