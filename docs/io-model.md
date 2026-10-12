@@ -263,6 +263,21 @@ pub struct Delivery<'d, S, R> {
 
 ### The four loops against it
 
+**threads** (std): **built (2026-10-12)** as `npro_io::threads`, for a
+`npro_io::host::Host`: many connections by id, as npro-ss holds them,
+since npro-ss depends on npro-io and its adapter cannot name it.  It
+came out a little differently from the sketch below.  The host and the
+application share one `Mutex`, and the application is given the host
+after every change, under the lock, after which every waiting thread is
+woken.  The reader blocks in `read()` with no timeout, and when the host
+has no room it waits for the application to take some, so the peer is
+held back.  The writer keeps the deadlines: it waits on the condvar
+until `until`, then calls `timer()`.  It writes from a copy, outside the
+lock, and closes the socket as the host asks, which wakes the reader.
+`threads::bind` takes `unix:/path` (removing what is there first, as C
+does) or an address and port; `Stop` ends it, waking the acceptors and
+shutting every connection's socket.  The sketch as it was:
+
 **threads** (std): a reader and a writer thread, the driver in a `Mutex`.
 Neither can hold a slice of the driver while it blocks, so both copy:
 

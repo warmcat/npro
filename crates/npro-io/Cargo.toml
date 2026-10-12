@@ -23,6 +23,8 @@ rustls = { version = "0.23.45", default-features = false, features = ["tls12"], 
 npro-core = { workspace = true, features = ["replay"] }
 
 [features]
+# the threads adapter: std's sockets and threads, nothing else
+std = []
 # permessage-deflate on ws connections: needs alloc, as npro-ws' pmd does
 pmd = ["npro-ws/pmd"]
 # tls by rustls, through its unbuffered API: needs alloc, as rustls does

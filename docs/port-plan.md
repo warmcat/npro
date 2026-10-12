@@ -869,7 +869,9 @@ agreed 2026-10-06.  For this phase:
 
 - the driver, `no_std`, replaying the transcripts over the in-memory
   transport before any socket;
-- the threads adapter (`std`), std TCP, no tls yet.  The first form of
+- the threads adapter (`std`), std TCP, no tls yet (**built
+  2026-10-12**, carrying npro-ss' streams over TCP and unix domain
+  sockets, [io-model.md](io-model.md)).  The first form of
   this plan said a poll-style loop, but std has no `poll()`; that is the
   `mio` adapter, which waits for its dependency decision.  There are no
   minimal examples as C has them: Secure Streams comes first, and the

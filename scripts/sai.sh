@@ -75,10 +75,14 @@ nostd)
 	for t in $nostd_targets; do
 		for c in $nostd_crates; do
 			features=--all-features
-			# npro-io's rustls needs atomic compare-and-swap, for its
+			# npro-io's std feature is its threads adapter, which no_std
+			# has not; its rustls needs atomic compare-and-swap, for its
 			# Arc, which the M0 and riscv32imc have not
-			if [ "$c" = npro-io ] && [ "$t" != thumbv7em-none-eabihf ]; then
-				features="--features pmd"
+			if [ "$c" = npro-io ]; then
+				features="--features pmd,rustls"
+				if [ "$t" != thumbv7em-none-eabihf ]; then
+					features="--features pmd"
+				fi
 			fi
 			echo "== $c ($features) for $t"
 			cargo build -p "$c" $features --target "$t" --locked \
