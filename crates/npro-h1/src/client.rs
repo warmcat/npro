@@ -41,6 +41,11 @@
 //! begins to go, the server has C's 15s ([`RESPONSE_TIMEOUT`]) to answer,
 //! and as long again after each interim response, or the connection fails.
 //!
+//! A connection kept alive whose response leaves it reusable is kept warm
+//! once the transaction is over, as C keeps it in `LRS_IDLING`: for
+//! [`KEEP_WARM`], C's `keep_warm_secs`, [`Client::next`] makes the next
+//! request on it, and after that it asks to be released.
+//!
 //! [`Client::redirect`] says whether the final response redirects, and
 //! where to, as C's `lws_client_interpret_server_handshake()` decides it.
 //! Following it is a new connection's, which is the caller's to make: C
@@ -75,6 +80,11 @@ pub const INTERIM_LIMIT: u8 = 8;
 /// `PENDING_TIMEOUT_AWAITING_SERVER_RESPONSE`, the context's
 /// `timeout_secs`.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a connection kept alive waits for its next request once a
+/// transaction is over: C's default `keep_warm_secs`, under
+/// `PENDING_TIMEOUT_CLIENT_CONN_IDLE`.
+pub const KEEP_WARM: Duration = Duration::from_secs(5);
 
 /// How many redirects one request follows: C's `lws_client_reset()`
 /// refuses a fifth.  Counting them is the caller's, which makes each new
@@ -330,6 +340,10 @@ pub enum Failure {
     /// The server did not answer in time: C's "Timed out waiting server
     /// reply".
     TimedOut,
+    /// The server sent bytes while the connection was kept warm, with no
+    /// request outstanding: they would be taken as the answer to the next
+    /// request.
+    Unsolicited,
 }
 
 impl core::fmt::Display for Failure {
@@ -343,6 +357,7 @@ impl core::fmt::Display for Failure {
             Self::Chunked(e) => write!(f, "{e}"),
             Self::Closed => f.write_str("closed before the body ended"),
             Self::TimedOut => f.write_str("Timed out waiting server reply"),
+            Self::Unsolicited => f.write_str("bytes from the server with no request"),
         }
     }
 }
@@ -380,11 +395,16 @@ enum Phase {
     Head { interims: u8, until: Instant },
     /// Taking the response's body.
     Body(Body),
-    /// The transaction is over, and the connection is still up: as C,
-    /// a client whose transaction is over leaves the connection to the
-    /// server's close, or the next request's.
+    /// The transaction is over, and the connection, not to be used again,
+    /// is still up: as C, a client whose transaction is over leaves the
+    /// connection to the server's close.
     Done,
-    /// The transaction is over and the server has closed.
+    /// The transaction is over, and the connection is kept warm for the
+    /// next request ([`Client::next`]) until `until`: C's `LRS_IDLING`.
+    Idle { until: Instant },
+    /// The transaction is over, and the connection is done with: the
+    /// server closed it, it was kept warm past its time, or the next
+    /// request could not be made on it.
     Closed,
     /// The final response to a request for an upgrade has come: the
     /// connection is the upgraded protocol's.
@@ -536,7 +556,32 @@ pub struct Client<S> {
     status: Option<u16>,
     /// How long the server has to answer.
     timeout: Duration,
+    /// How long the connection is kept warm between transactions.
+    keep_warm: Duration,
 }
+
+/// Why [`Client::next`] made no request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextError {
+    /// The connection is not kept warm: a transaction is in hand, or the
+    /// last left it not to be used again.
+    NotIdle,
+    /// The request is refused, and the connection kept warm as it was;
+    /// or it did not fit in the table, and the connection asks to be
+    /// released.
+    Request(NewError),
+}
+
+impl core::fmt::Display for NextError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotIdle => f.write_str("the connection is not kept warm"),
+            Self::Request(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for NextError {}
 
 /// Why a client cannot be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,43 +623,53 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     /// [`NewError`] if the storage is too large, the request does not fit,
     /// or one of its headers is refused.
     pub fn new(storage: S, req: Request<'_>) -> Result<Self, NewError> {
-        for (name, value) in req.headers {
-            check_header(name, value).map_err(NewError::Header)?;
-        }
-        let up = match req.body {
-            RequestBody::None | RequestBody::Length(0) => None,
-            RequestBody::Length(n) => Some(Upload::Length(n)),
-            RequestBody::Chunked => Some(Upload::ChunkAwaited),
-        };
-        if up.is_some() && matches!(req.connection, Connection::Upgrade(_)) {
-            return Err(NewError::UpgradeWithBody);
-        }
+        let (asked, up, own) = prepared(&req)?;
         let mut t = HeaderTable::new(storage).map_err(NewError::Capacity)?;
-        for (tok, v) in [
-            (Token::ClientUri, Some(req.path)),
-            (Token::ClientHost, req.host),
-            (Token::ClientOrigin, req.origin),
-            (Token::ClientMethod, Some(req.method)),
-        ] {
-            if let Some(v) = v {
-                t.create(tok, v).map_err(NewError::Table)?;
-            }
-        }
-        // the response is parsed after the request: an interim is dropped
-        // back to here
-        t.snapshot();
+        tabled(&mut t, &req)?;
         Ok(Self {
             head: Head::with_table(t, Side::Client, head::Config::new()),
-            asked: match req.connection {
-                Connection::Close => Asked::Close,
-                Connection::KeepAlive => Asked::KeepAlive,
-                Connection::Upgrade(_) => Asked::Upgrade,
-            },
+            asked,
             phase: Phase::Asking { up },
-            own: request_head(&req).map_err(NewError::Head)?,
+            own,
             status: None,
             timeout: RESPONSE_TIMEOUT,
+            keep_warm: KEEP_WARM,
         })
+    }
+
+    /// Makes the next request on a connection kept warm, at `now`, in the
+    /// storage of the last: C's joining of a kept-warm connection.  The
+    /// last response's headers are gone.
+    ///
+    /// # Errors
+    ///
+    /// [`NextError::NotIdle`] unless the connection is kept warm; or the
+    /// request's [`NewError`], the connection kept warm if the request
+    /// was refused before the table was touched, or released if it did
+    /// not fit in it.
+    pub fn next(&mut self, req: Request<'_>) -> Result<(), NextError> {
+        if !matches!(self.phase, Phase::Idle { .. }) {
+            return Err(NextError::NotIdle);
+        }
+        let (asked, up, own) = prepared(&req).map_err(NextError::Request)?;
+        self.head.reset();
+        if let Err(e) = tabled(self.head.table_mut(), &req) {
+            self.phase = Phase::Closed;
+            return Err(NextError::Request(e));
+        }
+        self.asked = asked;
+        self.phase = Phase::Asking { up };
+        self.own = own;
+        self.status = None;
+        Ok(())
+    }
+
+    /// The connection kept warm for `keep_warm` between transactions,
+    /// rather than [`KEEP_WARM`].
+    #[must_use]
+    pub const fn with_keep_warm(mut self, keep_warm: Duration) -> Self {
+        self.keep_warm = keep_warm;
+        self
     }
 
     /// The connection with the server given `timeout` to answer, rather
@@ -632,7 +687,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         match self.phase {
             Phase::Sending { until, .. }
             | Phase::Uploading { until, .. }
-            | Phase::Head { until, .. } => Some(until),
+            | Phase::Head { until, .. }
+            | Phase::Idle { until } => Some(until),
             Phase::Asking { .. }
             | Phase::Body(_)
             | Phase::Done
@@ -643,13 +699,26 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     }
 
     /// Tells the connection it is `now`, which may be past its
-    /// [`Client::next_deadline`]: then it fails, [`Failure::TimedOut`], and
-    /// asks to be aborted.
+    /// [`Client::next_deadline`]: then, kept warm, it asks to be released,
+    /// as C's `CLIENT_CONN_IDLE` closes it; waiting on the server, it fails,
+    /// [`Failure::TimedOut`], and asks to be aborted.
     pub fn deadline_passed(&mut self, now: Instant) {
-        if self.next_deadline().is_some_and(|d| now >= d) {
-            self.own = Own::new();
-            self.phase = Phase::Failed(Failure::TimedOut);
+        if self.next_deadline().is_none_or(|d| now < d) {
+            return;
         }
+        self.own = Own::new();
+        self.phase = match self.phase {
+            Phase::Idle { .. } => Phase::Closed,
+            Phase::Asking { .. }
+            | Phase::Sending { .. }
+            | Phase::Uploading { .. }
+            | Phase::Head { .. }
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Closed
+            | Phase::Upgraded
+            | Phase::Failed(_) => Phase::Failed(Failure::TimedOut),
+        };
     }
 
     /// Gives back the storage the connection's header table was made in,
@@ -702,6 +771,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 | Phase::Head { .. }
                 | Phase::Body(_)
                 | Phase::Done
+                | Phase::Idle { .. }
                 | Phase::Closed
                 | Phase::Upgraded
                 | Phase::Failed(_) => false,
@@ -731,6 +801,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
+            | Phase::Idle { .. }
             | Phase::Closed
             | Phase::Upgraded
             | Phase::Failed(_) => return Err(ChunkError::NotNow),
@@ -776,6 +847,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
+            | Phase::Idle { .. }
             | Phase::Upgraded => None,
         }
     }
@@ -791,6 +863,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
+            | Phase::Idle { .. }
             | Phase::Closed
             | Phase::Upgraded => None,
         }
@@ -799,7 +872,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     /// Whether the transaction is over.
     #[must_use]
     pub const fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Done | Phase::Closed)
+        matches!(self.phase, Phase::Done | Phase::Idle { .. } | Phase::Closed)
     }
 
     /// Whether the final response redirects, and if so where, its
@@ -953,6 +1026,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 Phase::Head { .. }
                 | Phase::Body(_)
                 | Phase::Done
+                | Phase::Idle { .. }
                 | Phase::Closed
                 | Phase::Upgraded
                 | Phase::Failed(_) => return written,
@@ -978,14 +1052,17 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         });
         match self.phase {
             Phase::Failed(f) => Err(f),
+            // nothing is asked: a byte now would answer the next request
+            Phase::Idle { .. } if !input.is_empty() => self.fail(Failure::Unsolicited),
             Phase::Asking { .. }
             | Phase::Sending { .. }
             | Phase::Uploading { .. }
             | Phase::Done
+            | Phase::Idle { .. }
             | Phase::Closed
             | Phase::Upgraded => held,
             Phase::Head { interims, .. } => self.rx_head(now, interims, input),
-            Phase::Body(b) => self.rx_body(b, input),
+            Phase::Body(b) => self.rx_body(now, b, input),
         }
     }
 
@@ -1080,10 +1157,34 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         Ok(Body::ToClose)
     }
 
-    fn rx_body<'a>(&mut self, body: Body, input: &'a [u8]) -> Result<Rx<'a>, Failure> {
+    /// Where a transaction that is over leaves the connection, at `now`:
+    /// kept warm if the request kept it and the response lets it be used
+    /// again, HTTP/1.1 without `Connection: close`, as C has it; or else
+    /// not to be used again.  C does not look at the response's
+    /// `Connection` but for a digest retry: RFC 9112 9.6 says a client
+    /// told `close` sends no more requests.
+    fn ended(&self, now: Instant) -> Phase {
+        let t = self.head.table();
+        let reusable =
+            self.asked == Asked::KeepAlive && t.is_present(Token::Http) && !says_close(t);
+        if reusable {
+            Phase::Idle {
+                until: now.saturating_add(self.keep_warm),
+            }
+        } else {
+            Phase::Done
+        }
+    }
+
+    fn rx_body<'a>(
+        &mut self,
+        now: Instant,
+        body: Body,
+        input: &'a [u8],
+    ) -> Result<Rx<'a>, Failure> {
         let (consumed, next, event) = match body {
             Body::Over => {
-                self.phase = Phase::Done;
+                self.phase = self.ended(now);
                 return Ok(Rx {
                     consumed: 0,
                     event: None,
@@ -1118,7 +1219,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             }
         };
         self.phase = if next == Body::Over {
-            Phase::Done
+            self.ended(now)
         } else {
             Phase::Body(next)
         };
@@ -1140,7 +1241,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 self.phase = Phase::Closed;
                 Ok(Some(Event::BodyEnd))
             }
-            Phase::Body(Body::Over) | Phase::Done => {
+            Phase::Body(Body::Over) | Phase::Done | Phase::Idle { .. } => {
                 self.phase = Phase::Closed;
                 Ok(None)
             }
@@ -1154,6 +1255,65 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             }
         }
     }
+}
+
+/// What a request is, checked, before any table is touched: what it
+/// asked, its body, and its head.
+fn prepared(req: &Request<'_>) -> Result<(Asked, Option<Upload>, Own), NewError> {
+    for (name, value) in req.headers {
+        check_header(name, value).map_err(NewError::Header)?;
+    }
+    let up = match req.body {
+        RequestBody::None | RequestBody::Length(0) => None,
+        RequestBody::Length(n) => Some(Upload::Length(n)),
+        RequestBody::Chunked => Some(Upload::ChunkAwaited),
+    };
+    if up.is_some() && matches!(req.connection, Connection::Upgrade(_)) {
+        return Err(NewError::UpgradeWithBody);
+    }
+    let asked = match req.connection {
+        Connection::Close => Asked::Close,
+        Connection::KeepAlive => Asked::KeepAlive,
+        Connection::Upgrade(_) => Asked::Upgrade,
+    };
+    Ok((asked, up, request_head(req).map_err(NewError::Head)?))
+}
+
+/// Puts the request's own tokens in the emptied table `t`, then marks
+/// where the response starts: an interim is dropped back to there.
+fn tabled<S: AsRef<[u8]> + AsMut<[u8]>>(
+    t: &mut HeaderTable<S>,
+    req: &Request<'_>,
+) -> Result<(), NewError> {
+    for (tok, v) in [
+        (Token::ClientUri, Some(req.path)),
+        (Token::ClientHost, req.host),
+        (Token::ClientOrigin, req.origin),
+        (Token::ClientMethod, Some(req.method)),
+    ] {
+        if let Some(v) = v {
+            t.create(tok, v).map_err(NewError::Table)?;
+        }
+    }
+    t.snapshot();
+    Ok(())
+}
+
+/// Whether the response's `Connection` lists `close` (RFC 9112 9.6),
+/// in any of its headers, whatever its case.
+fn says_close<S: AsRef<[u8]> + AsMut<[u8]>>(t: &HeaderTable<S>) -> bool {
+    t.fragments(Token::Connection).any(|v| {
+        v.split(|c| *c == b',').any(|opt| {
+            let blank = |c: &u8| *c == b' ' || *c == b'\t';
+            let start = opt.iter().position(|c| !blank(c)).unwrap_or(opt.len());
+            let end = opt
+                .iter()
+                .rposition(|c| !blank(c))
+                .map_or(0, |n| n.saturating_add(1));
+            opt.get(start..end)
+                .is_some_and(|o| o.eq_ignore_ascii_case(b"close"))
+        })
+    })
 }
 
 /// Writes the next of the body into `room`, pulling its data from `src`,
@@ -1965,5 +2125,184 @@ mod tests {
         let rx = c.rx(T0, b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
         assert_eq!(rx.event, None);
         assert_eq!(redirected(&c, b"http://h/", false), None);
+    }
+
+    fn kept(path: &'static [u8]) -> Request<'static> {
+        Request {
+            method: b"GET",
+            path,
+            host: Some(b"h"),
+            origin: None,
+            scheme: Scheme::Http,
+            no_cache: false,
+            connection: Connection::KeepAlive,
+            headers: &[],
+            body: RequestBody::None,
+        }
+    }
+
+    /// `c`'s request, as written at `now`, and its response, `response`,
+    /// taken to its end; what the body was.
+    fn exchange(c: &mut Client<[u8; 1024]>, now: Instant, response: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let request = sent(c, now, 1024, &mut NoPayload);
+        let mut body = Vec::new();
+        let mut input = response;
+        loop {
+            let rx = c.rx(now, input).unwrap();
+            input = &input[rx.consumed..];
+            match rx.event {
+                Some(Event::Body(b)) => body.extend_from_slice(b),
+                Some(Event::BodyEnd) => return (request, body),
+                Some(Event::Response) | None => assert!(rx.consumed > 0 || c.rx_pending(), "stuck"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_kept_alive_is_kept_warm_for_the_next_request() {
+        let mut c = Client::new([0u8; 1024], kept(b"/one")).unwrap();
+        let (req, body) = exchange(
+            &mut c,
+            at(1),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none",
+        );
+        assert_eq!(req, b"GET /one HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(body, b"one");
+        // C's keep_warm_secs, and nothing asked meanwhile
+        assert!(c.is_done());
+        assert_eq!(c.next_deadline(), Some(at(6)));
+        assert_eq!(c.close(), None);
+        assert!(!c.wants_write());
+
+        c.next(kept(b"/two")).unwrap();
+        assert_eq!(c.status(), None);
+        assert_eq!(c.response().first(Token::ClientUri), Some(&b"/two"[..]));
+        let (req2, body2) = exchange(
+            &mut c,
+            at(3),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ntwo\r\n0\r\n\r\n",
+        );
+        assert_eq!(req2, b"GET /two HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(body2, b"two");
+        assert!(!c.response().is_present(Token::ContentLength));
+        assert_eq!(c.next_deadline(), Some(at(8)));
+
+        // then released, not failed, if nothing comes
+        c.deadline_passed(at(7));
+        assert_eq!(c.close(), None);
+        c.deadline_passed(at(8));
+        assert_eq!((c.close(), c.failed()), (Some(Close::Release), None));
+        assert_eq!(c.next(kept(b"/three")), Err(NextError::NotIdle));
+    }
+
+    #[test]
+    fn a_warm_connection_the_server_closes_is_released() {
+        let mut c = Client::new([0u8; 1024], kept(b"/"))
+            .unwrap()
+            .with_keep_warm(Duration::from_secs(30));
+        assert_eq!(
+            exchange(&mut c, at(1), b"HTTP/1.1 204 No Content\r\n\r\n").1,
+            b""
+        );
+        assert_eq!(c.next_deadline(), Some(at(31)));
+        assert_eq!(c.rx_closed(), Ok(None));
+        assert_eq!(c.close(), Some(Close::Release));
+        assert_eq!(c.next(kept(b"/")), Err(NextError::NotIdle));
+    }
+
+    #[test]
+    fn bytes_on_a_warm_connection_fail_it() {
+        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        assert_eq!(
+            exchange(
+                &mut c,
+                at(1),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )
+            .1,
+            b""
+        );
+        assert_eq!(c.rx(at(2), b"").unwrap().consumed, 0);
+        assert_eq!(
+            c.rx(at(2), b"HTTP/1.1 200 OK\r\n"),
+            Err(Failure::Unsolicited)
+        );
+        assert_eq!(c.close(), Some(Close::Abort));
+    }
+
+    #[test]
+    fn what_the_response_or_request_says_can_end_the_connection_instead() {
+        for (request, response) in [
+            // the request did not keep it
+            (Connection::Close, &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..]),
+            // HTTP/1.0, as C
+            (Connection::KeepAlive, b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            // the server said close, which C does not look at
+            (Connection::KeepAlive, b"HTTP/1.1 200 OK\r\nConnection: Keep-Alive, CLOSE\r\nContent-Length: 0\r\n\r\n"),
+            (Connection::KeepAlive, b"HTTP/1.1 200 OK\r\nConnection: x\r\nConnection: close \r\nContent-Length: 0\r\n\r\n"),
+        ] {
+            let mut c = Client::new([0u8; 1024], Request { connection: request, ..kept(b"/") }).unwrap();
+            assert_eq!(exchange(&mut c, at(1), response).1, b"");
+            assert!(c.is_done());
+            assert_eq!(c.next_deadline(), None, "{}", response.escape_ascii());
+            assert_eq!(c.next(kept(b"/")), Err(NextError::NotIdle));
+            // as C, the server's close ends it
+            assert_eq!(c.close(), None);
+            assert_eq!(c.rx_closed(), Ok(None));
+            assert_eq!(c.close(), Some(Close::Release));
+        }
+        // nor is a body that runs to the close
+        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        assert_ne!(sent(&mut c, at(1), 1024, &mut NoPayload), b"");
+        assert_eq!(
+            c.rx(at(1), b"HTTP/1.1 200 OK\r\n\r\n").unwrap().event,
+            Some(Event::Response)
+        );
+        assert_eq!(c.rx_closed(), Ok(Some(Event::BodyEnd)));
+        assert_eq!(c.close(), Some(Close::Release));
+    }
+
+    #[test]
+    fn a_next_request_refused_leaves_the_connection_warm() {
+        let mut c = Client::new([0u8; 1024], kept(b"/")).unwrap();
+        assert_eq!(c.next(kept(b"/")), Err(NextError::NotIdle));
+        assert_eq!(
+            exchange(
+                &mut c,
+                at(1),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )
+            .1,
+            b""
+        );
+        let bad = Request {
+            headers: &[(b"Host", b"x")],
+            ..kept(b"/")
+        };
+        assert_eq!(
+            c.next(bad),
+            Err(NextError::Request(NewError::Header(
+                HeaderRefused::Reserved
+            )))
+        );
+        assert_eq!(c.next_deadline(), Some(at(6)));
+        // one that does not fit in the table releases it
+        let mut small = Client::new([0u8; 64], kept(b"/")).unwrap();
+        let mut out = [0u8; 256];
+        let _ = small.tx(at(1), &mut out, &mut NoPayload);
+        let rx = small
+            .rx(at(1), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert_eq!(rx.event, Some(Event::Response));
+        assert_eq!(small.rx(at(1), b"").unwrap().event, Some(Event::BodyEnd));
+        let long = Request {
+            path: b"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ..kept(b"/")
+        };
+        assert!(matches!(
+            small.next(long),
+            Err(NextError::Request(NewError::Table(_)))
+        ));
+        assert_eq!(small.close(), Some(Close::Release));
     }
 }

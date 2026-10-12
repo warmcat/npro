@@ -680,9 +680,8 @@ transcripts above.
 
 Not yet, for later phases or when something needs them: the connection
 machines of phase 1b drive neither side; no 100 Continue is sent; a
-server's fallback role is a shutdown; a client does no digest auth,
-and has no kept-warm `IDLING` state with its deadline; and neither side
-has a fuzz target of its own.
+server's fallback role is a shutdown; a client does no digest auth;
+and neither side has a fuzz target of its own.
 
 For Secure Streams (2026-10-12): a client's request carries the
 application's headers, checked so that none can end its line or reframe
@@ -692,7 +691,10 @@ have no client request body; the tests send npro's bodies to npro's
 server, written a byte at a time and in larger pieces, directly and
 through the driver over tls.  A client says whether its final response
 redirects, and where (`Client::redirect`, over `npro_h1::uri`, RFC 3986
-resolution); following it, on a new connection, is Secure Streams'.
+resolution); following it, on a new connection, is Secure Streams'.  A
+connection kept alive, whose response leaves it reusable, is kept warm
+for C's 5s (`IDLING`, `CLIENT_CONN_IDLE`) and takes the next request
+(`Client::next`); a done client waits for the server's close, as C.
 
 ### Phase 1e: ws
 
@@ -952,10 +954,10 @@ Streams over the driver, the threads adapter under it, one utility over
 it in place of the examples, then autobahn and the runs against C over
 it ([ss-design.md](ss-design.md), "Phases").
 
-Still not in the protocol crates: an h1 client's kept-warm `IDLING`
-(`CLIENT_CONN_IDLE`), which comes with the client's keep-alive; the
-staged shutdown's `SHUTDOWN_FLUSH`, and the IO side's connect and tls
-timeouts, which are the driver's.
+Still not in the protocol crates: the staged shutdown's
+`SHUTDOWN_FLUSH`, and the IO side's connect and tls timeouts, which are
+the driver's.  (An h1 client's kept-warm `IDLING` came with Secure
+Streams' needs, 2026-10-12.)
 
 ### Later stages
 

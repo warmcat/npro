@@ -1103,6 +1103,62 @@ mod tests {
     }
 
     #[test]
+    fn a_warm_client_connection_takes_the_next_request() {
+        let req = |path| Request {
+            method: b"GET",
+            path,
+            host: None,
+            origin: None,
+            scheme: Scheme::Http,
+            no_cache: false,
+            connection: Connection::KeepAlive,
+            headers: &[],
+            body: RequestBody::None,
+        };
+        let c = Client::new(vec![0u8; 1024], req(b"/one")).unwrap();
+        let mut d: D = Driver::new(Conn::h1_client(c), bufs(256, 256));
+        let ended = |drv: &mut D| {
+            let mut ended = false;
+            while let Some(step) = drv.poll_rx(T0) {
+                ended |= step.event() == Some(Event::H1Client(H1c::BodyEnd));
+            }
+            ended
+        };
+        assert_eq!(
+            write(&mut d, T0, &mut nothing(), 1024),
+            b"GET /one HTTP/1.1\r\n\r\n"
+        );
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(read(&mut d, T0, &mut nothing(), resp), resp.len());
+        assert!(ended(&mut d));
+        // kept warm for C's 5s, and not released
+        let Want::Io(io) = d.want(T0, &mut nothing()) else {
+            panic!("released");
+        };
+        assert_eq!(io.until, Some(at(5)));
+
+        let RoleMut::H1Client(cl) = d.conn().role_mut() else {
+            panic!("not h1");
+        };
+        cl.next(req(b"/two")).unwrap();
+        assert_eq!(
+            write(&mut d, T0, &mut nothing(), 1024),
+            b"GET /two HTTP/1.1\r\n\r\n"
+        );
+        assert_eq!(read(&mut d, T0, &mut nothing(), resp), resp.len());
+        assert!(ended(&mut d));
+
+        // nothing more: released when the time is up
+        d.timer(at(4));
+        assert!(matches!(d.want(at(4), &mut nothing()), Want::Io(_)));
+        d.timer(at(5));
+        assert!(matches!(
+            d.want(at(5), &mut nothing()),
+            Want::Release(Outcome::Delivered)
+        ));
+    }
+
+    #[test]
     fn the_fin_comes_after_what_came_before_it() {
         let c = Client::new(
             vec![0u8; 1024],
