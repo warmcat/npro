@@ -680,9 +680,17 @@ transcripts above.
 
 Not yet, for later phases or when something needs them: the connection
 machines of phase 1b drive neither side; no 100 Continue is sent; a
-server's fallback role is a shutdown; a client sends no request body,
-follows no redirect, does no digest auth, and has no kept-warm `IDLING`
-state with its deadline; and neither side has a fuzz target of its own.
+server's fallback role is a shutdown; a client follows no redirect,
+does no digest auth, and has no kept-warm `IDLING` state with its
+deadline; and neither side has a fuzz target of its own.
+
+For Secure Streams (2026-10-12): a client's request carries the
+application's headers, checked so that none can end its line or reframe
+the request, and a body, of a Content-Length or chunked, a chunk
+declared at a time, pulled as a server's answer is.  C's transcripts
+have no client request body; the tests send npro's bodies to npro's
+server, written a byte at a time and in larger pieces, directly and
+through the driver over tls.
 
 ### Phase 1e: ws
 

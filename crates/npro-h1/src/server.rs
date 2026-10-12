@@ -159,11 +159,23 @@ pub use npro_core::close::Close;
 
 /// Where the application's payload comes from: [`Server::tx`] pulls it
 /// into the buffer it is writing, after anything the connection writes
-/// itself.
+/// itself, as [`crate::client::Client::tx`] pulls a request's body.
 pub trait TxSource {
     /// Fills the start of `buf` with the next of the payload, returning how
     /// much: 0 if there is none yet.
     fn fill(&mut self, buf: &mut [u8]) -> usize;
+}
+
+/// A [`TxSource`] with nothing to give: for a connection whose
+/// application has no payload, a client's request with no body among
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoPayload;
+
+impl TxSource for NoPayload {
+    fn fill(&mut self, _: &mut [u8]) -> usize {
+        0
+    }
 }
 
 /// The application's answer to a request: C's

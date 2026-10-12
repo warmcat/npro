@@ -10,7 +10,7 @@ use std::sync::Arc;
 use npro_core::random::Random;
 use npro_core::random::Unavailable;
 use npro_core::time::Instant;
-use npro_h1::client::{Client, Connection, Event as H1c, Request, Scheme};
+use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
 use npro_h1::server::{Config, Event as H1s, Response, Server, TxSource};
 use npro_io::conn::{Conn, Event, RoleMut};
 use npro_io::driver::{Buffers, Driver, NetBuffers, Outcome, Want};
@@ -91,6 +91,7 @@ fn client_driver(layer: RustlsClient) -> C<RustlsClient> {
             no_cache: false,
             connection: Connection::Close,
             headers: &[],
+            body: RequestBody::None,
         },
     )
     .unwrap();

@@ -29,8 +29,8 @@
 mod ws_client_replay {
     use npro_core::random::SeededRandom;
     use npro_core::time::Instant;
-    use npro_h1::client::{Client, Connection, Event as H1Event, Request, Scheme};
-    use npro_h1::server::TxSource;
+    use npro_h1::client::{Client, Connection, Event as H1Event, Request, RequestBody, Scheme};
+    use npro_h1::server::{NoPayload, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
     use npro_test::{StepKind, Transcript, vendored};
     use npro_ws::conn::{AsClient, Event, Kind, Ws};
@@ -201,6 +201,7 @@ mod ws_client_replay {
                 no_cache: true,
                 connection: Connection::Upgrade(&lines[..lines_len]),
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
@@ -211,7 +212,7 @@ mod ws_client_replay {
             panic!("{}: does not start with the request", t.case);
         };
         let mut out = [0u8; 512];
-        let n = client.tx(time(sent), &mut out);
+        let n = client.tx(time(sent), &mut out, &mut NoPayload);
         assert_eq!(
             out[..n].escape_ascii().to_string(),
             request.escape_ascii().to_string(),

@@ -7,7 +7,15 @@
 //! not to, `Host`, `Origin`, then `connection: close`, or nothing for a
 //! connection kept for another request, or the header lines asking for an
 //! upgrade ([`Connection`]), then the application's own headers, as C's
-//! `LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER` adds them.
+//! `LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER` adds them, then what
+//! frames the request's body ([`RequestBody`]).
+//!
+//! A body follows the head, pulled from the application as the server's
+//! answer is ([`Client::tx`] and its [`TxSource`]): a body of a
+//! Content-Length to its length, or a chunked one a chunk at a time, each
+//! declared by [`Client::chunk`] with whether it is the last, as C frames
+//! each `lws_write()` of a body sent with no Content-Length.  Nothing is
+//! read while the request goes (C's `LRS_ISSUE_HTTP_BODY`).
 //!
 //! [`Client::rx`] takes the response, at most one thing each call: its head
 //! ([`Event::Response`]), a piece of its body, borrowed from the input
@@ -47,6 +55,7 @@ use crate::fields::{content_length, transfer_encoding_is_chunked};
 use crate::head::{self, Head, Progress, Refused, Side};
 use crate::own::Own;
 pub use crate::own::{MAX_OWN, RespondError};
+use crate::server::TxSource;
 use crate::table::{CapacityTooLarge, Full, HeaderTable};
 use crate::token::Token;
 pub use npro_core::close::Close;
@@ -94,7 +103,44 @@ pub struct Request<'a> {
     /// connection depend on are the client's to write, and refused here
     /// ([`HeaderRefused`]).
     pub headers: &'a [(&'a [u8], &'a [u8])],
+    /// The body that follows the head, and how it is framed.
+    pub body: RequestBody,
 }
+
+/// The body that follows the request's head, and how it is framed: the
+/// last of the request's headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestBody {
+    /// None: nothing is said, and a server takes none (RFC 9112 6.3).
+    None,
+    /// This many bytes: `Content-Length`, the body pulled to its length.
+    Length(u64),
+    /// Of a length not known when the head goes: `Transfer-Encoding:
+    /// chunked`, in C's spelling, the chunks declared by
+    /// [`Client::chunk`].  C sends a body the application gave no length
+    /// so (`lws_generate_client_handshake()`).
+    Chunked,
+}
+
+/// Why [`Client::chunk`] refused a chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkError {
+    /// The request's body is not chunked.
+    NotChunked,
+    /// A chunk is in hand, or the last has been declared.
+    NotNow,
+}
+
+impl core::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotChunked => "the request's body is not chunked",
+            Self::NotNow => "a chunk is in hand, or the body is over",
+        })
+    }
+}
+
+impl core::error::Error for ChunkError {}
 
 /// Why one of the application's headers is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,10 +310,14 @@ enum Body {
 /// Where the connection is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// The request is yet to go.
-    Asking,
-    /// The request is going, and the response is due by `until`.
-    Sending { until: Instant },
+    /// The request is yet to go, and then its body, if `up`.
+    Asking { up: Option<Upload> },
+    /// The request's head is going, and then its body, if `up`; the
+    /// response is due by `until`, or with a body, the head must have gone.
+    Sending { until: Instant, up: Option<Upload> },
+    /// The request's body is going, the next of it due by `until`: C's
+    /// `PENDING_TIMEOUT_CLIENT_ISSUE_PAYLOAD`.
+    Uploading { up: Upload, until: Instant },
     /// Waiting for the response's head, due by `until`; this many
     /// interims so far.
     Head { interims: u8, until: Instant },
@@ -286,6 +336,98 @@ enum Phase {
     Failed(Failure),
 }
 
+/// The most bytes of a chunked body's framing held at once: a size line,
+/// sixteen hex digits and CRLF, or a chunk's CRLF and the last-chunk.
+const FRAME_MAX: usize = 18;
+
+/// A chunked body's framing, held until it has gone: a chunk's size line,
+/// or what ends a chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame {
+    buf: [u8; FRAME_MAX],
+    len: usize,
+    sent: usize,
+}
+
+impl Frame {
+    /// `parts`, one after the other; the callers' parts fit by
+    /// [`FRAME_MAX`].
+    fn of(parts: &[&[u8]]) -> Self {
+        let mut f = Self {
+            buf: [0; FRAME_MAX],
+            len: 0,
+            sent: 0,
+        };
+        for p in parts {
+            let end = f.len.saturating_add(p.len());
+            if let Some(dst) = f.buf.get_mut(f.len..end) {
+                dst.copy_from_slice(p);
+                f.len = end;
+            }
+        }
+        f
+    }
+
+    /// A chunk's size line: its length in hex, as C's `%X`, and CRLF.
+    fn size_line(n: u64) -> Self {
+        let mut d = [0u8; 16];
+        let mut at = d.len();
+        let mut v = n;
+        loop {
+            at = at.saturating_sub(1);
+            let digit = usize::try_from(v & 0xf).unwrap_or(0);
+            if let (Some(slot), Some(c)) = (d.get_mut(at), b"0123456789ABCDEF".get(digit)) {
+                *slot = *c;
+            }
+            v >>= 4;
+            if v == 0 {
+                break;
+            }
+        }
+        Self::of(&[d.get(at..).unwrap_or_default(), b"\r\n"])
+    }
+
+    /// What ends a chunk: the CRLF after its data, if it had any, then the
+    /// last-chunk and the empty trailer, if it is the last.
+    fn tail(data: bool, last: bool) -> Self {
+        Self::of(&[
+            if data { b"\r\n" } else { b"" },
+            if last { b"0\r\n\r\n" } else { b"" },
+        ])
+    }
+
+    const fn pending(&self) -> bool {
+        self.sent < self.len
+    }
+
+    /// Writes what is left into `out`, returning how much.
+    fn drain(&mut self, out: &mut [u8]) -> usize {
+        let rest = self.buf.get(self.sent..self.len).unwrap_or_default();
+        let n = rest.len().min(out.len());
+        if let (Some(d), Some(s)) = (out.get_mut(..n), rest.get(..n)) {
+            d.copy_from_slice(s);
+        }
+        self.sent = self.sent.saturating_add(n);
+        n
+    }
+}
+
+/// How far the request's body has gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Upload {
+    /// A body of a Content-Length, this much of it still to be pulled.
+    Length(u64),
+    /// A chunked body between chunks: the application has yet to declare
+    /// the next.
+    ChunkAwaited,
+    /// A chunk: its size line going, then this much of its data to pull;
+    /// the last-chunk follows it if `last`.
+    Chunk { line: Frame, owed: u64, last: bool },
+    /// What ends a chunk going; then the body is over if `last`, or the
+    /// next chunk is awaited.
+    ChunkEnd { tail: Frame, last: bool },
+}
+
 /// What the request asked for: a transaction, or an upgrade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Asked {
@@ -301,7 +443,8 @@ enum Asked {
 ///
 /// ```
 /// use npro_core::time::Instant;
-/// use npro_h1::client::{Client, Connection, Event, Request, Scheme};
+/// use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
+/// use npro_h1::server::NoPayload;
 ///
 /// let now = Instant::from_micros(1_000_000);
 /// let mut c = Client::new([0u8; 1024], Request {
@@ -313,9 +456,10 @@ enum Asked {
 ///     no_cache: false,
 ///     connection: Connection::Close,
 ///     headers: &[],
+///     body: RequestBody::None,
 /// })?;
 /// let mut out = [0u8; 256];
-/// let n = c.tx(now, &mut out);
+/// let n = c.tx(now, &mut out, &mut NoPayload);
 /// assert_eq!(&out[..n], b"GET /x HTTP/1.1\r\nHost: example.com\r\nconnection: close\r\n\r\n");
 ///
 /// let mut input = &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..];
@@ -348,6 +492,9 @@ pub enum NewError {
     Head(RespondError),
     /// One of the application's headers is refused.
     Header(HeaderRefused),
+    /// A request for an upgrade has a body, which a server refuses with
+    /// 400.
+    UpgradeWithBody,
 }
 
 impl core::fmt::Display for NewError {
@@ -357,6 +504,7 @@ impl core::fmt::Display for NewError {
             Self::Table(e) => write!(f, "{e}"),
             Self::Head(e) => write!(f, "{e}"),
             Self::Header(e) => write!(f, "{e}"),
+            Self::UpgradeWithBody => f.write_str("a request for an upgrade has a body"),
         }
     }
 }
@@ -375,6 +523,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub fn new(storage: S, req: Request<'_>) -> Result<Self, NewError> {
         for (name, value) in req.headers {
             check_header(name, value).map_err(NewError::Header)?;
+        }
+        let up = match req.body {
+            RequestBody::None | RequestBody::Length(0) => None,
+            RequestBody::Length(n) => Some(Upload::Length(n)),
+            RequestBody::Chunked => Some(Upload::ChunkAwaited),
+        };
+        if up.is_some() && matches!(req.connection, Connection::Upgrade(_)) {
+            return Err(NewError::UpgradeWithBody);
         }
         let mut t = HeaderTable::new(storage).map_err(NewError::Capacity)?;
         for (tok, v) in [
@@ -397,7 +553,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 Connection::KeepAlive => Asked::KeepAlive,
                 Connection::Upgrade(_) => Asked::Upgrade,
             },
-            phase: Phase::Asking,
+            phase: Phase::Asking { up },
             own: request_head(&req).map_err(NewError::Head)?,
             status: None,
             timeout: RESPONSE_TIMEOUT,
@@ -417,8 +573,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     #[must_use]
     pub const fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
-            Phase::Sending { until } | Phase::Head { until, .. } => Some(until),
-            Phase::Asking
+            Phase::Sending { until, .. }
+            | Phase::Uploading { until, .. }
+            | Phase::Head { until, .. } => Some(until),
+            Phase::Asking { .. }
             | Phase::Body(_)
             | Phase::Done
             | Phase::Closed
@@ -466,10 +624,78 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         matches!(self.phase, Phase::Body(Body::EndDue))
     }
 
-    /// Whether the connection has something to write.
+    /// Whether the connection has something of its own to write: the
+    /// request's head, or a chunked body's framing.  Whether the
+    /// application has more of the body is the application's to say to
+    /// whatever pulls it.
     #[must_use]
     pub const fn wants_write(&self) -> bool {
         self.own.pending()
+            || match self.phase {
+                Phase::Uploading {
+                    up: Upload::Chunk { line: f, .. } | Upload::ChunkEnd { tail: f, .. },
+                    ..
+                } => f.pending(),
+                Phase::Uploading {
+                    up: Upload::Length(_) | Upload::ChunkAwaited,
+                    ..
+                }
+                | Phase::Asking { .. }
+                | Phase::Sending { .. }
+                | Phase::Head { .. }
+                | Phase::Body(_)
+                | Phase::Done
+                | Phase::Closed
+                | Phase::Upgraded
+                | Phase::Failed(_) => false,
+            }
+    }
+
+    /// Declares the next chunk of a chunked body: `len` bytes, pulled
+    /// from the application as they go, the last-chunk after them if
+    /// `last`.  It may be declared before the head has gone.  A chunk of
+    /// no bytes that is not the last is nothing on the wire, as in C,
+    /// since it would be the last-chunk; one that is the last is the
+    /// last-chunk alone.
+    ///
+    /// # Errors
+    ///
+    /// [`ChunkError::NotChunked`] if the body is not chunked, or
+    /// [`ChunkError::NotNow`] while a chunk is in hand, or once the last
+    /// has been declared.
+    pub fn chunk(&mut self, len: u64, last: bool) -> Result<(), ChunkError> {
+        let up = match &mut self.phase {
+            Phase::Asking { up: Some(up) }
+            | Phase::Sending { up: Some(up), .. }
+            | Phase::Uploading { up, .. } => up,
+            Phase::Asking { up: None } | Phase::Sending { up: None, .. } => {
+                return Err(ChunkError::NotChunked);
+            }
+            Phase::Head { .. }
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Closed
+            | Phase::Upgraded
+            | Phase::Failed(_) => return Err(ChunkError::NotNow),
+        };
+        match up {
+            Upload::ChunkAwaited => {}
+            Upload::Length(_) => return Err(ChunkError::NotChunked),
+            Upload::Chunk { .. } | Upload::ChunkEnd { .. } => return Err(ChunkError::NotNow),
+        }
+        *up = match (len, last) {
+            (0, false) => Upload::ChunkAwaited,
+            (0, true) => Upload::ChunkEnd {
+                tail: Frame::tail(false, true),
+                last: true,
+            },
+            (n, last) => Upload::Chunk {
+                line: Frame::size_line(n),
+                owed: n,
+                last,
+            },
+        };
+        Ok(())
     }
 
     /// What the connection asks of whatever carries it, once it is done
@@ -487,8 +713,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         match self.phase {
             Phase::Failed(_) => Some(Close::Abort),
             Phase::Closed => Some(Close::Release),
-            Phase::Asking
+            Phase::Asking { .. }
             | Phase::Sending { .. }
+            | Phase::Uploading { .. }
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
@@ -501,8 +728,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn failed(&self) -> Option<Failure> {
         match self.phase {
             Phase::Failed(f) => Some(f),
-            Phase::Asking
+            Phase::Asking { .. }
             | Phase::Sending { .. }
+            | Phase::Uploading { .. }
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
@@ -525,29 +753,77 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         matches!(self.phase, Phase::Upgraded)
     }
 
-    /// Writes the request's head, or what is left of it, into `out`, at
-    /// `now`, returning how much.  The server's answer is due from when the
-    /// head begins to go, as C sends it whole, in one push, and starts
-    /// waiting then.
-    pub fn tx(&mut self, now: Instant, out: &mut [u8]) -> usize {
-        let n = self.own.drain(out);
-        let until = match self.phase {
-            Phase::Asking if n > 0 => now.saturating_add(self.timeout),
-            Phase::Sending { until } => until,
-            Phase::Asking
-            | Phase::Head { .. }
-            | Phase::Body(_)
-            | Phase::Done
-            | Phase::Closed
-            | Phase::Upgraded
-            | Phase::Failed(_) => return n,
-        };
-        self.phase = if self.own.pending() {
-            Phase::Sending { until }
-        } else {
-            Phase::Head { interims: 0, until }
-        };
-        n
+    /// Writes the request, or what is left of it, into `out`, at `now`,
+    /// returning how much: its head, then its body, pulled from `src` and
+    /// framed as the head said.
+    ///
+    /// Without a body, the server's answer is due from when the head
+    /// begins to go, as C sends it whole, in one push, and starts waiting
+    /// then.  With one, as C, the body's next bytes are due from when the
+    /// head has gone, and the answer from when the body has.  Unlike C,
+    /// whose `PENDING_TIMEOUT_CLIENT_ISSUE_PAYLOAD` is set once for the
+    /// whole body, each piece of the body that goes renews the wait for
+    /// the next, as a server's answer renews its own: a body slower to go
+    /// than the timeout is not cut off while it moves.
+    pub fn tx(&mut self, now: Instant, out: &mut [u8], src: &mut dyn TxSource) -> usize {
+        let mut written = 0usize;
+        loop {
+            let room = out.get_mut(written..).unwrap_or_default();
+            match self.phase {
+                Phase::Asking { up } => {
+                    let n = self.own.drain(room);
+                    if n == 0 {
+                        return written;
+                    }
+                    written = written.saturating_add(n);
+                    self.phase = Phase::Sending {
+                        until: now.saturating_add(self.timeout),
+                        up,
+                    };
+                }
+                Phase::Sending { until, up } => {
+                    written = written.saturating_add(self.own.drain(room));
+                    if self.own.pending() {
+                        return written;
+                    }
+                    let Some(up) = up else {
+                        self.phase = Phase::Head { interims: 0, until };
+                        return written;
+                    };
+                    self.phase = Phase::Uploading {
+                        up,
+                        until: now.saturating_add(self.timeout),
+                    };
+                }
+                Phase::Uploading { up, until } => {
+                    let (n, next) = upload(up, room, src);
+                    written = written.saturating_add(n);
+                    let until = if n > 0 {
+                        now.saturating_add(self.timeout)
+                    } else {
+                        until
+                    };
+                    let Some(going) = next else {
+                        // the body has gone: the answer is due
+                        self.phase = Phase::Head {
+                            interims: 0,
+                            until: now.saturating_add(self.timeout),
+                        };
+                        return written;
+                    };
+                    self.phase = Phase::Uploading { up: going, until };
+                    if n == 0 {
+                        return written;
+                    }
+                }
+                Phase::Head { .. }
+                | Phase::Body(_)
+                | Phase::Done
+                | Phase::Closed
+                | Phase::Upgraded
+                | Phase::Failed(_) => return written,
+            }
+        }
     }
 
     const fn fail<'a>(&mut self, f: Failure) -> Result<Rx<'a>, Failure> {
@@ -568,8 +844,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         });
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Asking
+            Phase::Asking { .. }
             | Phase::Sending { .. }
+            | Phase::Uploading { .. }
             | Phase::Done
             | Phase::Closed
             | Phase::Upgraded => held,
@@ -733,13 +1010,69 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
                 self.phase = Phase::Closed;
                 Ok(None)
             }
-            Phase::Asking
+            Phase::Asking { .. }
             | Phase::Sending { .. }
+            | Phase::Uploading { .. }
             | Phase::Head { .. }
             | Phase::Body(Body::Length(_) | Body::Chunked(_)) => {
                 self.phase = Phase::Failed(Failure::Closed);
                 Err(Failure::Closed)
             }
+        }
+    }
+}
+
+/// Writes the next of the body into `room`, pulling its data from `src`,
+/// returning how much, and how far the body has gone after it: `None` once
+/// it is over.
+fn upload(up: Upload, room: &mut [u8], src: &mut dyn TxSource) -> (usize, Option<Upload>) {
+    // the next `owed` bytes of the body's data, as much as there is room
+    // for and the application has
+    let mut pull = |owed: u64| {
+        let cap = usize::try_from(owed).unwrap_or(usize::MAX).min(room.len());
+        let n = src.fill(room.get_mut(..cap).unwrap_or_default()).min(cap);
+        (n, owed.saturating_sub(u64::try_from(n).unwrap_or(owed)))
+    };
+    match up {
+        Upload::ChunkAwaited => (0, Some(up)),
+        Upload::Length(owed) => {
+            let (n, rest) = pull(owed);
+            (n, (rest > 0).then_some(Upload::Length(rest)))
+        }
+        Upload::Chunk {
+            mut line,
+            owed,
+            last,
+        } if line.pending() => {
+            let n = line.drain(room);
+            (n, Some(Upload::Chunk { line, owed, last }))
+        }
+        Upload::Chunk { line, owed, last } => {
+            let (n, rest) = pull(owed);
+            let next = if rest > 0 {
+                Upload::Chunk {
+                    line,
+                    owed: rest,
+                    last,
+                }
+            } else {
+                Upload::ChunkEnd {
+                    tail: Frame::tail(true, last),
+                    last,
+                }
+            };
+            (n, Some(next))
+        }
+        Upload::ChunkEnd { mut tail, last } => {
+            let n = tail.drain(room);
+            let next = if tail.pending() {
+                Some(Upload::ChunkEnd { tail, last })
+            } else if last {
+                None
+            } else {
+                Some(Upload::ChunkAwaited)
+            };
+            (n, next)
         }
     }
 }
@@ -778,6 +1111,15 @@ fn request_head(r: &Request<'_>) -> Result<Own, RespondError> {
         o.push(value)?;
         o.push(b"\r\n")?;
     }
+    match r.body {
+        RequestBody::None => {}
+        RequestBody::Length(n) => {
+            o.push(b"Content-Length: ")?;
+            o.push_u64(n)?;
+            o.push(b"\r\n")?;
+        }
+        RequestBody::Chunked => o.push(b"Transfer-Encoding: chunked\r\n")?,
+    }
     o.push(b"\r\n")?;
     Ok(o)
 }
@@ -814,7 +1156,11 @@ fn atoi(s: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
+    use crate::server::{self, NoPayload, Server};
+    use alloc::vec::Vec;
 
     /// When the tests' connections do all they do.
     const T0: Instant = Instant::from_micros(1_000_000);
@@ -831,11 +1177,12 @@ mod tests {
                 no_cache: true,
                 connection: Connection::Close,
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let _ = c.tx(T0, &mut out);
+        let _ = c.tx(T0, &mut out, &mut NoPayload);
         c
     }
 
@@ -879,11 +1226,12 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Upgrade(b"Upgrade: x\r\nConnection: Upgrade\r\n"),
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let n = c.tx(T0, &mut out);
+        let n = c.tx(T0, &mut out, &mut NoPayload);
         assert_eq!(
             &out[..n],
             b"GET /x HTTP/1.1\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\n"
@@ -954,6 +1302,7 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Close,
                 headers,
+                body: RequestBody::None,
             },
         )
     }
@@ -962,7 +1311,7 @@ mod tests {
     fn the_applications_headers_go_last_as_cs_append_does() {
         let mut c = with_headers(&[(b"x-a", b"1"), (b"Cookie", b"k=v; \tj=\xff")]).unwrap();
         let mut out = [0u8; 512];
-        let n = c.tx(T0, &mut out);
+        let n = c.tx(T0, &mut out, &mut NoPayload);
         assert_eq!(
             &out[..n],
             b"GET /x HTTP/1.1\r\nHost: h\r\nconnection: close\r\nx-a: 1\r\nCookie: k=v; \tj=\xff\r\n\r\n"
@@ -1018,6 +1367,7 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Close,
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap()
@@ -1028,9 +1378,9 @@ mod tests {
         let mut c = unsent();
         assert_eq!(c.next_deadline(), None);
         let mut out = [0u8; 512];
-        assert_eq!(c.tx(at(1), &mut out[..4]), 4);
+        assert_eq!(c.tx(at(1), &mut out[..4], &mut NoPayload), 4);
         assert_eq!(c.next_deadline(), Some(at(16)));
-        assert!(c.tx(at(3), &mut out) > 0);
+        assert!(c.tx(at(3), &mut out, &mut NoPayload) > 0);
         assert_eq!(c.next_deadline(), Some(at(16)));
         c.deadline_passed(at(15));
         assert_eq!(c.failed(), None);
@@ -1062,7 +1412,6 @@ mod tests {
 
     #[test]
     fn a_timeout_says_what_c_says() {
-        extern crate alloc;
         use alloc::string::ToString;
 
         assert_eq!(
@@ -1090,5 +1439,259 @@ mod tests {
         let mut failed = get(b"GET");
         let _ = failed.rx(T0, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
         assert_eq!(failed.close(), Some(Close::Abort));
+    }
+
+    /// The application's body: what is left of it, given at most `step`
+    /// bytes a pull.
+    struct Upload<'a> {
+        rest: &'a [u8],
+        step: usize,
+    }
+
+    impl TxSource for Upload<'_> {
+        fn fill(&mut self, buf: &mut [u8]) -> usize {
+            let n = self.rest.len().min(buf.len()).min(self.step);
+            buf[..n].copy_from_slice(&self.rest[..n]);
+            self.rest = &self.rest[n..];
+            n
+        }
+    }
+
+    fn post(body: RequestBody) -> Client<[u8; 1024]> {
+        Client::new(
+            [0u8; 1024],
+            Request {
+                method: b"POST",
+                path: b"/x",
+                host: Some(b"h"),
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::KeepAlive,
+                headers: &[],
+                body,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Everything `c` writes at `now`, `room` bytes a call, until it
+    /// writes nothing.
+    fn sent(
+        c: &mut Client<[u8; 1024]>,
+        now: Instant,
+        room: usize,
+        src: &mut dyn TxSource,
+    ) -> Vec<u8> {
+        let mut all = Vec::new();
+        let mut out = [0u8; 1024];
+        loop {
+            let n = c.tx(now, &mut out[..room], src);
+            if n == 0 {
+                return all;
+            }
+            all.extend_from_slice(&out[..n]);
+        }
+    }
+
+    const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\n";
+
+    #[test]
+    fn a_body_of_a_length_is_pulled_to_its_length() {
+        let mut c = post(RequestBody::Length(5));
+        let mut src = Upload {
+            rest: b"hello world",
+            step: 2,
+        };
+        let wire = sent(&mut c, T0, 1024, &mut src);
+        assert_eq!(wire, [HEAD, b"Content-Length: 5\r\n\r\nhello"].concat());
+        assert_eq!(src.rest, b" world");
+        // the body has gone: the answer is awaited
+        let rx = c.rx(T0, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(rx.unwrap().event, Some(Event::Response));
+    }
+
+    #[test]
+    fn an_empty_body_of_a_length_says_so_and_has_nothing_to_pull() {
+        let mut c = post(RequestBody::Length(0));
+        let wire = sent(&mut c, T0, 1024, &mut NoPayload);
+        assert_eq!(wire, [HEAD, b"Content-Length: 0\r\n\r\n"].concat());
+        assert_eq!(c.next_deadline(), Some(at(15)));
+        assert_eq!(c.chunk(1, true), Err(ChunkError::NotNow));
+    }
+
+    #[test]
+    fn a_chunked_body_goes_a_declared_chunk_at_a_time() {
+        let mut c = post(RequestBody::Chunked);
+        // declared before the head has gone
+        c.chunk(3, false).unwrap();
+        assert_eq!(c.chunk(1, false), Err(ChunkError::NotNow));
+        let mut src = Upload {
+            rest: b"abcdefghijklmnopqrstuvwxyz",
+            step: 2,
+        };
+        let wire = sent(&mut c, T0, 1024, &mut src);
+        assert_eq!(
+            wire,
+            [HEAD, b"Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"].concat()
+        );
+        // nothing more till the next is declared, and an empty one that is
+        // not the last is nothing on the wire
+        assert!(!c.wants_write());
+        c.chunk(0, false).unwrap();
+        assert_eq!(sent(&mut c, T0, 1024, &mut src), b"");
+        c.chunk(23, true).unwrap();
+        assert!(c.wants_write());
+        let rest = sent(&mut c, T0, 1024, &mut src);
+        assert_eq!(rest, b"17\r\ndefghijklmnopqrstuvwxyz\r\n0\r\n\r\n");
+        assert_eq!(c.chunk(1, true), Err(ChunkError::NotNow));
+        assert_eq!(c.next_deadline(), Some(at(15)));
+    }
+
+    #[test]
+    fn a_last_chunk_alone_ends_the_body() {
+        let mut c = post(RequestBody::Chunked);
+        c.chunk(0, true).unwrap();
+        let wire = sent(&mut c, T0, 1024, &mut NoPayload);
+        assert_eq!(
+            wire,
+            [HEAD, b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"].concat()
+        );
+        assert_eq!(c.chunk(0, true), Err(ChunkError::NotNow));
+    }
+
+    #[test]
+    fn only_a_chunked_body_takes_chunks() {
+        assert_eq!(
+            post(RequestBody::None).chunk(1, true),
+            Err(ChunkError::NotChunked)
+        );
+        let mut c = post(RequestBody::Length(4));
+        assert_eq!(c.chunk(1, true), Err(ChunkError::NotChunked));
+        assert_ne!(sent(&mut c, T0, 1024, &mut NoPayload), b"");
+        assert_eq!(c.chunk(1, true), Err(ChunkError::NotChunked));
+    }
+
+    #[test]
+    fn a_size_line_is_cs_hex_and_fits_any_length() {
+        let mut out = [0u8; FRAME_MAX];
+        for (n, line) in [
+            (1u64, &b"1\r\n"[..]),
+            (0xabc, b"ABC\r\n"),
+            (u64::MAX, b"FFFFFFFFFFFFFFFF\r\n"),
+        ] {
+            let mut f = Frame::size_line(n);
+            let k = f.drain(&mut out);
+            assert_eq!(&out[..k], line);
+            assert!(!f.pending());
+        }
+    }
+
+    #[test]
+    fn an_upgrade_has_no_body() {
+        let r = Client::new(
+            [0u8; 1024],
+            Request {
+                method: b"GET",
+                path: b"/x",
+                host: None,
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Upgrade(b"Upgrade: x\r\n"),
+                headers: &[],
+                body: RequestBody::Chunked,
+            },
+        );
+        assert_eq!(r.err(), Some(NewError::UpgradeWithBody));
+    }
+
+    #[test]
+    fn nothing_is_read_while_the_body_goes() {
+        let mut c = post(RequestBody::Length(4));
+        assert_ne!(sent(&mut c, T0, 1024, &mut NoPayload), b"");
+        let early = b"HTTP/1.1 413 Too Large\r\n\r\n";
+        assert_eq!(c.rx(T0, early).unwrap().consumed, 0);
+        let mut body = Upload {
+            rest: b"abcd",
+            step: 4,
+        };
+        assert_eq!(sent(&mut c, T0, 1024, &mut body), b"abcd");
+        assert_eq!(c.rx(T0, early).unwrap().event, Some(Event::Response));
+    }
+
+    #[test]
+    fn the_body_has_the_timeout_for_each_piece_then_the_answer() {
+        let mut c = post(RequestBody::Length(4));
+        let mut src = Upload {
+            rest: b"abcd",
+            step: 1,
+        };
+        let mut out = [0u8; 1024];
+        // the head: the body's first piece is due from when it has gone
+        let n = c.tx(at(1), &mut out, &mut NoPayload);
+        assert!(n > 0);
+        assert_eq!(c.next_deadline(), Some(at(16)));
+        // each piece renews it, where C's is set once for the whole body
+        assert_eq!(c.tx(at(10), &mut out[..1], &mut src), 1);
+        assert_eq!(c.next_deadline(), Some(at(25)));
+        c.deadline_passed(at(24));
+        assert_eq!(c.failed(), None);
+        // the rest, at once: then the answer is due from there
+        assert_eq!(c.tx(at(20), &mut out, &mut src), 3);
+        assert_eq!(c.next_deadline(), Some(at(35)));
+
+        // a body that stops coming fails the connection
+        let mut stalled = post(RequestBody::Chunked);
+        assert_ne!(sent(&mut stalled, at(1), 1024, &mut NoPayload), b"");
+        stalled.deadline_passed(at(16));
+        assert_eq!(stalled.failed(), Some(Failure::TimedOut));
+        assert_eq!(stalled.chunk(1, true), Err(ChunkError::NotNow));
+    }
+
+    /// The body npro's own server takes from `wire`, which must be one
+    /// request and nothing more.
+    fn served(wire: &[u8]) -> Vec<u8> {
+        let mut s = Server::new([0u8; 1024], server::Config::default(), T0).unwrap();
+        let mut input = wire;
+        let mut body = Vec::new();
+        loop {
+            let rx = s.rx(T0, input);
+            input = &input[rx.consumed..];
+            match rx.event {
+                Some(server::Event::Body(b)) => body.extend_from_slice(b),
+                Some(server::Event::BodyEnd) => {
+                    assert!(input.is_empty(), "{}", input.escape_ascii());
+                    return body;
+                }
+                Some(server::Event::Request) => {}
+                None => assert!(rx.consumed > 0, "stuck at {}", input.escape_ascii()),
+            }
+        }
+    }
+
+    #[test]
+    fn npros_server_takes_the_body_however_it_was_written() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        let source = || Upload {
+            rest: &data,
+            step: 333,
+        };
+        for room in [1, 2, 7, 1024] {
+            let mut by_length = post(RequestBody::Length(3000));
+            let wire = sent(&mut by_length, T0, room, &mut source());
+            assert_eq!(served(&wire), data, "length, {room}");
+
+            let mut chunked = post(RequestBody::Chunked);
+            let mut src = source();
+            let mut chunks = Vec::new();
+            for (i, piece) in data.chunks(1000).enumerate() {
+                chunked
+                    .chunk(u64::try_from(piece.len()).unwrap(), i == 2)
+                    .unwrap();
+                chunks.extend(sent(&mut chunked, T0, room, &mut src));
+            }
+            assert_eq!(served(&chunks), data, "chunked, {room}");
+        }
     }
 }

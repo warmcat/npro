@@ -24,7 +24,7 @@ mod driver_replay {
 
     use npro_core::random::SeededRandom;
     use npro_core::time::Instant;
-    use npro_h1::client::{Client, Connection, Event as H1c, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
     use npro_h1::head;
     use npro_h1::server::{Config, Event as H1s, Response, Server, TxSource};
     use npro_h1::table::DEFAULT_CAPACITY;
@@ -525,6 +525,7 @@ mod driver_replay {
                     no_cache: true,
                     connection: Connection::Upgrade(&lines[..n]),
                     headers: &[],
+                    body: RequestBody::None,
                 },
             )
             .unwrap();
@@ -568,6 +569,7 @@ mod driver_replay {
                     no_cache: true,
                     connection: Connection::Close,
                     headers: &[],
+                    body: RequestBody::None,
                 },
             )
             .unwrap();

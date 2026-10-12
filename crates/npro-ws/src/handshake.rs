@@ -340,7 +340,8 @@ impl core::error::Error for ClientRefusal {}
 /// ```
 /// use npro_core::random::SeededRandom;
 /// use npro_core::time::Instant;
-/// use npro_h1::client::{Client, Connection, Event, Request, Scheme};
+/// use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
+/// use npro_h1::server::NoPayload;
 /// use npro_ws::handshake::{ClientKey, MAX_REQUEST_LINES};
 ///
 /// // C's seeded random, as its ws-client transcript has it
@@ -359,9 +360,10 @@ impl core::error::Error for ClientRefusal {}
 ///     no_cache: false,
 ///     connection: Connection::Upgrade(&lines[..n]),
 ///     headers: &[],
+///     body: RequestBody::None,
 /// })?;
 /// let mut out = [0u8; 512];
-/// let n = c.tx(now, &mut out);
+/// let n = c.tx(now, &mut out, &mut NoPayload);
 /// assert!(out[..n].starts_with(b"GET /echo HTTP/1.1\r\nHost: sansio\r\nUpgrade: websocket\r\n"));
 ///
 /// let rx = c.rx(now, b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
@@ -551,7 +553,8 @@ mod tests {
     /// When the tests' connections do all they do.
     const T0: Instant = Instant::from_micros(1_000_000);
     use npro_core::random::SeededRandom;
-    use npro_h1::client::{Client, Connection, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Request, RequestBody, Scheme};
+    use npro_h1::server::NoPayload;
 
     /// The head of a 101 with the accept of seed 1's key, as C's ws-client
     /// transcript has it.
@@ -593,11 +596,12 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Upgrade(&lines[..n]),
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let _ = c.tx(T0, &mut out);
+        let _ = c.tx(T0, &mut out, &mut NoPayload);
         let _ = c.rx(T0, response.as_bytes()).unwrap();
         assert!(c.is_upgraded(), "{response}");
         match key.check(c.status(), c.response(), Some(b"echo, chat"), None) {

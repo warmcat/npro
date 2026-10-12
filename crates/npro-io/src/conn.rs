@@ -323,7 +323,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
     pub fn tx(&mut self, now: Instant, out: &mut [u8], src: &mut dyn TxSource) -> usize {
         match &mut self.inner {
             Inner::H1Server(s) => s.tx(now, out, src).written,
-            Inner::H1Client(c) => c.tx(now, out),
+            Inner::H1Client(c) => c.tx(now, out, src),
             Inner::WsServer(w) => w.tx(now, out, src),
             Inner::WsClient(w) => w.tx(now, out, src),
         }
@@ -397,7 +397,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
 mod tests {
     use super::*;
     use npro_core::random::SeededRandom;
-    use npro_h1::client::{Connection, Request, Scheme};
+    use npro_h1::client::{Connection, Request, RequestBody, Scheme};
     use npro_h1::server::Config;
 
     const T0: Instant = Instant::from_micros(1_000_000);
@@ -464,6 +464,7 @@ mod tests {
                     no_cache: false,
                     connection: Connection::Upgrade(b""),
                     headers: &[],
+                    body: RequestBody::None,
                 },
             )
             .unwrap(),
@@ -485,6 +486,7 @@ mod tests {
                     no_cache: false,
                     connection: Connection::Upgrade(b""),
                     headers: &[],
+                    body: RequestBody::None,
                 },
             )
             .unwrap(),
@@ -520,6 +522,7 @@ mod tests {
                     no_cache: false,
                     connection: Connection::Close,
                     headers: &[],
+                    body: RequestBody::None,
                 },
             )
             .unwrap(),

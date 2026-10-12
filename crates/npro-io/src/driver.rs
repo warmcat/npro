@@ -835,7 +835,7 @@ mod tests {
     use alloc::vec::Vec;
     use npro_core::random::SeededRandom;
     use npro_h1::client::Event as H1c;
-    use npro_h1::client::{Client, Connection, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Request, RequestBody, Scheme};
     use npro_h1::server::{Config, Event as H1, Response, Server};
 
     const T0: Instant = Instant::from_micros(1_000_000);
@@ -1078,6 +1078,7 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Close,
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
@@ -1114,6 +1115,7 @@ mod tests {
                 no_cache: false,
                 connection: Connection::Close,
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
@@ -1194,7 +1196,7 @@ mod tls_tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use npro_core::random::SeededRandom;
-    use npro_h1::client::{Client, Connection, Event as H1c, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Event as H1c, Request, RequestBody, Scheme};
     use npro_h1::server::{Config, Event as H1s, Response, Server};
 
     const T0: Instant = Instant::from_micros(1_000_000);
@@ -1416,11 +1418,15 @@ mod tls_tests {
     }
 
     fn client() -> Conn<Vec<u8>, SeededRandom> {
+        client_with(b"GET", RequestBody::None)
+    }
+
+    fn client_with(method: &[u8], body: RequestBody) -> Conn<Vec<u8>, SeededRandom> {
         Conn::h1_client(
             Client::new(
                 vec![0u8; 1024],
                 Request {
-                    method: b"GET",
+                    method,
                     path: b"/",
                     host: Some(b"x"),
                     origin: None,
@@ -1428,6 +1434,7 @@ mod tls_tests {
                     no_cache: false,
                     connection: Connection::Close,
                     headers: &[],
+                    body,
                 },
             )
             .unwrap(),
@@ -1449,8 +1456,9 @@ mod tls_tests {
         }
     }
 
-    /// Moves what `from` writes into `to`, a few bytes at a time; what
-    /// went.
+    /// Moves what `from` writes into `to`, a few bytes at a time, while
+    /// `to` has room; what went.  Once `to` is gone, the next piece is
+    /// written and lost.
     fn carry(from: &mut D, src: &mut Text, to: &mut D, sink: &mut Text) -> Vec<u8> {
         let mut went = Vec::new();
         loop {
@@ -1460,16 +1468,22 @@ mod tls_tests {
             let Some(w) = io.write else {
                 return went;
             };
-            let n = w.len().min(5);
-            let bytes = w[..n].to_vec();
-            from.write_done(T0, n);
+            let bytes = w[..w.len().min(5)].to_vec();
             let Want::Io(into) = to.want(T0, sink) else {
+                // `to` is gone: what was written to it is lost, as on a
+                // socket the peer has closed
+                from.write_done(T0, bytes.len());
                 return went;
             };
-            let room = into.read.unwrap();
-            room[..n].copy_from_slice(&bytes);
+            // what `to` has not taken is back-pressure: the rest waits
+            let Some(room) = into.read else {
+                return went;
+            };
+            let n = bytes.len().min(room.len());
+            room[..n].copy_from_slice(&bytes[..n]);
             to.read_done(T0, n);
-            went.extend_from_slice(&bytes);
+            from.write_done(T0, n);
+            went.extend_from_slice(&bytes[..n]);
         }
     }
 
@@ -1520,6 +1534,49 @@ mod tls_tests {
         // and none of it went as plaintext
         assert!(!wire.windows(5).any(|w| w == b"GET /"));
         assert!(!wire.windows(8).any(|w| w == b"HTTP/1.1"));
+    }
+
+    #[test]
+    fn an_h1_clients_body_is_pulled_through_the_driver() {
+        let sent: Vec<u8> = (0..=255u8).cycle().take(700).collect();
+        for body in [RequestBody::Length(700), RequestBody::Chunked] {
+            let (mut c, mut s) = (
+                tls(client_with(b"POST", body), Toy::new(Side::Client)),
+                tls(server(), Toy::new(Side::Server)),
+            );
+            if body == RequestBody::Chunked {
+                let RoleMut::H1Client(cl) = c.conn().role_mut() else {
+                    panic!("not h1");
+                };
+                cl.chunk(700, true).unwrap();
+            }
+            let (mut csrc, mut ssrc) = (Text(sent.clone()), Text(Vec::new()));
+            c.request_write();
+            let mut got = Vec::new();
+            let mut wire = Vec::new();
+            let mut ended = false;
+            for _ in 0..200 {
+                wire.extend(carry(&mut c, &mut csrc, &mut s, &mut ssrc));
+                while let Some(step) = s.poll_rx(T0) {
+                    match step.event() {
+                        Some(Event::H1Server(H1s::Body(b))) => got.extend_from_slice(b),
+                        Some(Event::H1Server(H1s::BodyEnd)) => ended = true,
+                        _ => {}
+                    }
+                }
+                if ended {
+                    break;
+                }
+                // the server's half of the handshake
+                wire.extend(carry(&mut s, &mut ssrc, &mut c, &mut csrc));
+                while c.poll_rx(T0).is_some() {}
+            }
+            assert!(ended, "{body:?}");
+            assert_eq!(got, sent, "{body:?}");
+            assert_eq!(csrc.0, b"");
+            // and it went sealed
+            assert!(!wire.windows(6).any(|w| w == b"POST /"));
+        }
     }
 
     #[test]

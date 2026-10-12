@@ -19,7 +19,8 @@
 #[cfg(test)]
 mod h1_client_replay {
     use npro_core::time::Instant;
-    use npro_h1::client::{Client, Connection, Event, Request, Scheme};
+    use npro_h1::client::{Client, Connection, Event, Request, RequestBody, Scheme};
+    use npro_h1::server::NoPayload;
     use npro_h1::table::DEFAULT_CAPACITY;
     use npro_test::{StepKind, Transcript, vendored};
 
@@ -74,11 +75,12 @@ mod h1_client_replay {
                 no_cache: true,
                 connection: Connection::Close,
                 headers: &[],
+                body: RequestBody::None,
             },
         )
         .unwrap();
         let mut out = [0u8; 512];
-        let n = c.tx(time(sent), &mut out);
+        let n = c.tx(time(sent), &mut out, &mut NoPayload);
         assert_eq!(
             out[..n].escape_ascii().to_string(),
             want.escape_ascii().to_string(),
