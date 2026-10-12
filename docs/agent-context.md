@@ -195,10 +195,12 @@ half.
   is kept warm for a few seconds (idle state with a timeout) so a new
   request to the same endpoint joins it.  This is design intent, not dead
   code.
-- Parked question, do not settle without Andy: a request that joins a
-  kept-warm h2/h3 connection is told "established" at the join with
-  status 0, before any response arrives.  Secure Streams relies on that
-  today.
+- A request that joins a kept-warm h2/h3 connection is told
+  "established" at the join with status 0, before any response arrives,
+  and C's Secure Streams relies on that.  npro does not copy it (Andy,
+  2026-10-12): a stream is connected when the peer has answered, since a
+  warm connection may already be closed at the peer
+  (docs/ss-design.md).
 - A client redirect is a transport phase ("restarting") of the same
   connection object, and its tests found three separate defects in the C
   h2 path.  Test redirects over every protocol.

@@ -2,8 +2,8 @@
 
 **Draft, for iteration.**  It records what was decided with Andy from
 2026-10-07 to 2026-10-09, and marks what is still open.  The stream and
-service API it configures is a separate document, still to be written
-(`ss-design.md`); [io-model.md](io-model.md) is the layer underneath.
+service API it configures is [ss-design.md](ss-design.md);
+[io-model.md](io-model.md) is the layer underneath.
 
 ## What this replaces
 

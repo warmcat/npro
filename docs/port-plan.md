@@ -859,9 +859,11 @@ agreed 2026-10-06.  For this phase:
   transport before any socket;
 - the threads adapter (`std`), std TCP, no tls yet.  The first form of
   this plan said a poll-style loop, but std has no `poll()`; that is the
-  `mio` adapter, which waits for its dependency decision.  The minimal
-  examples (ws echo server and client, http server and client) come with
-  it.  Enough to run:
+  `mio` adapter, which waits for its dependency decision.  There are no
+  minimal examples as C has them: Secure Streams comes first, and the
+  examples are one utility over it, client and server, in a
+  workspace of its own ([ss-design.md](ss-design.md), Andy,
+  2026-10-12).  Enough to run:
   - **autobahn**, both ways: `wstest -m fuzzingclient` against npro-io's
     ws echo server, and `-m fuzzingserver` against its echo client.  This
     is a conformance gate.  Where it runs is decided (2026-10-06): a sai
@@ -935,8 +937,10 @@ connection whatever its role, with the h1 to ws changes, and
 `npro_io::driver::Driver`, holding it and its buffers, its close stages
 with C's deadlines, and saying what IO it wants.  All 46 transcripts the
 roles replay also replay through the driver over an in-memory adapter
-writing four bytes at a time.  Next: the threads adapter on std TCP,
-then the examples, autobahn and the runs against C.
+writing four bytes at a time.  Next, reordered (2026-10-12): Secure
+Streams over the driver, the threads adapter under it, one utility over
+it in place of the examples, then autobahn and the runs against C over
+it ([ss-design.md](ss-design.md), "Phases").
 
 Still not in the protocol crates: an h1 client's kept-warm `IDLING`
 (`CLIENT_CONN_IDLE`), which comes with the client's keep-alive; the
