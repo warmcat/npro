@@ -1,0 +1,15 @@
+[package]
+name        = "npro-json"
+description = "The JSON of npro: I-JSON, parsed in pieces, bounded, into caller-owned storage"
+readme      = "../../README.md"
+keywords    = ["json", "sans-io", "no-std"]
+categories  = ["parser-implementations", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[lints]
+workspace = true

@@ -76,6 +76,13 @@ doc   = false
 bench = false
 
 [[bin]]
+name  = "json"
+path  = "fuzz_targets/json.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
 name  = "ws-server"
 path  = "fuzz_targets/ws_server.rs"
 test  = false

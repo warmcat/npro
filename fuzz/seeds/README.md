@@ -26,6 +26,11 @@ The protocol crates' targets start from the C library's corpora
 - `uri`: written for it, a control byte first, its top bit set for a
   reference resolved rather than a URL parsed: RFC 3986's examples, an
   IPv6 literal with a port, and some it refuses;
+- `json`: C's `fuzz/fuzz-lejp/seeds`, each behind a control byte of 0,
+  named as there, and some written for it: names twice, surrogates,
+  noncharacters, numbers and escapes RFC 8259 has and has not, a lone
+  number, a policy like npro.rs', and `tight-*` ones reaching the small
+  storage's limits;
 - `ws-server`: C's `fuzz/fuzz-ws/seeds`, each behind a control byte of 0,
   named as there;
 - `ws-pmd`: C's `fuzz/fuzz-ws-pmd/seeds`, each behind a control byte of
