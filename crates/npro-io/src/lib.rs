@@ -6,9 +6,10 @@
 //! IO, as `docs/io-model.md` lays out:
 //!
 //! - [`conn`]: the connection, whichever its role, h1 server or client, ws
-//!   either end, and its changes of role, h1 to ws;
+//!   either end, or raw, and its changes of role, h1 to ws or raw;
 //! - [`driver`]: what carries it, keeping its buffers, close stages and
 //!   deadlines, and saying what IO it wants;
+//! - [`raw`]: the raw role, bytes as they are both ways;
 //! - [`tls`]: the record layer the driver keeps tls behind, a trait a tls
 //!   stack is bound to it by;
 //!
@@ -20,4 +21,5 @@
 
 pub mod conn;
 pub mod driver;
+pub mod raw;
 pub mod tls;

@@ -1,8 +1,9 @@
 //! The connection the driver carries, whichever its role.
 //!
 //! A [`Conn`] is one of the roles the protocol crates have: an h1 server or
-//! client ([`npro_h1::server::Server`], [`npro_h1::client::Client`]), or ws
-//! at either end ([`npro_ws::conn::Ws`]).  It answers what the driver asks
+//! client ([`npro_h1::server::Server`], [`npro_h1::client::Client`]), ws
+//! at either end ([`npro_ws::conn::Ws`]), or raw bytes
+//! ([`crate::raw::Raw`]).  It answers what the driver asks
 //! of any connection, whatever its role: take these bytes ([`Conn::rx`]),
 //! write into this buffer ([`Conn::tx`]), the peer closed
 //! ([`Conn::rx_closed`]), what do you want ([`Conn::wants_write`],
@@ -10,9 +11,9 @@
 //! ([`Conn::next_deadline`]).  Each is one `match` over the roles.
 //!
 //! The role changes as C's does, h1 to ws, only through
-//! [`Conn::accept_ws`] and [`Conn::upgraded_ws`], which check the h1 role
-//! is where the change may happen, and give back the storage of its header
-//! table: as C drops a connection's ah when the user returns from
+//! [`Conn::accept_ws`] and [`Conn::upgraded_ws`], or h1 to raw through
+//! [`Conn::switch_raw`], which check the h1 role is where the change may
+//! happen, and give back its storage: as C drops a connection's ah when the user returns from
 //! ESTABLISHED, the h1 role's request or response event is the last time
 //! its headers are seen.  Bytes after the h1 head were never taken by the
 //! h1 role, so they are the new role's.
@@ -29,6 +30,8 @@ use npro_h1::client::{self, Client};
 use npro_h1::server::{self, Server, TxSource};
 use npro_ws::conn::{self as ws, AsClient, AsServer, Ws};
 
+use crate::raw::{self, Raw};
+
 /// The role a connection has now.
 #[derive(Clone, Debug)]
 #[expect(
@@ -40,6 +43,7 @@ enum Inner<S, R> {
     H1Client(Client<S>),
     WsServer(Ws<AsServer>),
     WsClient(Ws<AsClient<R>>),
+    Raw(Raw),
 }
 
 /// One connection, whichever its role, `S` the storage of an h1 role's
@@ -96,6 +100,8 @@ pub enum Event<'a> {
     /// ws, either end's: a piece of a message, a pong, or the peer's
     /// close.
     Ws(ws::Event<'a>),
+    /// Raw: bytes as they came, or the peer's close.
+    Raw(raw::Event<'a>),
 }
 
 /// What [`Conn::rx`] took.
@@ -119,6 +125,8 @@ pub enum Role<'c, S, R> {
     WsServer(&'c Ws<AsServer>),
     /// A ws client.
     WsClient(&'c Ws<AsClient<R>>),
+    /// Raw.
+    Raw(&'c Raw),
 }
 
 /// The connection's role, borrowed to act on: [`Conn::role_mut`].
@@ -132,6 +140,8 @@ pub enum RoleMut<'c, S, R> {
     WsServer(&'c mut Ws<AsServer>),
     /// A ws client.
     WsClient(&'c mut Ws<AsClient<R>>),
+    /// Raw: to close.
+    Raw(&'c mut Raw),
 }
 
 /// A role change asked for where it cannot happen: the connection is not
@@ -191,6 +201,7 @@ impl<S, R> Conn<S, R> {
             Inner::H1Client(c) => Role::H1Client(c),
             Inner::WsServer(w) => Role::WsServer(w),
             Inner::WsClient(w) => Role::WsClient(w),
+            Inner::Raw(r) => Role::Raw(r),
         }
     }
 
@@ -202,6 +213,7 @@ impl<S, R> Conn<S, R> {
             Inner::H1Client(c) => RoleMut::H1Client(c),
             Inner::WsServer(w) => RoleMut::WsServer(w),
             Inner::WsClient(w) => RoleMut::WsClient(w),
+            Inner::Raw(r) => RoleMut::Raw(r),
         }
     }
 }
@@ -217,6 +229,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.rx_pending(),
             Inner::WsServer(w) => w.rx_pending(),
             Inner::WsClient(w) => w.rx_pending(),
+            Inner::Raw(_) => false,
         }
     }
 
@@ -229,6 +242,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.wants_write(),
             Inner::WsServer(w) => w.wants_write(),
             Inner::WsClient(w) => w.wants_write(),
+            Inner::Raw(_) => false,
         }
     }
 
@@ -241,6 +255,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.close(),
             Inner::WsServer(w) => w.close(),
             Inner::WsClient(w) => w.close(),
+            Inner::Raw(r) => r.closing(),
         }
     }
 
@@ -252,6 +267,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.next_deadline(),
             Inner::WsServer(w) => w.next_deadline(),
             Inner::WsClient(w) => w.next_deadline(),
+            Inner::Raw(_) => None,
         }
     }
 
@@ -296,6 +312,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
                     event: r.event.map(Event::Ws),
                 }
             }
+            Inner::Raw(r) => {
+                let (consumed, event) = r.rx(input);
+                Rx {
+                    consumed,
+                    event: event.map(Event::Raw),
+                }
+            }
         }
     }
 
@@ -317,6 +340,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
                 w.rx_closed(now);
                 None
             }
+            Inner::Raw(r) => r.rx_closed().map(Event::Raw),
         }
     }
 
@@ -328,6 +352,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.tx(now, out, src),
             Inner::WsServer(w) => w.tx(now, out, src),
             Inner::WsClient(w) => w.tx(now, out, src),
+            Inner::Raw(r) => r.tx(out, src),
         }
     }
 
@@ -339,6 +364,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
             Inner::H1Client(c) => c.deadline_passed(now),
             Inner::WsServer(w) => w.deadline_passed(now),
             Inner::WsClient(w) => w.deadline_passed(now),
+            // no deadline of its own
+            Inner::Raw(_) => {}
         }
     }
 
@@ -354,14 +381,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
     pub fn accept_ws(&mut self, ws: Ws<AsServer>) -> Result<Storage<S>, NotNow> {
         match &self.inner {
             Inner::H1Server(s) if s.is_awaiting_answer() => {}
-            Inner::H1Server(_) | Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_) => {
+            Inner::H1Server(_)
+            | Inner::H1Client(_)
+            | Inner::WsServer(_)
+            | Inner::WsClient(_)
+            | Inner::Raw(_) => {
                 return Err(NotNow);
             }
         }
         match core::mem::replace(&mut self.inner, Inner::WsServer(ws)) {
             Inner::H1Server(s) => Ok(s.into_storage()),
             // not so, as just seen: put it back
-            was @ (Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_)) => {
+            was
+            @ (Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_) | Inner::Raw(_)) => {
                 self.inner = was;
                 Err(NotNow)
             }
@@ -380,14 +412,50 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
     pub fn upgraded_ws(&mut self, ws: Ws<AsClient<R>>) -> Result<Storage<S>, NotNow> {
         match &self.inner {
             Inner::H1Client(c) if c.is_upgraded() => {}
-            Inner::H1Server(_) | Inner::H1Client(_) | Inner::WsServer(_) | Inner::WsClient(_) => {
+            Inner::H1Server(_)
+            | Inner::H1Client(_)
+            | Inner::WsServer(_)
+            | Inner::WsClient(_)
+            | Inner::Raw(_) => {
                 return Err(NotNow);
             }
         }
         match core::mem::replace(&mut self.inner, Inner::WsClient(ws)) {
             Inner::H1Client(c) => Ok(c.into_storage()),
             // not so, as just seen: put it back
-            was @ (Inner::H1Server(_) | Inner::WsServer(_) | Inner::WsClient(_)) => {
+            was
+            @ (Inner::H1Server(_) | Inner::WsServer(_) | Inner::WsClient(_) | Inner::Raw(_)) => {
+                self.inner = was;
+                Err(NotNow)
+            }
+        }
+    }
+
+    /// Both ends agreed an upgrade to a protocol the application carries
+    /// itself: the connection becomes [`Raw`], and the h1 role's storage
+    /// comes back.  An h1 server's 101 has gone ([`Server::switch`],
+    /// [`Server::is_switched`]), or an h1 client's request for an upgrade
+    /// was answered 101.  Bytes after the h1 head were never taken by the
+    /// h1 role, so they are the raw role's.
+    ///
+    /// # Errors
+    ///
+    /// [`NotNow`], and the connection is as it was, if it is neither.
+    pub fn switch_raw(&mut self) -> Result<Storage<S>, NotNow> {
+        match &self.inner {
+            Inner::H1Server(s) if s.is_switched() => {}
+            Inner::H1Client(c) if c.is_upgraded() && c.status() == Some(101) => {}
+            Inner::H1Server(_)
+            | Inner::H1Client(_)
+            | Inner::WsServer(_)
+            | Inner::WsClient(_)
+            | Inner::Raw(_) => return Err(NotNow),
+        }
+        match core::mem::replace(&mut self.inner, Inner::Raw(Raw::new())) {
+            Inner::H1Server(s) => Ok(s.into_storage()),
+            Inner::H1Client(c) => Ok(c.into_storage()),
+            // not so, as just seen: put it back
+            was @ (Inner::WsServer(_) | Inner::WsClient(_) | Inner::Raw(_)) => {
                 self.inner = was;
                 Err(NotNow)
             }
@@ -555,5 +623,94 @@ mod tests {
         let rx = c.rx(T0, &mut input, &mut []);
         assert_eq!((rx.consumed, rx.event), (0, None));
         assert_eq!(c.close(), Some(Close::Abort));
+    }
+
+    fn upgrading_client() -> ServerConn {
+        Conn::h1_client(
+            Client::new(
+                Storage {
+                    table: [0u8; 1024],
+                    out: [0u8; 1024],
+                },
+                Request {
+                    method: b"GET",
+                    path: b"/",
+                    host: None,
+                    origin: None,
+                    scheme: Scheme::Http,
+                    no_cache: false,
+                    connection: Connection::Upgrade(b"upgrade: x\r\nconnection: upgrade\r\n"),
+                    headers: &[],
+                    body: RequestBody::None,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_server_becomes_raw_once_its_101_has_gone_and_the_rest_is_the_raws() {
+        let mut c = server();
+        // the request, and the client's first bytes of the new protocol
+        let mut input = *b"GET / HTTP/1.1\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\nfirst";
+        let rx = c.rx(T0, &mut input, &mut []);
+        let at = rx.consumed;
+        assert_eq!(&input[at..], b"first");
+        let RoleMut::H1Server(s) = c.role_mut() else {
+            panic!("not h1");
+        };
+        s.switch(T0, b"x", &[(b"x-a", b"1")]).unwrap();
+        // not until the 101 has gone
+        assert_eq!(c.switch_raw(), Err(NotNow));
+        let mut out = [0u8; 256];
+        let n = c.tx(T0, &mut out, &mut Nothing);
+        assert_eq!(
+            &out[..n],
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: x\r\nx-a: 1\r\n\r\n"
+        );
+        let storage = c.switch_raw().unwrap();
+        assert_eq!(storage.table.len(), 1024);
+        assert!(matches!(c.role(), Role::Raw(_)));
+        let after = c.rx(T0, &mut input[at..], &mut []);
+        assert_eq!(
+            (after.consumed, after.event),
+            (5, Some(Event::Raw(raw::Event::Data(b"first"))))
+        );
+        assert_eq!(c.next_deadline(), None);
+        assert_eq!(c.rx_closed(T0), Some(Event::Raw(raw::Event::PeerClosed)));
+        let RoleMut::Raw(r) = c.role_mut() else {
+            panic!("not raw");
+        };
+        r.close(Close::Shutdown);
+        assert_eq!(c.close(), Some(Close::Shutdown));
+    }
+
+    #[test]
+    fn a_client_becomes_raw_only_on_a_101() {
+        for (response, raw) in [
+            (&b"HTTP/1.1 101 Switching Protocols\r\n\r\n"[..], true),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false),
+        ] {
+            let mut c = upgrading_client();
+            assert_eq!(c.switch_raw(), Err(NotNow));
+            let mut out = [0u8; 256];
+            c.tx(T0, &mut out, &mut Nothing);
+            let mut input = [0u8; 64];
+            input[..response.len()].copy_from_slice(response);
+            c.rx(T0, &mut input[..response.len()], &mut []);
+            assert_eq!(c.switch_raw().is_ok(), raw, "{}", response.escape_ascii());
+            assert_eq!(matches!(c.role(), Role::Raw(_)), raw);
+        }
+    }
+
+    #[test]
+    fn nothing_but_a_switched_h1_role_becomes_raw() {
+        let mut c = server();
+        assert_eq!(c.switch_raw(), Err(NotNow));
+        let mut input = *b"GET / HTTP/1.1\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n";
+        c.rx(T0, &mut input, &mut []);
+        assert!(c.accept_ws(Ws::server(b"", T0)).is_ok());
+        assert_eq!(c.switch_raw(), Err(NotNow));
+        assert!(matches!(c.role(), Role::WsServer(_)));
     }
 }

@@ -299,7 +299,9 @@ mod driver_replay {
                     Some(
                         Event::H1Server(H1s::Body(_) | H1s::BodyEnd)
                         | Event::H1Client(H1c::BodyEnd)
-                        | Event::Ws(WsEvent::Pong(_) | WsEvent::PeerClose(_)),
+                        | Event::Ws(WsEvent::Pong(_) | WsEvent::PeerClose(_))
+                        // no transcript has the raw role
+                        | Event::Raw(_),
                     )
                     | None => {}
                 }

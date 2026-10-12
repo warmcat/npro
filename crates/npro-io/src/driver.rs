@@ -832,6 +832,7 @@ mod tests {
 
     use super::*;
     use crate::conn::RoleMut;
+    use crate::raw;
     use alloc::vec;
     use alloc::vec::Vec;
     use npro_core::random::SeededRandom;
@@ -924,9 +925,10 @@ mod tests {
             seen.push(ev.map(|e| match e {
                 Event::H1Server(H1::Request) => Event::H1Server(H1::Request),
                 Event::H1Server(H1::BodyEnd) => Event::H1Server(H1::BodyEnd),
-                Event::H1Server(H1::Body(_)) | Event::H1Client(_) | Event::Ws(_) => {
-                    Event::H1Server(H1::Body(b""))
-                }
+                Event::H1Server(H1::Body(_))
+                | Event::H1Client(_)
+                | Event::Ws(_)
+                | Event::Raw(_) => Event::H1Server(H1::Body(b"")),
             }));
             if ev == Some(Event::H1Server(H1::Request)) {
                 let RoleMut::H1Server(s) = step.conn().role_mut() else {
@@ -1259,6 +1261,54 @@ mod tests {
         assert_eq!(write(&mut d, T0, &mut Text(b"ok".to_vec()), 1024), b"");
         d.request_write();
         assert_eq!(write(&mut d, T0, &mut Text(b"ok".to_vec()), 1024), b"ok");
+    }
+
+    #[test]
+    fn a_switched_connection_carries_raw_bytes_from_the_ones_behind_its_head() {
+        let mut d = server(256, 256);
+        let mut app = nothing();
+        let wire = b"GET / HTTP/1.1\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\nfirst";
+        assert_eq!(read(&mut d, T0, &mut app, wire), wire.len());
+        let mut requests = 0;
+        while let Some(mut step) = d.poll_rx(T0) {
+            if step.event() == Some(Event::H1Server(H1::Request)) {
+                requests += 1;
+                let RoleMut::H1Server(s) = step.conn().role_mut() else {
+                    panic!("not h1");
+                };
+                s.switch(T0, b"x", &[]).unwrap();
+            }
+        }
+        assert_eq!(requests, 1);
+        let out = write(&mut d, T0, &mut app, 1024);
+        assert!(out.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+        d.conn().switch_raw().unwrap();
+        // the bytes that came behind the head, held while it was h1
+        let mut got = Vec::new();
+        while let Some(step) = d.poll_rx(T0) {
+            if let Some(Event::Raw(raw::Event::Data(b))) = step.event() {
+                got.extend_from_slice(b);
+            }
+        }
+        assert_eq!(got, b"first");
+        // the application's bytes go as they are
+        let mut reply = Text(b"back".to_vec());
+        d.request_write();
+        assert_eq!(write(&mut d, T0, &mut reply, 1024), b"back");
+        // the peer's close is told, and passed on as a shutdown
+        d.read_done(T0, 0);
+        let mut closed = false;
+        while let Some(mut step) = d.poll_rx(T0) {
+            if step.event() == Some(Event::Raw(raw::Event::PeerClosed)) {
+                closed = true;
+                let RoleMut::Raw(r) = step.conn().role_mut() else {
+                    panic!("not raw");
+                };
+                r.close(Close::Shutdown);
+            }
+        }
+        assert!(closed);
+        assert!(matches!(d.want(T0, &mut app), Want::HalfClose));
     }
 }
 
