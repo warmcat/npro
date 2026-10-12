@@ -348,6 +348,22 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         )
     }
 
+    /// Whether [`Server::rx`] has something to give without more input:
+    /// the end of a request's body that came with the bytes already
+    /// taken, or of one there was none of.  A caller that hands in input
+    /// only as it arrives must call `rx` again, with none, while this
+    /// holds.
+    #[must_use]
+    pub const fn rx_pending(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Request(Txn {
+                body: Body::EndDue,
+                ..
+            })
+        )
+    }
+
     /// Whether the connection has something to write.
     #[must_use]
     pub const fn wants_write(&self) -> bool {

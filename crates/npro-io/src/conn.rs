@@ -205,12 +205,14 @@ impl<S, R> Conn<S, R> {
 }
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>, R: Random> Conn<S, R> {
-    /// Whether [`Conn::rx`] has more to give without more input: a ws
+    /// Whether [`Conn::rx`] has more to give without more input: the end
+    /// of an h1 body that came with the bytes already taken, or a ws
     /// message deflated, inflating to more than one call gives.
     #[must_use]
     pub fn rx_pending(&self) -> bool {
         match &self.inner {
-            Inner::H1Server(_) | Inner::H1Client(_) => false,
+            Inner::H1Server(s) => s.rx_pending(),
+            Inner::H1Client(c) => c.rx_pending(),
             Inner::WsServer(w) => w.rx_pending(),
             Inner::WsClient(w) => w.rx_pending(),
         }

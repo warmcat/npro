@@ -1043,6 +1043,65 @@ mod tests {
     }
 
     #[test]
+    fn a_request_body_ending_with_the_read_is_ended() {
+        for (req, seen) in [
+            (
+                &b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nok"[..],
+                &[
+                    Event::H1Server(H1::Request),
+                    Event::H1Server(H1::Body(b"")),
+                    Event::H1Server(H1::BodyEnd),
+                ][..],
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                &[Event::H1Server(H1::Request), Event::H1Server(H1::BodyEnd)],
+            ),
+        ] {
+            let mut d = server(256, 256);
+            assert_eq!(read(&mut d, T0, &mut nothing(), req), req.len());
+            let got: Vec<_> = answer(&mut d, T0).into_iter().flatten().collect();
+            assert_eq!(got, seen, "{}", req.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn a_response_body_ending_with_the_read_is_ended() {
+        let c = Client::new(
+            vec![0u8; 1024],
+            Request {
+                method: b"GET",
+                path: b"/",
+                host: None,
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Close,
+                headers: &[],
+            },
+        )
+        .unwrap();
+        let mut d: D = Driver::new(Conn::h1_client(c), bufs(256, 256));
+        assert_ne!(write(&mut d, T0, &mut nothing(), 1024), b"");
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(read(&mut d, T0, &mut nothing(), resp), resp.len());
+        let mut ended = false;
+        while let Some(step) = d.poll_rx(T0) {
+            ended |= step.event() == Some(Event::H1Client(H1c::BodyEnd));
+        }
+        // with no FIN: the length ended it
+        assert!(ended);
+        // and as C, the connection waits for the server's close
+        assert!(matches!(d.want(T0, &mut nothing()), Want::Io(_)));
+        d.read_done(T0, 0);
+        while d.poll_rx(T0).is_some() {}
+        assert!(matches!(
+            d.want(T0, &mut nothing()),
+            Want::Release(Outcome::Delivered)
+        ));
+    }
+
+    #[test]
     fn the_fin_comes_after_what_came_before_it() {
         let c = Client::new(
             vec![0u8; 1024],

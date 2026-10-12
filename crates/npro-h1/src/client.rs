@@ -273,8 +273,12 @@ enum Phase {
     Head { interims: u8, until: Instant },
     /// Taking the response's body.
     Body(Body),
-    /// The transaction is over.
+    /// The transaction is over, and the connection is still up: as C,
+    /// a client whose transaction is over leaves the connection to the
+    /// server's close, or the next request's.
     Done,
+    /// The transaction is over and the server has closed.
+    Closed,
     /// The final response to a request for an upgrade has come: the
     /// connection is the upgraded protocol's.
     Upgraded,
@@ -414,9 +418,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
             Phase::Sending { until } | Phase::Head { until, .. } => Some(until),
-            Phase::Asking | Phase::Body(_) | Phase::Done | Phase::Upgraded | Phase::Failed(_) => {
-                None
-            }
+            Phase::Asking
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Closed
+            | Phase::Upgraded
+            | Phase::Failed(_) => None,
         }
     }
 
@@ -449,6 +456,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         self.status
     }
 
+    /// Whether [`Client::rx`] has something to give without more input:
+    /// the end of a response's body that came with the bytes already
+    /// taken, or of one there was none of.  A caller that hands in input
+    /// only as it arrives must call `rx` again, with none, while this
+    /// holds.
+    #[must_use]
+    pub const fn rx_pending(&self) -> bool {
+        matches!(self.phase, Phase::Body(Body::EndDue))
+    }
+
     /// Whether the connection has something to write.
     #[must_use]
     pub const fn wants_write(&self) -> bool {
@@ -457,24 +474,25 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
 
     /// What the connection asks of whatever carries it, once it is done
     /// with: [`Close::Abort`] once it failed, as C closes a client whose
-    /// connection failed with nothing more to say; [`Close::Release`] once a
-    /// transaction that said `connection: close` is over, a client staging
-    /// no shutdown in C.  A connection kept alive, or upgraded, asks
-    /// nothing: it is the next request's, or the upgraded protocol's.
+    /// connection failed with nothing more to say; [`Close::Release`] once
+    /// its transaction is over and the server has closed, a client staging
+    /// no shutdown in C.  A transaction over with the connection still up
+    /// asks nothing, whatever its `Connection` said: C gives the
+    /// application the transaction's end
+    /// (`LWS_CALLBACK_COMPLETED_CLIENT_HTTP`) and closes only if it asks,
+    /// and otherwise on the server's close.  An upgraded connection is the
+    /// upgraded protocol's.
     #[must_use]
     pub const fn close(&self) -> Option<Close> {
-        match (self.phase, self.asked) {
-            (Phase::Failed(_), _) => Some(Close::Abort),
-            (Phase::Done, Asked::Close) => Some(Close::Release),
-            (Phase::Done, Asked::KeepAlive | Asked::Upgrade)
-            | (
-                Phase::Asking
-                | Phase::Sending { .. }
-                | Phase::Head { .. }
-                | Phase::Body(_)
-                | Phase::Upgraded,
-                _,
-            ) => None,
+        match self.phase {
+            Phase::Failed(_) => Some(Close::Abort),
+            Phase::Closed => Some(Close::Release),
+            Phase::Asking
+            | Phase::Sending { .. }
+            | Phase::Head { .. }
+            | Phase::Body(_)
+            | Phase::Done
+            | Phase::Upgraded => None,
         }
     }
 
@@ -488,6 +506,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
+            | Phase::Closed
             | Phase::Upgraded => None,
         }
     }
@@ -495,7 +514,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     /// Whether the transaction is over.
     #[must_use]
     pub const fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Done)
+        matches!(self.phase, Phase::Done | Phase::Closed)
     }
 
     /// Whether the final response to a request for an upgrade has come:
@@ -519,6 +538,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
             | Phase::Head { .. }
             | Phase::Body(_)
             | Phase::Done
+            | Phase::Closed
             | Phase::Upgraded
             | Phase::Failed(_) => return n,
         };
@@ -548,7 +568,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
         });
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Asking | Phase::Sending { .. } | Phase::Done | Phase::Upgraded => held,
+            Phase::Asking
+            | Phase::Sending { .. }
+            | Phase::Done
+            | Phase::Closed
+            | Phase::Upgraded => held,
             Phase::Head { interims, .. } => self.rx_head(now, interims, input),
             Phase::Body(b) => self.rx_body(b, input),
         }
@@ -691,7 +715,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     }
 
     /// The server closed the connection: the end of a body framed by the
-    /// close, or a failure if the body was framed otherwise.
+    /// close, or a failure if the body was framed otherwise.  The
+    /// transaction over, the connection then asks to be released.
     ///
     /// # Errors
     ///
@@ -699,13 +724,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     pub const fn rx_closed<'a>(&mut self) -> Result<Option<Event<'a>>, Failure> {
         match self.phase {
             Phase::Failed(f) => Err(f),
-            Phase::Done | Phase::Upgraded => Ok(None),
+            Phase::Closed | Phase::Upgraded => Ok(None),
             Phase::Body(Body::ToClose | Body::EndDue) => {
-                self.phase = Phase::Done;
+                self.phase = Phase::Closed;
                 Ok(Some(Event::BodyEnd))
             }
-            Phase::Body(Body::Over) => {
-                self.phase = Phase::Done;
+            Phase::Body(Body::Over) | Phase::Done => {
+                self.phase = Phase::Closed;
                 Ok(None)
             }
             Phase::Asking
@@ -1054,6 +1079,11 @@ mod tests {
         assert_eq!(rx.unwrap().event, Some(Event::Response));
         assert_eq!(c.rx(T0, b"").unwrap().event, Some(Event::BodyEnd));
         assert_eq!(c.rx(T0, b"").unwrap().event, None);
+        assert!(c.is_done());
+        // as C, done is not released: the server's close is awaited,
+        // whatever the request's `connection: close` said
+        assert_eq!(c.close(), None);
+        assert_eq!(c.rx_closed(), Ok(None));
         assert!(c.is_done());
         assert_eq!(c.close(), Some(Close::Release));
 
