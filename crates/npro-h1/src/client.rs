@@ -41,6 +41,11 @@
 //! begins to go, the server has C's 15s ([`RESPONSE_TIMEOUT`]) to answer,
 //! and as long again after each interim response, or the connection fails.
 //!
+//! [`Client::redirect`] says whether the final response redirects, and
+//! where to, as C's `lws_client_interpret_server_handshake()` decides it.
+//! Following it is a new connection's, which is the caller's to make: C
+//! closes the connection and starts over (`lws_client_reset()`).
+//!
 //! The final response to a request for an upgrade is not framed at all:
 //! after its head, whatever its status, the connection is the upgraded
 //! protocol's ([`Client::is_upgraded`]), which judges the response, as C's
@@ -58,6 +63,7 @@ pub use crate::own::{MAX_OWN, RespondError};
 use crate::server::TxSource;
 use crate::table::{CapacityTooLarge, Full, HeaderTable};
 use crate::token::Token;
+use crate::uri::{self, Uri, UriError};
 pub use npro_core::close::Close;
 
 /// How many interim responses a client takes before the final one: C's
@@ -69,6 +75,57 @@ pub const INTERIM_LIMIT: u8 = 8;
 /// `PENDING_TIMEOUT_AWAITING_SERVER_RESPONSE`, the context's
 /// `timeout_secs`.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many redirects one request follows: C's `lws_client_reset()`
+/// refuses a fifth.  Counting them is the caller's, which makes each new
+/// connection.
+pub const REDIRECT_LIMIT: u8 = 4;
+
+/// The method a redirected request is made with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectMethod {
+    /// The same method, with the same body.
+    Same,
+    /// `GET`, with no body.
+    Get,
+}
+
+/// Where a redirect goes: [`Client::redirect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirect<'a> {
+    /// The URL to make the request of, in the storage given.
+    pub to: Uri<'a>,
+    /// The method to make it with.
+    pub method: RedirectMethod,
+}
+
+/// Why a redirect is not followed.  The first three are C's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectError {
+    /// No `Location`: "HS: Redirect code but no Location".
+    NoLocation,
+    /// A `Location` npro does not take: "HS: URI did not parse".
+    Location(UriError),
+    /// From tls to plaintext, not allowed: "HS: Redirect attempted SSL
+    /// downgrade".
+    Downgrade,
+    /// More than one `Location`, which C does not check: which to follow
+    /// is not known.
+    Locations,
+}
+
+impl core::fmt::Display for RedirectError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoLocation => f.write_str("HS: Redirect code but no Location"),
+            Self::Location(e) => write!(f, "HS: URI did not parse: {e}"),
+            Self::Downgrade => f.write_str("HS: Redirect attempted SSL downgrade"),
+            Self::Locations => f.write_str("HS: Redirect with more than one Location"),
+        }
+    }
+}
+
+impl core::error::Error for RedirectError {}
 
 /// Where the request's `Origin` comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,6 +800,83 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     #[must_use]
     pub const fn is_done(&self) -> bool {
         matches!(self.phase, Phase::Done | Phase::Closed)
+    }
+
+    /// Whether the final response redirects, and if so where, its
+    /// `Location` resolved against `from`, the URL this request was made
+    /// of, into `storage`; `None` before the final response, or if it is
+    /// not 301, 302, 303, 307 or 308, as C follows.  A redirect from tls
+    /// to plaintext is refused unless `downgrade` (C's
+    /// `LCCSCF_ACCEPT_TLS_DOWNGRADE_REDIRECTS`).
+    ///
+    /// The method, by RFC 9110 15.4 and as browsers do, where C makes
+    /// every redirect but a 307 or 308 a GET: a 307 or 308 keeps the
+    /// method and its body; a 303 is a GET, but for a HEAD; a 301 or 302
+    /// makes a POST a GET, and keeps any other method.
+    ///
+    /// ```
+    /// use npro_h1::client::{Client, Connection, Event, RedirectMethod, Request, RequestBody, Scheme};
+    /// use npro_h1::server::NoPayload;
+    /// use npro_h1::uri;
+    /// use npro_core::time::Instant;
+    ///
+    /// let now = Instant::from_micros(1_000_000);
+    /// let mut c = Client::new([0u8; 1024], Request {
+    ///     method: b"POST",
+    ///     path: b"/a/form",
+    ///     host: Some(b"example.com"),
+    ///     origin: None,
+    ///     scheme: Scheme::Https,
+    ///     no_cache: false,
+    ///     connection: Connection::Close,
+    ///     headers: &[],
+    ///     body: RequestBody::Length(0),
+    /// })?;
+    /// let _ = c.tx(now, &mut [0u8; 256], &mut NoPayload);
+    /// let rx = c.rx(now, b"HTTP/1.1 302 Found\r\nLocation: done?ok\r\n\r\n")?;
+    /// assert_eq!(rx.event, Some(Event::Response));
+    ///
+    /// let mut f = [0u8; 256];
+    /// let from = uri::parse(b"https://example.com/a/form", &mut f)?;
+    /// let mut t = [0u8; 256];
+    /// let r = c.redirect(&from, false, &mut t).unwrap()?;
+    /// assert_eq!((r.to.host(), r.to.target()), (&b"example.com"[..], &b"/a/done?ok"[..]));
+    /// assert_eq!(r.method, RedirectMethod::Get);
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn redirect<'b>(
+        &self,
+        from: &Uri<'_>,
+        downgrade: bool,
+        storage: &'b mut [u8],
+    ) -> Option<Result<Redirect<'b>, RedirectError>> {
+        let status = self.status?;
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return None;
+        }
+        let t = self.head.table();
+        let mut locations = t.fragments(Token::Location);
+        let Some(location) = locations.next() else {
+            return Some(Err(RedirectError::NoLocation));
+        };
+        if locations.next().is_some() {
+            return Some(Err(RedirectError::Locations));
+        }
+        let to = match uri::resolve(from, location, storage) {
+            Ok(to) => to,
+            Err(e) => return Some(Err(RedirectError::Location(e))),
+        };
+        if from.scheme().is_tls() && !to.scheme().is_tls() && !downgrade {
+            return Some(Err(RedirectError::Downgrade));
+        }
+        let method = t.first(Token::ClientMethod).unwrap_or_default();
+        let method = match status {
+            303 if method != b"HEAD" => RedirectMethod::Get,
+            301 | 302 if method == b"POST" => RedirectMethod::Get,
+            _ => RedirectMethod::Same,
+        };
+        Some(Ok(Redirect { to, method }))
     }
 
     /// Whether the final response to a request for an upgrade has come:
@@ -1693,5 +1827,143 @@ mod tests {
             }
             assert_eq!(served(&chunks), data, "chunked, {room}");
         }
+    }
+
+    /// The client, having asked `method` of `/a/b`, given `response`.
+    fn answered(method: &'static [u8], response: &[u8]) -> Client<[u8; 1024]> {
+        let mut c = get(method);
+        let mut input = response;
+        loop {
+            let rx = c.rx(T0, input).unwrap();
+            input = &input[rx.consumed..];
+            if rx.event == Some(Event::Response) {
+                return c;
+            }
+            assert!(rx.consumed > 0, "stuck");
+        }
+    }
+
+    /// Where `c` is redirected from `from`, as text, or why not.
+    fn redirected(
+        c: &Client<[u8; 1024]>,
+        from: &[u8],
+        downgrade: bool,
+    ) -> Option<Result<(Vec<u8>, RedirectMethod), RedirectError>> {
+        let mut f = [0u8; 256];
+        let from = uri::parse(from, &mut f).unwrap();
+        let mut t = [0u8; 256];
+        c.redirect(&from, downgrade, &mut t).map(|r| {
+            r.map(|r| {
+                let scheme: &[u8] = if r.to.scheme().is_tls() {
+                    b"https://"
+                } else {
+                    b"http://"
+                };
+                let port = alloc::string::ToString::to_string(&r.to.port());
+                (
+                    [
+                        scheme,
+                        r.to.authority_host(),
+                        b":",
+                        port.as_bytes(),
+                        r.to.target(),
+                    ]
+                    .concat(),
+                    r.method,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn the_redirect_codes_c_follows_say_where_and_how() {
+        use RedirectMethod::{Get, Same};
+
+        for (status, method, how) in [
+            (301, &b"GET"[..], Same),
+            (301, b"POST", Get),
+            (301, b"PUT", Same),
+            (302, b"POST", Get),
+            (302, b"HEAD", Same),
+            (303, b"POST", Get),
+            (303, b"PUT", Get),
+            (303, b"HEAD", Same),
+            (307, b"POST", Same),
+            (308, b"PUT", Same),
+        ] {
+            let head = alloc::format!(
+                "HTTP/1.1 {status} X\r\nLocation: ../c?d\r\nContent-Length: 0\r\n\r\n"
+            );
+            let c = answered(method, head.as_bytes());
+            assert_eq!(
+                redirected(&c, b"https://h/a/b", false),
+                Some(Ok((b"https://h:443/c?d".to_vec(), how))),
+                "{status} {}",
+                method.escape_ascii()
+            );
+        }
+        for status in [200, 300, 304, 305, 306, 404] {
+            let head =
+                alloc::format!("HTTP/1.1 {status} X\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n");
+            assert_eq!(
+                redirected(&answered(b"GET", head.as_bytes()), b"http://h/", false),
+                None,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_that_cannot_be_followed_says_why() {
+        let none = answered(b"GET", b"HTTP/1.1 302 X\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(
+            redirected(&none, b"http://h/", false),
+            Some(Err(RedirectError::NoLocation))
+        );
+        let two = answered(
+            b"GET",
+            b"HTTP/1.1 302 X\r\nLocation: /a\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(
+            redirected(&two, b"http://h/", false),
+            Some(Err(RedirectError::Locations))
+        );
+        let bad = answered(
+            b"GET",
+            b"HTTP/1.1 302 X\r\nLocation: http://u@h/\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(
+            redirected(&bad, b"http://h/", false),
+            Some(Err(RedirectError::Location(UriError::UserInfo)))
+        );
+        let down = answered(
+            b"GET",
+            b"HTTP/1.1 302 X\r\nLocation: http://h/x\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(
+            redirected(&down, b"https://h/", false),
+            Some(Err(RedirectError::Downgrade))
+        );
+        assert_eq!(
+            redirected(&down, b"https://h/", true),
+            Some(Ok((b"http://h:80/x".to_vec(), RedirectMethod::Same)))
+        );
+        // up is always allowed
+        let up = answered(
+            b"GET",
+            b"HTTP/1.1 301 X\r\nLocation: https://h:8443/x\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(
+            redirected(&up, b"http://h/", false),
+            Some(Ok((b"https://h:8443/x".to_vec(), RedirectMethod::Same)))
+        );
+    }
+
+    #[test]
+    fn nothing_redirects_before_the_final_response() {
+        let mut c = get(b"GET");
+        let rx = c.rx(T0, b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+        assert_eq!(rx.event, None);
+        assert_eq!(redirected(&c, b"http://h/", false), None);
     }
 }
