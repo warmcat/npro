@@ -20,7 +20,7 @@ use std::sync::{Mutex, PoisonError};
 
 use npro_core::time::Instant;
 use npro_io::driver::{Buffers, NetBuffers};
-use npro_io::threads::{self, Listening, Stop};
+use npro_io::threads::{self, Jobs, Listening, Stop, Workers};
 use npro_io::tls::rustls::RustlsServer;
 use npro_ss::id::ListenerId;
 use npro_ss::policy::{Listener, Tls};
@@ -144,16 +144,23 @@ impl Bound<'_> {
 
     /// Carries the listeners' streams, in `slots` slots, until `stop` is
     /// stopped, `app` acting on them after anything changed, as npro-io's
-    /// threads adapter gives it them.  An accepted stream starts with `U`'s
+    /// threads adapter gives it them, with the jobs it may give `workers`
+    /// threads to do off its turn.  An accepted stream starts with `U`'s
     /// default.
     ///
     /// # Errors
     ///
     /// [`RunError::Policy`], if the policy was refused.
-    pub fn serve<U, A>(self, slots: usize, mut app: A, stop: &Stop) -> Result<(), RunError>
+    pub fn serve<U, A>(
+        self,
+        slots: usize,
+        mut app: A,
+        workers: Workers,
+        stop: &Stop,
+    ) -> Result<(), RunError>
     where
         U: Default + Send,
-        A: for<'s> FnMut(&mut Streams<'s, U>, Instant) + Send,
+        A: for<'s, 'j> FnMut(&mut Streams<'s, U>, Instant, &Jobs<'j, Streams<'s, U>>) + Send,
     {
         let tls = self
             .listeners
@@ -194,7 +201,8 @@ impl Bound<'_> {
             ss,
             listening.collect(),
             make_tls,
-            |ss: &mut Streams<'_, U>, now| app(ss, now),
+            |ss: &mut Streams<'_, U>, now, jobs| app(ss, now, jobs),
+            workers,
             stop,
         );
         Ok(())

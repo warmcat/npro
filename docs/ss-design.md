@@ -499,7 +499,11 @@ over aws-lc alone, so the policy has nothing yet to choose between.
 `runner::bind()` binds each listener, loads each tls one's certificate
 and key, then drops every capability; `Bound::serve()` makes the
 streams in slots sized for tls records and carries them with the threads
-adapter, the application given the streams after every change.  A
+adapter, the application given the streams after every change, and the
+adapter's jobs, for what it must not do on its turn (2026-10-14: a job
+runs on one of the adapter's worker threads with no lock held, and what
+it comes to is applied to the streams under the lock, the application's
+turn after; C's `LWS_WITH_ASYNC_QUEUE`).  A
 listener's certificate and key are looked at, at most every 10s, when a
 connection is accepted, and the config made again if they changed; a
 pair that does not load keeps the old one, as C does.  npro's random is

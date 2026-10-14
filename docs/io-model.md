@@ -76,7 +76,7 @@ is a value, not a service.
 
    | adapter | feature | scale | needs |
    |---|---|---|---|
-   | threads, blocking calls | `std` | a reader and a writer thread per connection; not for tens of thousands | std only |
+   | threads, blocking calls | `std` | a reader and a writer thread per connection, and worker threads for the application's jobs; not for tens of thousands | std only |
    | one-thread readiness loop | `mio` | many connections on one thread | `mio`, and through it `libc` (unix) and `windows-sys` |
    | tokio | `tokio` | one task per connection, spawned by the user | tokio |
    | embassy | `embassy` | connections fixed at build time (`pool_size`) | `embedded-io-async`, `embassy-time` |

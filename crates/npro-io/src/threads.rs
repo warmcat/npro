@@ -20,7 +20,13 @@
 //!   copy, since a blocking write cannot hold it.  It half-closes and
 //!   closes the socket as the host asks, which wakes the reader;
 //! - **listeners** are TCP, or with unix, unix domain sockets, by the
-//!   address forms [`bind`] takes.
+//!   address forms [`bind`] takes;
+//! - **jobs** are what the application must not do on its turn, since
+//!   that holds the lock: a file read, say.  It gives one to [`Jobs`],
+//!   a worker thread does it, and what it came to is applied to the host
+//!   under the lock, followed by the application's turn, as C's
+//!   `LWS_WITH_ASYNC_QUEUE` takes the file server's reads off the service
+//!   thread.
 //!
 //! Time is std's monotonic clock, as [`Clock`] gives it.  tls is the
 //! host's: the adapter makes each connection's record layer as `tls`
@@ -28,6 +34,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,6 +43,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, Scope};
 
@@ -48,8 +56,54 @@ use crate::host::Host;
 const CHUNK: usize = 4096;
 
 /// How long an acceptor waits after `accept()` failed (too many files
-/// open, say) before it tries again.
+/// open, say) before it tries again, and how often an idle worker looks
+/// whether it is stopped.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// What a job comes to: applied to the host, under the lock, before the
+/// application's turn.
+pub type Done<'j, H> = Box<dyn FnOnce(&mut H, Instant) + Send + 'j>;
+
+/// A job: done on a worker thread, with no lock held.
+type Job<'j, H> = Box<dyn FnOnce() -> Done<'j, H> + Send + 'j>;
+
+/// Where the application gives the adapter work to do off its turn: see
+/// the module's description.  It is given to the application on every
+/// turn ([`serve`]'s `app`).
+#[derive(Debug)]
+pub struct Jobs<'j, H> {
+    tx: Sender<Job<'j, H>>,
+}
+
+impl<'j, H> Jobs<'j, H> {
+    /// Has `job` done on a worker thread, and what it comes to applied
+    /// to the host, under the lock, with the application's turn after.
+    /// `job` runs with no lock held, so it may block.  If the adapter is
+    /// stopping, the job may never run.
+    ///
+    /// ```no_run
+    /// # fn example<H>(jobs: &npro_io::threads::Jobs<'_, H>) {
+    /// jobs.spawn(|| {
+    ///     let bytes = std::fs::read("/etc/hostname").unwrap_or_default();
+    ///     move |_host: &mut H, _now| drop(bytes)
+    /// });
+    /// # }
+    /// ```
+    pub fn spawn<F, G>(&self, job: F)
+    where
+        F: FnOnce() -> G + Send + 'j,
+        G: FnOnce(&mut H, Instant) + Send + 'j,
+    {
+        // refused only once the adapter is stopping, when it is moot
+        let boxed: Job<'j, H> = Box::new(move || {
+            let done: Done<'j, H> = Box::new(job());
+            done
+        });
+        if let Err(not_sent) = self.tx.send(boxed) {
+            drop(not_sent);
+        }
+    }
+}
 
 /// std's monotonic clock, as npro's [`Instant`]: microseconds since the
 /// clock was made, so that never goes backwards and never wraps.
@@ -313,13 +367,6 @@ struct State<H, A> {
     app: A,
 }
 
-impl<H: Host, A: FnMut(&mut H, Instant)> State<H, A> {
-    /// The application's turn.
-    fn act(&mut self, now: Instant) {
-        (self.app)(&mut self.host, now);
-    }
-}
-
 /// What every thread shares.
 struct Shared<'a, H, A> {
     state: Mutex<State<H, A>>,
@@ -327,13 +374,25 @@ struct Shared<'a, H, A> {
     changed: Condvar,
     clock: Clock,
     stop: &'a Stop,
+    jobs: Jobs<'a, H>,
 }
 
-impl<H: Host, A: FnMut(&mut H, Instant)> Shared<'_, H, A> {
+impl<'a, H: Host, A: FnMut(&mut H, Instant, &Jobs<'a, H>)> Shared<'a, H, A> {
     /// Gives the application its turn, then wakes whatever waits.
     fn acted(&self, s: &mut State<H, A>, now: Instant) {
-        s.act(now);
+        (s.app)(&mut s.host, now, &self.jobs);
         self.changed.notify_all();
+    }
+}
+
+/// How many worker threads [`serve`] has for jobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Workers(pub usize);
+
+impl Default for Workers {
+    /// Two: enough that one slow read does not hold the rest.
+    fn default() -> Self {
+        Self(2)
     }
 }
 
@@ -345,26 +404,30 @@ impl<H: Host, A: FnMut(&mut H, Instant)> Shared<'_, H, A> {
 /// (`None` for a plain one), and a reader and a writer thread.  After any
 /// of them changed something, `app` is given the host, at that time, to
 /// act on: to loop on the host's events, and answer them.  It runs under
-/// the lock, so it must not block.
-pub fn serve<H, A, M>(
+/// the lock, so it must not block: what would, it gives to the [`Jobs`]
+/// it is given, done by `workers` threads (at least one).
+pub fn serve<'a, H, A, M>(
     host: H,
     listeners: Vec<(H::Listener, Listening)>,
     tls: M,
     app: A,
-    stop: &Stop,
+    workers: Workers,
+    stop: &'a Stop,
 ) -> H
 where
-    H: Host + Send,
+    H: Host + Send + 'a,
     H::Listener: Send,
     H::Conn: Send,
-    A: FnMut(&mut H, Instant) + Send,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
     M: Fn(H::Listener) -> Option<H::Tls> + Sync,
 {
+    let (tx, rx) = mpsc::channel::<Job<'a, H>>();
     let shared = Shared {
         state: Mutex::new(State { host, app }),
         changed: Condvar::new(),
         clock: Clock::new(),
         stop,
+        jobs: Jobs { tx },
     };
     let mut accepting = Vec::new();
     for (id, l) in listeners {
@@ -373,10 +436,15 @@ where
         }
         accepting.push((id, l));
     }
+    let rx = Mutex::new(rx);
     thread::scope(|scope| {
         for (id, l) in accepting {
             let (shared, tls) = (&shared, &tls);
             scope.spawn(move || accept(scope, shared, id, &l, tls));
+        }
+        for _ in 0..workers.0.max(1) {
+            let (shared, rx) = (&shared, &rx);
+            scope.spawn(move || work(shared, rx));
         }
     });
     lock(&stop.listeners).clear();
@@ -385,6 +453,31 @@ where
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
         .host
+}
+
+/// Does jobs as they come, until stopped: each with no lock held, then
+/// what it came to applied under it.
+fn work<'a, H, A>(shared: &Shared<'a, H, A>, rx: &Mutex<Receiver<Job<'a, H>>>)
+where
+    H: Host,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>),
+{
+    loop {
+        if shared.stop.is_stopping() {
+            return;
+        }
+        let next = lock(rx).recv_timeout(ACCEPT_RETRY);
+        let job = match next {
+            Ok(j) => j,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let done = job();
+        let mut s = lock(&shared.state);
+        let now = shared.clock.now();
+        done(&mut s.host, now);
+        shared.acted(&mut s, now);
+    }
 }
 
 fn clone_listening(l: &Listening) -> io::Result<Listening> {
@@ -397,9 +490,9 @@ fn clone_listening(l: &Listening) -> io::Result<Listening> {
 
 /// Accepts on `l` until stopped, giving each connection to the host and
 /// to a reader and a writer.
-fn accept<'scope, H, A, M>(
+fn accept<'scope, 'a, H, A, M>(
     scope: &'scope Scope<'scope, '_>,
-    shared: &'scope Shared<'scope, H, A>,
+    shared: &'scope Shared<'a, H, A>,
     id: H::Listener,
     l: &Listening,
     tls: &M,
@@ -407,7 +500,7 @@ fn accept<'scope, H, A, M>(
     H: Host + Send,
     H::Listener: Send,
     H::Conn: Send,
-    A: FnMut(&mut H, Instant) + Send,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
     M: Fn(H::Listener) -> Option<H::Tls> + Sync,
 {
     loop {
@@ -446,10 +539,10 @@ fn accept<'scope, H, A, M>(
 
 /// Reads what the peer sends, and hands it to the host, until the peer's
 /// FIN, a failure, or the connection is gone.
-fn read<H, A>(shared: &Shared<'_, H, A>, conn: H::Conn, mut socket: Socket)
+fn read<'a, H, A>(shared: &Shared<'a, H, A>, conn: H::Conn, mut socket: Socket)
 where
     H: Host,
-    A: FnMut(&mut H, Instant),
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>),
 {
     let mut buf = [0u8; CHUNK];
     loop {
@@ -518,10 +611,10 @@ enum Next {
 
 /// Writes what the host has for the peer, keeps its deadlines, and
 /// closes the socket as it asks, until the connection is gone.
-fn write<H, A>(shared: &Shared<'_, H, A>, conn: H::Conn, mut socket: Socket)
+fn write<'a, H, A>(shared: &Shared<'a, H, A>, conn: H::Conn, mut socket: Socket)
 where
     H: Host,
-    A: FnMut(&mut H, Instant),
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>),
 {
     let mut out = [0u8; CHUNK];
     let mut s = lock(&shared.state);

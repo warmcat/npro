@@ -21,7 +21,7 @@ mod runner {
     use npro_cli::tls::{CHECK_EVERY, CertError, Certs};
     use npro_core::time::Instant;
     use npro_h1::server::Config;
-    use npro_io::threads::Stop;
+    use npro_io::threads::{Jobs, Stop, Workers};
     use npro_ss::event::{Filled, Kind, Response};
     use npro_ss::id::ListenerId;
     use npro_ss::policy::{Listener, Match, Route, Tls, Vhost, Ws};
@@ -94,7 +94,7 @@ mod runner {
     }
 
     /// Answers each request with its path.
-    fn app(ss: &mut Streams<'_, App>, now: Instant) {
+    fn app(ss: &mut Streams<'_, App>, now: Instant, _: &Jobs<'_, Streams<'_, App>>) {
         while let Some(ev) = ss.poll_event(now) {
             let (stream, user) = (ev.stream, ev.user);
             let tx = match ev.kind {
@@ -173,7 +173,7 @@ mod runner {
         let tls = bound.local_addr(ListenerId::new(1)).unwrap();
         let stop = Stop::new();
         thread::scope(|scope| {
-            let server = scope.spawn(|| bound.serve(4, app, &stop));
+            let server = scope.spawn(|| bound.serve(4, app, Workers::default(), &stop));
 
             let mut c = TcpStream::connect(plain).unwrap();
             c.write_all(GET).unwrap();

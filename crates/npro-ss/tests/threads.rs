@@ -22,7 +22,7 @@ mod threads {
     use npro_core::time::Instant;
     use npro_h1::server::Config;
     use npro_io::driver::{Buffers, NetBuffers};
-    use npro_io::threads::{Listening, Stop, bind, serve};
+    use npro_io::threads::{Jobs, Listening, Stop, Workers, bind, serve};
     use npro_ss::event::{End, Filled, Kind, Response};
     use npro_ss::id::{ListenerId, StreamId};
     use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
@@ -101,30 +101,43 @@ mod threads {
         Nothing,
         Tx,
         Message(u64),
+        /// The answer comes from a job, off the application's turn.
+        Job,
     }
 
+    /// What `/job` answers, made on a worker thread.
+    const FROM_JOB: &[u8] = b"from a job";
+
     /// The application: an h1 request is answered with its path, or for
-    /// `/big`, [`BIG`] bytes; a ws message is echoed.
-    fn app(ss: &mut S<'_>, now: Instant) {
+    /// `/big`, [`BIG`] bytes, or for `/job`, what a job comes to; a ws
+    /// message is echoed.
+    fn app<'s, 'j>(ss: &mut S<'s>, now: Instant, jobs: &Jobs<'j, S<'s>>) {
         while let Some(ev) = ss.poll_event(now) {
             let (stream, user): (StreamId, &mut App) = (ev.stream, ev.user);
             let then = match ev.kind {
                 Kind::ServerTxn(mut txn) => {
-                    user.out = match txn.path().unwrap_or_default() {
+                    let path = txn.path().unwrap_or_default();
+                    let (out, then) = match path {
                         // far more than the buffers hold
-                        b"/big" => vec![b'x'; BIG],
-                        p => p.to_vec(),
+                        b"/big" => (vec![b'x'; BIG], Then::Tx),
+                        b"/job" => (Vec::new(), Then::Job),
+                        p => (p.to_vec(), Then::Tx),
                     };
+                    let len = if path == b"/job" {
+                        FROM_JOB.len()
+                    } else {
+                        out.len()
+                    };
+                    user.out = out;
                     user.at = 0;
-                    let len = u64::try_from(user.out.len()).unwrap();
                     txn.respond(Response {
                         status: 200,
                         content_type: Some(b"text/plain"),
-                        content_length: Some(len),
+                        content_length: Some(u64::try_from(len).unwrap()),
                         headers: &[],
                     })
                     .unwrap();
-                    Then::Tx
+                    then
                 }
                 Kind::Rx { data, end } => {
                     user.msg.extend_from_slice(data);
@@ -160,6 +173,19 @@ mod threads {
                 Then::Nothing => {}
                 Then::Tx => ss.request_tx(stream).unwrap(),
                 Then::Message(len) => ss.request_tx_len(stream, len).unwrap(),
+                Then::Job => jobs.spawn(move || {
+                    // off the turn, with no lock held: it may take its time
+                    thread::sleep(core::time::Duration::from_millis(20));
+                    let bytes = FROM_JOB.to_vec();
+                    move |streams: &mut S<'s>, _now: Instant| {
+                        // the stream may have gone meanwhile
+                        if let Ok(u) = streams.user(stream) {
+                            u.out = bytes;
+                            u.at = 0;
+                            streams.request_tx(stream).unwrap();
+                        }
+                    }
+                }),
             }
         }
     }
@@ -177,7 +203,8 @@ mod threads {
         }
         let stop = Stop::new();
         thread::scope(|scope| {
-            let server = scope.spawn(|| serve(ss, serving, |_| None, app, &stop));
+            let server =
+                scope.spawn(|| serve(ss, serving, |_| None, app, Workers::default(), &stop));
             client(&bound);
             stop.stop();
             server.join().unwrap();
@@ -215,6 +242,17 @@ mod threads {
                 "HTTP/1.1 200 OK\\r\\ncontent-type: text/plain\\r\\ncontent-length: 6\\r\\n\
                  x-test: 1\\r\\n\\r\\n/hello"
             );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
+    fn an_answer_made_by_a_job_off_the_turn_is_sent_when_it_comes() {
+        with_server(&[listener("127.0.0.1:0")], 2, |l| {
+            let mut c = tcp(&l[0]);
+            c.write_all(b"GET /job HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            assert!(all(c).ends_with(b"\r\n\r\nfrom a job"));
         });
     }
 
