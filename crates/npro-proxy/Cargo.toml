@@ -1,0 +1,24 @@
+[package]
+name        = "npro-proxy"
+description = "npro's reverse proxy: a request passed to an origin over h1 and its answer passed back, sans-IO, one bounded buffer each way"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "http", "proxy"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core.workspace = true
+npro-h1.workspace   = true
+npro-io.workspace   = true
+npro-ss             = { path = "../npro-ss", version = "0.0.2" }
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+
+[lints]
+workspace = true

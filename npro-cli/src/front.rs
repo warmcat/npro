@@ -4,10 +4,12 @@
 //! A policy's route says `to: "www"`; the front has the services the
 //! program was built with, by name ([`Services`]), and [`check`] refuses
 //! a policy naming one it does not have, listing those it has, when the
-//! policy is loaded.  The first service is files ([`Service::Files`]):
+//! policy is loaded.  The services are files ([`Service::Files`]):
 //! npro-files over std's file system ([`StdFs`]), its reads done by the
-//! adapter's jobs, off the application's turn.  A request on a route
-//! naming no service, or on no route, gets the vhost's 404.
+//! adapter's jobs, off the application's turn; and the proxy
+//! ([`Service::Proxy`]): npro-proxy, the request passed to its origin by
+//! a stream connecting out, which the adapter connects.  A request on a
+//! route naming no service, or on no route, gets the vhost's 404.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -17,6 +19,7 @@ use std::time::UNIX_EPOCH;
 use npro_core::time::Instant;
 use npro_files::{Fs, Mount, Opened, Scheme, Served, Serving, serve};
 use npro_io::threads::Jobs;
+use npro_proxy::{Act, Asked, CAPACITY, Side, Storage, Upstream};
 use npro_ss::event::{Filled, Kind};
 use npro_ss::id::StreamId;
 use npro_ss::policy::{Listener, Tls};
@@ -28,6 +31,8 @@ use crate::runner::Streams;
 pub enum Service<'p> {
     /// npro-files, serving this mount.
     Files(Mount<'p>),
+    /// npro-proxy, passing requests to this origin.
+    Proxy(Upstream<'p>),
 }
 
 /// The services, by the name a route's `to` gives.
@@ -154,6 +159,66 @@ pub enum Front {
     Answered,
     /// A file's bytes, from npro-files.
     File(Serving<File, Vec<u8>>),
+    /// One side of a proxied request, from npro-proxy: the client's
+    /// stream or the one to the origin.  Boxed: its buffers are far
+    /// larger than any other state, and a std program has a heap.
+    Proxy(Box<Side<Vec<u8>>>),
+}
+
+/// The proxy's side of a front stream, if it is one.
+fn proxy_side(u: &mut Front) -> Option<&mut Side<Vec<u8>>> {
+    match u {
+        Front::Proxy(s) => Some(s),
+        Front::Idle | Front::Answered | Front::File(_) => None,
+    }
+}
+
+/// What the front does after an event, since the event borrows the
+/// streams.
+enum Then {
+    Nothing,
+    /// The stream has payload to write.
+    Tx,
+    /// A request to pass on, copied out: [`npro_proxy::start`].  Boxed:
+    /// it carries the onward headers.
+    Start(Upstream<'static>, Box<Asked>),
+    /// The client is answered with this status page.
+    Status(u16),
+    /// The proxy's calls.
+    Acts(npro_proxy::Acts),
+}
+
+/// Answers the stream with C's status page and ends its answer.
+fn status(ss: &mut Streams<'_, Front>, now: Instant, stream: StreamId, code: u16) {
+    if ss.status(now, stream, code).is_ok() {
+        if let Ok(u) = ss.user(stream) {
+            *u = Front::Answered;
+        }
+        let _ = ss.request_tx(stream);
+    }
+}
+
+/// Applies one of the proxy's calls.
+fn apply(ss: &mut Streams<'_, Front>, now: Instant, a: Act) {
+    match a {
+        Act::Move { from, to } => npro_proxy::moved(ss, from, to, proxy_side),
+        Act::Answer { client, origin } => {
+            // refused only as the role refuses it: the request is then
+            // unanswered, and its timeout ends the connection
+            let _ = npro_proxy::answer(ss, client, origin, proxy_side);
+        }
+        Act::Status(s, code) => status(ss, now, s, code),
+        Act::OriginGone(client) => npro_proxy::origin_gone(ss, now, client, proxy_side),
+        Act::Destroy(s) => {
+            let _ = ss.destroy(now, s);
+        }
+        Act::RequestTx(s) => {
+            let _ = ss.request_tx(s);
+        }
+        Act::Flow(s, f) => {
+            let _ = ss.flow(s, f);
+        }
+    }
 }
 
 /// Reads `read` of `file`, off the turn: what it got, short at the
@@ -177,38 +242,52 @@ fn read_chunk(file: &File, read: npro_files::Read) -> Vec<u8> {
 /// The front's turn: every event answered, the file reads wanted given
 /// to `jobs`.  This is what the runner's `serve()` is given.
 pub fn act<'s, 'j>(
-    services: &Services<'_>,
+    services: &Services<'static>,
     ss: &mut Streams<'s, Front>,
     now: Instant,
     jobs: &Jobs<'j, Streams<'s, Front>>,
 ) {
     while let Some(ev) = ss.poll_event(now) {
         let (stream, user): (StreamId, &mut Front) = (ev.stream, ev.user);
-        let mut wants_tx = false;
-        match ev.kind {
-            Kind::ServerTxn(mut txn) => {
+        let then = match (user, ev.kind) {
+            (Front::Proxy(side), kind) => Then::Acts(npro_proxy::on_event(stream, side, kind)),
+            (user, Kind::ServerTxn(mut txn)) => {
                 let scheme = match txn.listener().tls {
                     Tls::Plain => Scheme::Http,
                     Tls::Server { .. } => Scheme::Https,
                 };
                 let service = txn.route().and_then(|r| services.find(r.route.to));
-                let served = match service {
-                    Some(Service::Files(mount)) => serve(mount, &mut txn, &mut StdFs, scheme),
-                    None => txn.status(404).map(|()| Served::Answered),
-                };
-                // refused only as the role refuses it: the request stays
-                // unanswered, and its timeout ends the connection
-                if let Ok(served) = served {
-                    *user = match served {
-                        Served::Answered => Front::Answered,
-                        Served::Body(s) => Front::File(s),
-                    };
-                    wants_tx = true;
+                match service {
+                    // refused only as the role refuses it: the request
+                    // stays unanswered, and its timeout ends the connection
+                    Some(Service::Files(mount)) => match serve(mount, &mut txn, &mut StdFs, scheme)
+                    {
+                        Ok(Served::Answered) => {
+                            *user = Front::Answered;
+                            Then::Tx
+                        }
+                        Ok(Served::Body(s)) => {
+                            *user = Front::File(s);
+                            Then::Tx
+                        }
+                        Err(_) => Then::Nothing,
+                    },
+                    Some(Service::Proxy(up)) => match Asked::of(up, &txn) {
+                        Ok(asked) => Then::Start(*up, Box::new(asked)),
+                        Err(e) => Then::Status(e.status()),
+                    },
+                    None => match txn.status(404) {
+                        Ok(()) => {
+                            *user = Front::Answered;
+                            Then::Tx
+                        }
+                        Err(_) => Then::Nothing,
+                    },
                 }
             }
-            Kind::Tx(tx) => {
+            (user, Kind::Tx(tx)) => {
                 tx.fill(|buf| match user {
-                    Front::Idle | Front::Answered => Filled::Last(0),
+                    Front::Idle | Front::Answered | Front::Proxy(_) => Filled::Last(0),
                     Front::File(s) => s.fill(buf),
                 });
                 if let Front::File(serving) = user {
@@ -225,18 +304,47 @@ pub fn act<'s, 'j>(
                         });
                     }
                 }
+                Then::Nothing
             }
-            Kind::ServerUpgrade { .. }
-            | Kind::UpgradeRefused(_)
-            | Kind::Rx { .. }
-            | Kind::Pong
-            | Kind::PeerClose { .. }
-            | Kind::Response(_)
-            | Kind::ConnectFailed
-            | Kind::Disconnected => {}
-        }
-        if wants_tx {
-            let _ = ss.request_tx(stream);
+            (
+                Front::Idle | Front::Answered | Front::File(_),
+                Kind::ServerUpgrade { .. }
+                | Kind::UpgradeRefused(_)
+                | Kind::Rx { .. }
+                | Kind::Pong
+                | Kind::PeerClose { .. }
+                | Kind::Response(_)
+                | Kind::ConnectFailed
+                | Kind::Disconnected,
+            ) => Then::Nothing,
+        };
+        match then {
+            Then::Nothing => {}
+            Then::Tx => {
+                let _ = ss.request_tx(stream);
+            }
+            Then::Status(code) => status(ss, now, stream, code),
+            Then::Start(up, asked) => {
+                let storage = || Storage {
+                    staging: vec![0; CAPACITY],
+                    out: vec![0; CAPACITY],
+                };
+                match npro_proxy::start(&up, &asked, stream, ss, storage(), storage(), |side| {
+                    Front::Proxy(Box::new(side))
+                }) {
+                    Ok(side) => {
+                        if let Ok(u) = ss.user(stream) {
+                            *u = Front::Proxy(Box::new(side));
+                        }
+                    }
+                    Err(e) => status(ss, now, stream, e.status()),
+                }
+            }
+            Then::Acts(acts) => {
+                for a in acts.iter() {
+                    apply(ss, now, a);
+                }
+            }
         }
     }
 }

@@ -23,6 +23,7 @@ npro-h1     = { path = "../crates/npro-h1" }
 npro-io     = { path = "../crates/npro-io", features = ["std", "rustls"] }
 npro-ss     = { path = "../crates/npro-ss", features = ["pmd"] }
 npro-files  = { path = "../crates/npro-files" }
+npro-proxy  = { path = "../crates/npro-proxy" }
 npro-ws     = { path = "../crates/npro-ws", features = ["pmd"] }
 npro-aws-lc = { path = "../npro-aws-lc" }
 # as npro-aws-lc has it: the config builders, and the provider's random

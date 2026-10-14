@@ -122,3 +122,10 @@ path  = "fuzz_targets/files.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "proxy"
+path  = "fuzz_targets/proxy.rs"
+test  = false
+doc   = false
+bench = false

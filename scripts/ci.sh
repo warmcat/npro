@@ -43,7 +43,7 @@ cargo "+$msrv" check --workspace --all-targets --all-features --locked
 
 echo "== no_std"
 # the sans-IO crates must build for a target with no std at all
-for c in npro-core npro-h1 npro-ws npro-io npro-json npro-ss npro-files; do
+for c in npro-core npro-h1 npro-ws npro-io npro-json npro-ss npro-files npro-proxy; do
 	features=--all-features
 	# npro-io's std feature is its threads adapter, which no_std has not
 	if [ "$c" = npro-io ]; then

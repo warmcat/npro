@@ -23,6 +23,7 @@
 mod files;
 mod h1;
 mod json;
+mod proxy;
 mod ss;
 mod targets;
 mod ws;
@@ -30,6 +31,7 @@ mod ws;
 pub use files::files;
 pub use h1::{chunked, h1_request, h1_response, uri};
 pub use json::json;
+pub use proxy::proxy;
 pub use ss::ss_server;
 pub use targets::{base64, sha1, transcript, utf8};
 pub use ws::{ws_client, ws_pmd, ws_server};
@@ -76,11 +78,13 @@ pub enum Target {
     SsServer,
     /// [`files`]: npro-files serving requests from a tree in memory.
     Files,
+    /// [`proxy`]: npro-proxy between a client and an origin both played.
+    Proxy,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -95,6 +99,7 @@ impl Target {
         Self::WsPmd,
         Self::SsServer,
         Self::Files,
+        Self::Proxy,
     ];
 
     /// The target's name.
@@ -115,6 +120,7 @@ impl Target {
             Self::WsPmd => "ws-pmd",
             Self::SsServer => "ss-server",
             Self::Files => "files",
+            Self::Proxy => "proxy",
         }
     }
 
@@ -140,6 +146,7 @@ impl Target {
             Self::WsPmd => ws_pmd(data),
             Self::SsServer => ss_server(data),
             Self::Files => files(data),
+            Self::Proxy => proxy(data),
         }
     }
 }

@@ -1,0 +1,9 @@
+ËHEAD /h HTTP/1.1
+Host: f
+
+                                                            HTTP/1.1 302 Found
+Location: /y
+Set-Cookie: a=1
+Set-Cookie: b=2
+Content-Length: 0
+

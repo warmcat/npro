@@ -262,6 +262,11 @@ fn files() {
 }
 
 #[test]
+fn proxy() {
+    smoke(Target::Proxy, seeded).unwrap();
+}
+
+#[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
     let tested = [
@@ -279,6 +284,7 @@ fn every_target_has_a_smoke_test() {
         "ws-pmd",
         "ss-server",
         "files",
+        "proxy",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

@@ -668,6 +668,28 @@ both sides have agreed, it passes bytes both ways.  A ws frame over h2
 (RFC 8441) is the same bytes inside DATA frames, so that holds when
 the return side is h2.
 
+*Built (2026-10-14)* as `npro-proxy`, no_std, over npro-ss' streams,
+with the client half's first form: `Asked::of()` copies out of the
+request what goes onward (the method, the path re-encoded under the
+origin's own with the arguments put back as C's `lws_proxy_pct_encode()`
+does, the `Host`, the body's framing, and C's list of forwarded
+headers), `start()` makes the stream to the origin, and `on_event()`
+takes what either stream is told: what it received is staged in its
+own `U` and moved to the other's buffer right after the event
+(`moved()`), the origin's head copied out and the client answered from
+it (`answer()`) with C's list of headers passed back, an origin not
+reached answered 503 and one gone before its head 502.  An origin gone
+after sending still has what it staged moved to the client first: a
+stream told it is gone keeps its `U` until the next look, for just
+this.  The front's `Service::Proxy` names an `Upstream`; over sockets,
+a 300KB answer passes through with its cookie and without the origin's
+own header.  Where it differs from C: the request's own `Host` goes
+onward, not the origin's address; a chunked request body is refused
+411 where C chunks it onward; the client's connection is kept alive
+when the origin gave a length, where C adds `connection: close`.  Not
+yet: ws passed through, an origin over tls, and the connection to the
+origin kept warm.
+
 **The proxy is flow controlled** (Andy, 2026-10-12): passing bytes
 through is still networking.  Between the two sides there is one
 bounded buffer per direction, its size from the policy, and nothing
@@ -678,7 +700,12 @@ client has not given), the proxy stops reading from the origin.  The
 origin's socket fills and it feels the backpressure, however fast it
 would like to send.  Uploads are regulated the same way, the other way
 round.  In sansIO this is the driver's `Want` without a read buffer:
-the connection simply is not asked to read.
+the connection simply is not asked to read.  *As built*: each
+direction's buffer is 64KiB (`npro_proxy::CAPACITY`), the giving
+stream's rx held (`Ss::flow()`, C's `lws_rx_flow_control()`) once 16KiB
+is held and given again below 8KiB; the capacity leaves room for what
+a held giver had staged, so nothing is lost when it goes.  Its tests
+pass a 200KB answer to a client taking 100 bytes at a time.
 
 **Privileges**: the process does not start as root.  systemd starts it
 as its own user, with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and

@@ -49,6 +49,13 @@ The protocol crates' targets start from the C library's corpora
   HEAD with a matching `if-none-match`, a large file, a path reaching
   outside the mount, a request for what is not there followed by one
   for the 404 document, and a request for the application's route.
+- `proxy`: written for it, a control byte (the split between the
+  client's bytes and the origin's, in sixteenths; whether the connect
+  fails; the client's write pace) then both: a GET with arguments and a
+  cookie answered with a length, a POST's body passed on, an answer
+  with no length, a connect that fails, an origin gone mid-head, a
+  chunked upload refused, and a HEAD answered with cookies and a
+  location.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

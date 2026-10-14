@@ -150,6 +150,7 @@ dependencies = [
  "npro-files",
  "npro-h1",
  "npro-io",
+ "npro-proxy",
  "npro-ss",
  "npro-ws",
  "rustls",
@@ -181,6 +182,16 @@ dependencies = [
  "npro-h1",
  "npro-ws",
  "rustls",
+]
+
+[[package]]
+name = "npro-proxy"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-h1",
+ "npro-io",
+ "npro-ss",
 ]
 
 [[package]]

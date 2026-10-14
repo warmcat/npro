@@ -1,6 +1,8 @@
 //! The front over real sockets: a directory served by npro-files through
 //! the runner, its reads done by the adapter's workers, a 404 document,
-//! a 304, a HEAD, and a policy naming a service that is not built in.
+//! a 304, a HEAD, a request passed to an origin by npro-proxy and its
+//! answer passed back, an origin that is not there, and a policy naming
+//! a service that is not built in.
 
 #![expect(
     unused_crate_dependencies,
@@ -11,7 +13,7 @@
 #[cfg(test)]
 mod front {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::thread;
 
@@ -20,6 +22,7 @@ mod front {
     use npro_files::{Cache, Intermediaries, Mount, Revalidate};
     use npro_h1::server::Config;
     use npro_io::threads::{Stop, Workers};
+    use npro_proxy::Upstream;
     use npro_ss::id::ListenerId;
     use npro_ss::policy::{Listener, Match, Route, Tls, Vhost, Ws};
 
@@ -37,7 +40,43 @@ mod front {
         dir.to_str().unwrap().to_owned().leak()
     }
 
+    /// An origin the test plays, at `address`: one connection accepted,
+    /// its request's head kept, and `body` sent back with a length, then
+    /// closed.  `None` for an address nothing listens on.
+    fn origin(body: Vec<u8>) -> (&'static str, thread::JoinHandle<Vec<u8>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address: &'static str = l.local_addr().unwrap().to_string().leak();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Origin: 1\r\n\
+                     Set-Cookie: a=1\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            s.write_all(&body).unwrap();
+            head
+        });
+        (address, handle)
+    }
+
     fn policy(root: &'static str) -> (Services<'static>, Listener<'static>) {
+        policy_with(root, "127.0.0.1:1")
+    }
+
+    fn policy_with(root: &'static str, up: &'static str) -> (Services<'static>, Listener<'static>) {
         let services: &'static [(&str, Service<'_>)] = vec![
             (
                 "www",
@@ -62,6 +101,14 @@ mod front {
                     mimes: &[],
                 }),
             ),
+            (
+                "up",
+                Service::Proxy(Upstream {
+                    address: up,
+                    path: "/o",
+                    host: "origin",
+                }),
+            ),
         ]
         .leak();
         let routes: &'static [Route<'static>] = vec![
@@ -78,6 +125,13 @@ mod front {
                 to: "sub",
                 ws: Ws::NotTaken,
                 headers: &[(b"x-sub", b"1")],
+            },
+            Route {
+                path: "/up",
+                matching: Match::Prefix,
+                to: "up",
+                ws: Ws::NotTaken,
+                headers: &[(b"x-up", b"1")],
             },
         ]
         .leak();
@@ -224,6 +278,106 @@ mod front {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
+    fn a_request_is_passed_to_the_origin_and_its_answer_back() {
+        let body: Vec<u8> = (0..300_000u32)
+            .map(|i| u8::try_from(i % 89).unwrap().wrapping_add(b'!'))
+            .collect();
+        let (up, origin) = origin(body.clone());
+        let root = www();
+        let (services, listener) = policy_with(root, up);
+        let listeners = [listener];
+        let bound = bind(&listeners).unwrap();
+        let addr = bound.local_addr(ListenerId::new(0)).unwrap();
+        let stop = Stop::new();
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                bound.serve(
+                    8,
+                    |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+                    Workers::default(),
+                    &stop,
+                )
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let got = ask(addr, &get("/up/x/y?q=1&r=a%20b", "Cookie: s=2\r\n"));
+                let at = got
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .unwrap()
+                    .checked_add(4)
+                    .unwrap();
+                let head = String::from_utf8_lossy(&got[..at]);
+                assert!(
+                    head.starts_with(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 300000\r\n\
+                         x-front: 1\r\nx-up: 1\r\nset-cookie: a=1\r\n"
+                    ),
+                    "{head}"
+                );
+                assert!(!head.contains("x-origin"));
+                assert_eq!(got.len().checked_sub(at), Some(body.len()));
+                assert_eq!(got[at..], body[..]);
+                let sent = origin.join().unwrap();
+                let sent = String::from_utf8_lossy(&sent);
+                assert!(
+                    sent.starts_with("GET /o/x/y?q=1&r=a%20b HTTP/1.1\r\nHost: localhost\r\n"),
+                    "{sent}"
+                );
+                assert!(sent.contains("cookie: s=2\r\n"), "{sent}");
+            }));
+            stop.stop();
+            server.join().unwrap().unwrap();
+            if let Err(e) = outcome {
+                std::panic::resume_unwind(e);
+            }
+        });
+        drop(std::fs::remove_dir_all(root));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
+    fn an_origin_not_there_is_answered_503() {
+        // bound then dropped: nothing listens there
+        let nowhere: &'static str = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string()
+            .leak();
+        let root = www();
+        let (services, listener) = policy_with(root, nowhere);
+        let listeners = [listener];
+        let bound = bind(&listeners).unwrap();
+        let addr = bound.local_addr(ListenerId::new(0)).unwrap();
+        let stop = Stop::new();
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                bound.serve(
+                    4,
+                    |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+                    Workers::default(),
+                    &stop,
+                )
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let got = ask(addr, &get("/up/", ""));
+                assert!(
+                    got.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"),
+                    "{}",
+                    got.escape_ascii()
+                );
+            }));
+            stop.stop();
+            server.join().unwrap().unwrap();
+            if let Err(e) = outcome {
+                std::panic::resume_unwind(e);
+            }
+        });
+        drop(std::fs::remove_dir_all(root));
+    }
+
+    #[test]
     fn a_route_naming_no_built_in_service_is_refused_with_the_list() {
         let (services, listener) = policy("/nowhere");
         let routes = [Route {
@@ -241,7 +395,7 @@ mod front {
         let e = check(&services, &bad).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "www, localhost, /: no service \"login\"; built in: www, sub"
+            "www, localhost, /: no service \"login\"; built in: www, sub, up"
         );
     }
 }
