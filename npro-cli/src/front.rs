@@ -33,7 +33,32 @@ pub enum Service<'p> {
     Files(Mount<'p>),
     /// npro-proxy, passing requests to this origin.
     Proxy(Upstream<'p>),
+    /// A redirect, the front's own: C's `>https://` mount origin.
+    Redirect(Redirect<'p>),
 }
+
+/// A redirect: every request on the route is answered 301 to `to`, with
+/// what came after the route's path appended if `append` says, as C's
+/// `lws_http_redirect_hit()` does for a `>https://` origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirect<'p> {
+    /// Where to: `https://example.com`.
+    pub to: &'p str,
+    /// Whether the rest of the request's path follows it.
+    pub append: Append,
+}
+
+/// What follows a redirect's `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Append {
+    /// Nothing: every request goes to `to` as it is.
+    Nothing,
+    /// The rest of the request's path, after a `/`: C's `append-path`.
+    Path,
+}
+
+/// The longest location a redirect composes.
+const MAX_LOCATION: usize = 2048;
 
 /// The services, by the name a route's `to` gives.
 #[derive(Clone, Copy, Debug)]
@@ -239,13 +264,58 @@ fn read_chunk(file: &File, read: npro_files::Read) -> Vec<u8> {
     chunk
 }
 
+/// The next read `serving` wants, if one, given to `jobs`: done off the
+/// turn, and handed back to the stream, which then asks to write.
+fn read_off_the_turn<'s, 'j>(
+    serving: &mut Serving<File, Vec<u8>>,
+    stream: StreamId,
+    jobs: &Jobs<'j, Streams<'s, Front>>,
+) {
+    if let Some((file, read)) = serving.wanted() {
+        jobs.spawn(move || {
+            let chunk = read_chunk(&file, read);
+            move |streams: &mut Streams<'s, Front>, _: Instant| {
+                // the stream may have gone meanwhile
+                if let Ok(Front::File(back)) = streams.user(stream) {
+                    back.read_done(file, chunk);
+                    let _ = streams.request_tx(stream);
+                }
+            }
+        });
+    }
+}
+
+/// Answers the request with the redirect `r` says: 301 to its `to`, the
+/// rest of the path after it if it appends, or 414 if that does not
+/// fit [`MAX_LOCATION`].
+fn redirect<S: AsRef<[u8]> + AsMut<[u8]>>(
+    r: &Redirect<'_>,
+    txn: &mut npro_ss::event::Txn<'_, S>,
+) -> Result<(), npro_ss::event::RespondError> {
+    let mut loc = Vec::with_capacity(MAX_LOCATION);
+    loc.extend_from_slice(r.to.as_bytes());
+    if let (Append::Path, Some(routed)) = (r.append, txn.route()) {
+        if !routed.rest.is_empty() {
+            if !loc.ends_with(b"/") {
+                loc.push(b'/');
+            }
+            loc.extend_from_slice(routed.rest);
+        }
+    }
+    if loc.len() > MAX_LOCATION {
+        txn.status(414)
+    } else {
+        txn.redirect(301, &loc)
+    }
+}
+
 /// The front's turn: every event answered, the file reads wanted given
 /// to `jobs`.  This is what the runner's `serve()` is given.
-pub fn act<'s, 'j>(
+pub fn act<'s>(
     services: &Services<'static>,
     ss: &mut Streams<'s, Front>,
     now: Instant,
-    jobs: &Jobs<'j, Streams<'s, Front>>,
+    jobs: &Jobs<'_, Streams<'s, Front>>,
 ) {
     while let Some(ev) = ss.poll_event(now) {
         let (stream, user): (StreamId, &mut Front) = (ev.stream, ev.user);
@@ -276,6 +346,13 @@ pub fn act<'s, 'j>(
                         Ok(asked) => Then::Start(*up, Box::new(asked)),
                         Err(e) => Then::Status(e.status()),
                     },
+                    Some(Service::Redirect(r)) => match redirect(r, &mut txn) {
+                        Ok(()) => {
+                            *user = Front::Answered;
+                            Then::Tx
+                        }
+                        Err(_) => Then::Nothing,
+                    },
                     None => match txn.status(404) {
                         Ok(()) => {
                             *user = Front::Answered;
@@ -291,18 +368,7 @@ pub fn act<'s, 'j>(
                     Front::File(s) => s.fill(buf),
                 });
                 if let Front::File(serving) = user {
-                    if let Some((file, read)) = serving.wanted() {
-                        jobs.spawn(move || {
-                            let chunk = read_chunk(&file, read);
-                            move |streams: &mut Streams<'s, Front>, _: Instant| {
-                                // the stream may have gone meanwhile
-                                if let Ok(Front::File(back)) = streams.user(stream) {
-                                    back.read_done(file, chunk);
-                                    let _ = streams.request_tx(stream);
-                                }
-                            }
-                        });
-                    }
+                    read_off_the_turn(serving, stream, jobs);
                 }
                 Then::Nothing
             }

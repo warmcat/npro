@@ -17,9 +17,16 @@ edition      = "2024"
 rust-version = "1.85"
 license      = "MIT"
 
+# the command is npro: the package cannot be, since that is the
+# library's name on crates.io
+[[bin]]
+name = "npro"
+path = "src/main.rs"
+
 [dependencies]
 npro-core   = { path = "../crates/npro-core" }
 npro-h1     = { path = "../crates/npro-h1" }
+npro-json   = { path = "../crates/npro-json" }
 npro-io     = { path = "../crates/npro-io", features = ["std", "rustls"] }
 npro-ss     = { path = "../crates/npro-ss", features = ["pmd"] }
 npro-files  = { path = "../crates/npro-files" }

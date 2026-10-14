@@ -550,8 +550,21 @@ route's `to` gives (`Services`), checked against the policy when it is
 loaded so a route naming a service not built in is refused with the
 list of those that are; npro-files over std's file system, its reads
 given to the adapter's jobs; and a request on no route, or on a route
-naming no service, answered with the vhost's 404.  The command line is
-not there yet: it waits on the first item under "Open".
+naming no service, answered with the vhost's 404; and a redirect
+service of its own, C's `>https://` origin, for the port-80 vhost.
+
+**The command, `npro`** (2026-10-14): `npro serve [--policy FILE] [-p
+FRAGMENT]...` serves everything its policy says, as decided.  The
+policy is JSON, read by npro-json into an owned value, in the five
+layers decided (built in, `/etc/npro/defaults.json`,
+`~/.config/npro/defaults.json`, the policy file, the `-p` fragments,
+each a JSON object or `key.path=value`), merged member by member, and
+made into the listeners, vhosts, routes and services of the Rust
+types; nothing is accepted and ignored, and what is wrong is said with
+its path.  The shape this version reads is `npro-cli/README.md`'s;
+it is the first form, before the layers, parameters and authority of
+ss-policy.md.  Its tests run the binary on a policy serving a
+directory over a unix domain socket with a fragment over it.
 
 ### The first goal: npro.rs served by npro
 
@@ -964,11 +977,9 @@ code for exactly this trust model.
 
 For Andy:
 
-1. **The utility**: its subcommands and options, and how a
-   policy fragment or a named streamtype is given on its command line.
-   `serve` and the default layers are decided (above); the rest is
-   proposed as `npro get URL`, `npro ws URL`, `--policy FILE` and `-p`
-   fragments.
+1. **The utility's client side**: `npro get URL` and `npro ws URL`,
+   needing no policy, are proposed and not built; `serve`, `--policy`
+   and `-p` are built as decided.
 2. SSPC's two questions above, when it is built.
 3. **The login guard**: the JWT cookie is checked in the front, on
    every request to a guarded route, with the login itself in an

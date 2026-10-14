@@ -104,6 +104,7 @@ dependencies = [
  "npro-h1",
  "npro-io",
  "npro-json",
+ "npro-proxy",
  "npro-ss",
  "npro-test",
  "npro-ws",
@@ -136,6 +137,16 @@ dependencies = [
 [[package]]
 name = "npro-json"
 version = "0.0.2"
+
+[[package]]
+name = "npro-proxy"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-h1",
+ "npro-io",
+ "npro-ss",
+]
 
 [[package]]
 name = "npro-ss"

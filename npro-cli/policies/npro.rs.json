@@ -1,0 +1,51 @@
+{
+  "listeners": {
+    "https": {
+      "bind": "[::]:443",
+      "tls": {
+        "cert": "/var/dnssec/domains/npro.rs/certs/production/crt/npro.rs-latest-fullchain.crt",
+        "key": "/var/dnssec/domains/npro.rs/certs/production/key/npro.rs-latest.key"
+      },
+      "vhosts": ["npro.rs"]
+    },
+    "http": { "bind": "[::]:80", "vhosts": ["npro.rs-http"] }
+  },
+  "vhosts": {
+    "npro.rs": {
+      "not-found": "/404.html",
+      "headers": {
+        "strict-transport-security": "max-age=15768000; includeSubDomains",
+        "x-frame-options": "deny",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer"
+      },
+      "routes": [
+        { "path": "/",     "to": "www" },
+        { "path": "/git",  "to": "git" },
+        { "path": "/sai",  "to": "sai", "ws": { "protocols": ["sai"], "default": "sai", "binary": false } },
+        { "path": "/npro-login-sai", "to": "lwsws" },
+        { "path": "/oauth",          "to": "lwsws" },
+        { "path": "/repo",           "to": "lwsws" },
+        { "path": "/npro-login-deaddrop", "to": "lwsws" },
+        { "path": "/docrepo",        "to": "lwsws" }
+      ]
+    },
+    "npro.rs-http": {
+      "routes": [ { "path": "/", "to": "to-https" } ]
+    }
+  },
+  "services": {
+    "www": {
+      "type": "files",
+      "root": "/var/www/npro.rs",
+      "default": "index.html",
+      "cache": { "max-age": 172800, "revalidate": false, "public": false },
+      "mimes": { ".tar.gz": "application/x-gtar", ".md": "text/markdown" }
+    },
+    "git":   { "type": "proxy", "address": "unix:/var/run/gitohashi-npro", "path": "/git" },
+    "sai":   { "type": "proxy", "address": "unix:/var/run/sainpro", "path": "/sai" },
+    "lwsws": { "type": "proxy", "address": "unix:/var/run/lwsws-npro", "path": "/" },
+    "to-https": { "type": "redirect", "to": "https://npro.rs", "append-path": true }
+  },
+  "npro": { "slots": 256, "workers": 4 }
+}

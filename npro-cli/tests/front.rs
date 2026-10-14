@@ -26,9 +26,11 @@ mod front {
     use npro_ss::id::ListenerId;
     use npro_ss::policy::{Listener, Match, Route, Tls, Vhost, Ws};
 
-    /// A directory of files to serve: its path, leaked for the policy.
-    fn www() -> &'static str {
-        let dir: PathBuf = std::env::temp_dir().join(format!("npro-front-{}", std::process::id()));
+    /// A directory of files to serve, `name`'s own: its path, leaked for
+    /// the policy.
+    fn www(name: &str) -> &'static str {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("npro-front-{name}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("index.html"), b"<html>front</html>").unwrap();
         std::fs::write(dir.join("sub/index.html"), b"<html>sub</html>").unwrap();
@@ -170,7 +172,7 @@ mod front {
     #[test]
     #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
     fn files_are_served_through_the_runner_with_reads_off_the_turn() {
-        let root = www();
+        let root = www("files_are_served_through_the_runner_with_reads_off_the_turn");
         let (services, listener) = policy(root);
         let listeners = [listener];
         check(&services, &listeners).unwrap();
@@ -284,7 +286,7 @@ mod front {
             .map(|i| u8::try_from(i % 89).unwrap().wrapping_add(b'!'))
             .collect();
         let (up, origin) = origin(body.clone());
-        let root = www();
+        let root = www("a_request_is_passed_to_the_origin_and_its_answer_back");
         let (services, listener) = policy_with(root, up);
         let listeners = [listener];
         let bound = bind(&listeners).unwrap();
@@ -345,7 +347,7 @@ mod front {
             .unwrap()
             .to_string()
             .leak();
-        let root = www();
+        let root = www("an_origin_not_there_is_answered_503");
         let (services, listener) = policy_with(root, nowhere);
         let listeners = [listener];
         let bound = bind(&listeners).unwrap();
