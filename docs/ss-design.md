@@ -507,8 +507,14 @@ turn after; C's `LWS_WITH_ASYNC_QUEUE`).  A
 listener's certificate and key are looked at, at most every 10s, when a
 connection is accepted, and the config made again if they changed; a
 pair that does not load keeps the old one, as C does.  npro's random is
-the provider's.  The command line is not there yet: it waits on the
-first item under "Open".
+the provider's.  Its `front` module (2026-10-14) is the server's
+application: the services the program was built with, by the name a
+route's `to` gives (`Services`), checked against the policy when it is
+loaded so a route naming a service not built in is refused with the
+list of those that are; npro-files over std's file system, its reads
+given to the adapter's jobs; and a request on no route, or on a route
+naming no service, answered with the vhost's 404.  The command line is
+not there yet: it waits on the first item under "Open".
 
 ### The first goal: npro.rs served by npro
 

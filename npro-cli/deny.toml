@@ -31,6 +31,7 @@ allow = [
 	"npro-cli",
 	"npro-aws-lc",
 	"npro-ss",
+	"npro-files",
 	"npro-core",
 	"npro-h1",
 	"npro-ws",
