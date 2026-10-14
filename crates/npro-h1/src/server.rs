@@ -719,6 +719,48 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         Ok(())
     }
 
+    /// Answers the request in hand with a redirect to `location`, as C's
+    /// `lws_http_redirect()` composes it: `location`, then `content-type:
+    /// text/html` and `content-length: 0`, so a kept connection's client
+    /// knows the transaction is over, then `headers`; and is done with the
+    /// transaction at `now`.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError::NotNow`] if there is no request in hand, or it is
+    /// answered already; [`RespondError::Header`] if `location` or one of
+    /// `headers` is refused; [`RespondError::TooLong`] if it does not fit.
+    /// The request is then still unanswered.
+    pub fn redirect(
+        &mut self,
+        now: Instant,
+        code: u16,
+        location: &[u8],
+        headers: &[(&[u8], &[u8])],
+    ) -> Result<(), RespondError> {
+        let Phase::Request(mut t) = self.phase else {
+            return Err(RespondError::NotNow);
+        };
+        if t.reply != Reply::Awaited {
+            return Err(RespondError::NotNow);
+        }
+        check_header(b"location", location, &[]).map_err(RespondError::Header)?;
+        let version = self.version;
+        self.own.compose(|own| {
+            status_line(own, version, code)?;
+            own.push(b"location: ")?;
+            own.push(location)?;
+            own.push(b"\r\ncontent-type: text/html\r\ncontent-length: 0\r\n")?;
+            own.push_headers(headers, &RESERVED)?;
+            own.push(b"\r\n")
+        })?;
+        t.reply = Reply::Payload(Some(0));
+        t.completed = true;
+        self.phase = Phase::Request(t);
+        self.settle(now);
+        Ok(())
+    }
+
     /// Queues C's status page, then the shutdown.  It fits: `out` is at
     /// least [`MIN_OUT`], which every page the server writes itself fits
     /// in (a test says so).
@@ -1165,6 +1207,7 @@ content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>
         .ok_or(RespondError::TooLong)?;
     status_line(own, v, code)?;
     own.push(b"content-type: text/html\r\n")?;
+    // C adds the extra headers here, before the length
     own.push_headers(headers, &RESERVED)?;
     own.push(b"content-length: ")?;
     own.push_u64(u64::try_from(body_len).map_err(|_| RespondError::TooLong)?)?;
@@ -1336,13 +1379,37 @@ mod tests {
         let head = s.tx(T0, &mut out, &mut Nothing);
         assert!(out[..head.written].ends_with(b"content-length: 173\r\n\r\n"));
         assert!(s.close().is_none());
-        // a reserved header is refused, and the request still unanswered
-        let mut r = server_out(MIN_OUT);
+        // a redirect is composed as C composes it, and is over at once
+        assert_eq!(
+            s.rx(T0, b"GET /z HTTP/1.1\r\nHost: x\r\n\r\n").event,
+            Some(Event::Request)
+        );
+        s.redirect(T0, 302, b"/404.html", &[(b"x-vhost", b"1")])
+            .unwrap();
+        let r = s.tx(T0, &mut out, &mut Nothing);
+        assert_eq!(
+            &out[..r.written],
+            b"HTTP/1.1 302 Redirect\r\nlocation: /404.html\r\ncontent-type: text/html\r\n\
+              content-length: 0\r\nx-vhost: 1\r\n\r\n"
+        );
+        assert!(s.close().is_none());
+        assert_eq!(s.redirect(T0, 302, b"/", &[]), Err(RespondError::NotNow));
+        assert_eq!(
+            s.rx(T0, b"GET /z HTTP/1.1\r\nHost: x\r\n\r\n").event,
+            Some(Event::Request)
+        );
         assert!(matches!(
-            r.status(T0, 404, &[(b"content-length", b"0")]),
+            s.redirect(T0, 302, b"bad\r\nvalue", &[]),
             Err(RespondError::Header(_))
         ));
-        assert!(r.is_awaiting_answer());
+        assert!(s.is_awaiting_answer());
+        // a reserved header is refused, and the request still unanswered
+        let mut other = server_out(MIN_OUT);
+        assert!(matches!(
+            other.status(T0, 404, &[(b"content-length", b"0")]),
+            Err(RespondError::Header(_))
+        ));
+        assert!(other.is_awaiting_answer());
     }
 
     #[test]
