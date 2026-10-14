@@ -331,6 +331,10 @@ the port's shape:
   and the new `client_body_chunked`, `interpreting`, `http_carries_sse`
   and `pong_pending_flag`.  There are also two write-only fields.  The
   port makes them variants.
+- **A `Host` under several vhosts' names goes to the first in C**
+  (`lws_select_vhost_by_name()`, priority 2), so with `example.com`
+  listed before `rtc.example.com`, `a.rtc.example.com` is served by
+  `example.com`.  The port takes the nearest, `rtc.example.com`.
 - **From the review, not re-checked here**:
   - the ws upgrade does not check that the method is GET (RFC 6455 4.1);
   - the reap in `4c68c756` waits on a running worker read on the service

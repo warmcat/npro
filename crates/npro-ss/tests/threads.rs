@@ -25,7 +25,7 @@ mod threads {
     use npro_io::threads::{Listening, Stop, bind, serve};
     use npro_ss::event::{End, Filled, Kind, Response};
     use npro_ss::id::{ListenerId, StreamId};
-    use npro_ss::policy::{Deflate, Listener, Payload, Tls, Ws, WsServer};
+    use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
     use npro_ss::ss::{ConnStorage, Slot, Ss};
 
     /// A stream's own state: what it has to send.
@@ -44,19 +44,33 @@ mod threads {
     /// The length of `/big`'s answer.
     const BIG: usize = 300_000;
 
+    const ROUTES: [Route<'static>; 1] = [Route {
+        path: "/",
+        matching: Match::Prefix,
+        to: "echo",
+        ws: Ws::Taken(WsServer {
+            protocols: &ECHO,
+            default: Some(0),
+            payload: Payload::Text,
+            deflate: Deflate::Off,
+        }),
+        headers: &[],
+    }];
+
+    const VHOSTS: [Vhost<'static>; 1] = [Vhost {
+        name: "test",
+        routes: &ROUTES,
+        headers: &[(b"x-test", b"1")],
+        not_found: None,
+    }];
+
     fn listener(bind: &'static str) -> Listener<'static> {
         Listener {
             name: "test",
             bind,
             tls: Tls::Plain,
             h1: Config::default(),
-            ws: Ws::Taken(WsServer {
-                protocols: &ECHO,
-                default: Some(0),
-                payload: Payload::Text,
-                deflate: Deflate::Off,
-            }),
-            headers: &[(b"x-test", b"1")],
+            vhosts: &VHOSTS,
         }
     }
 

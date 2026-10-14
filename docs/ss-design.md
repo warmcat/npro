@@ -297,14 +297,34 @@ differs from the sketch above, and why:
   `LWSSSSRET_TX_DONT_SEND` does.
 - **A response** is made in `ServerTxn`, or later by `Ss::respond()`
   (C's `lws_ss_server_ack()`), once the stream has the request's body,
-  say.  The listener's headers go first, then the application's, up to
-  64 in all.
-- **ws is the listener's**: if its policy takes ws, npro-ss answers a
+  say.  The vhost's headers go first, then the route's, then the
+  application's, up to 64 in all.  A response saying a length of 0
+  still ends by the stream's `Filled::Last(0)`, as C's SS server
+  completes only at the tx callback's EOM.
+- **A request is routed before the stream hears** (2026-10-14): a
+  listener serves vhosts, a vhost has routes, C's mounts.  The vhost is
+  the one the `Host` names, exactly, else the nearest it is under
+  (`a.rtc.example.com` reaches `rtc.example.com` before `example.com`,
+  where C takes whichever is first), else the listener's first.  The
+  route is the longest whose path leads the request's, an exact one
+  before a prefix as long: C's `lws_find_mount()`.  `Txn::route()` gives
+  the route, its `to` naming what serves it (a name the application
+  resolves: npro-ss carries it and nothing more), and the rest of the
+  path under it; `None` if nothing matched, which the stream answers as
+  it chooses, `Txn::status(404)` giving C's page with the connection
+  kept, or, on a vhost with a 404 document (C's `error-document-404`),
+  C's redirect to it; `Txn::redirect()` is C's `lws_http_redirect()`.
+  The policy is checked when the streams are made: a listener
+  with no vhost, a vhost with no name or named twice, a route whose
+  path does not start with `/` or given twice, each refused saying
+  where.
+- **ws is the route's**: if the route takes ws, npro-ss answers a
   request for it with the 101, or refuses it as C does, before the
-  stream hears; one that does not take ws gives the request to the
-  stream like any other.  A message's length is said first, by
-  `request_tx_len()`, as the frame header needs it; whether messages
-  are text or binary is the listener's (`ws_binary`).
+  stream hears, and `ServerUpgrade` names the route; a route that does
+  not take ws gives the request to the stream like any other.  A
+  message's length is said first, by `request_tx_len()`, as the frame
+  header needs it; whether messages are text or binary is the route's
+  (`ws_binary`).
 - **`destroy()`** ends the stream at once, and closes its connection by
   its role's close: an h1 transaction is dropped, ws closes once what
   was sent has gone.  The stream is not told `Disconnected`: it is gone
@@ -313,10 +333,11 @@ differs from the sketch above, and why:
 Not yet, in this half:
 
 - the request's path and headers are not given to a stream whose
-  request became ws: they would have to be copied into the stream's
-  metadata, which comes with routes, where they decide the service;
+  request became ws, beyond its route: they would have to be copied
+  into the stream's metadata;
 - the 101 and the h1 role's own refusal pages carry none of the
-  listener's headers, where C adds the vhost's;
+  vhost's headers, where C adds them; the status page a stream answers
+  with (`Txn::status()`) does;
 - `Txn::header()` gives the first of a header sent more than once,
   where C's `lws_hdr_copy()` joins them;
 - `destroy()` on ws closes with no close frame, where C sends one: the

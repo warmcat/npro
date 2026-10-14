@@ -15,9 +15,10 @@
 //! - [`event`]: what a stream is told, and the handles some events lend;
 //! - [`id`]: the ids streams, connections and listeners are named by.
 //!
-//! So far it is the server's half: listeners, the streams accepted on
-//! them, a request's head in and its response out, and ws taken on as the
-//! listener says.  Client streams come next.
+//! So far it is the server's half: listeners, each with its vhosts and
+//! their routes, the streams accepted on them, a request's head in, routed
+//! to its vhost and route, and its response out, and ws taken on as the
+//! route says.  Client streams come next.
 //!
 //! ```
 //! use npro_core::random::SeededRandom;
@@ -27,7 +28,7 @@
 //! use npro_io::driver::{Buffers, NetBuffers, Want};
 //! use npro_ss::event::{Filled, Kind, Response};
 //! use npro_ss::id::ListenerId;
-//! use npro_ss::policy::{Listener, Tls, Ws};
+//! use npro_ss::policy::{Listener, Match, Route, Tls, Vhost, Ws};
 //! use npro_ss::ss::{ConnStorage, Slot, Ss};
 //!
 //! let listeners = [Listener {
@@ -35,8 +36,18 @@
 //!     bind: "[::]:8080",
 //!     tls: Tls::Plain,
 //!     h1: Config::default(),
-//!     ws: Ws::NotTaken,
-//!     headers: &[(b"x-frame-options", b"deny")],
+//!     vhosts: &[Vhost {
+//!         name: "example.com",
+//!         routes: &[Route {
+//!             path: "/",
+//!             matching: Match::Prefix,
+//!             to: "hello",
+//!             ws: Ws::NotTaken,
+//!             headers: &[],
+//!         }],
+//!         headers: &[(b"x-frame-options", b"deny")],
+//!         not_found: None,
+//!     }],
 //! }];
 //! let storage = || ConnStorage {
 //!     h1: Storage { table: vec![0u8; 1024], out: vec![0u8; 512] },
@@ -60,6 +71,7 @@
 //!     match ev.kind {
 //!         Kind::ServerTxn(mut txn) => {
 //!             assert_eq!(txn.path(), Some(&b"/hello"[..]));
+//!             assert_eq!(txn.route().map(|r| (r.route.to, r.rest)), Some(("hello", &b"hello"[..])));
 //!             txn.respond(Response {
 //!                 status: 200,
 //!                 content_type: Some(b"text/plain"),

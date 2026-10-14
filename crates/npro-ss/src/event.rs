@@ -17,7 +17,7 @@ use npro_io::tls::RecordLayer;
 use npro_ws::conn::Kind as WsKind;
 
 use crate::id::StreamId;
-use crate::policy::Payload;
+use crate::policy::{Listener, Payload, Route, Vhost};
 
 /// Something that happened to a stream.
 #[derive(Debug)]
@@ -39,8 +39,10 @@ pub enum Kind<'a, S, R, T> {
     /// The request became ws, with this subprotocol, C's
     /// `SERVER_UPGRADE`: from here the stream's payload is messages.
     ServerUpgrade {
-        /// The subprotocol agreed, of the listener's.
+        /// The subprotocol agreed, of the route's.
         protocol: &'a [u8],
+        /// The route it was on, whose `to` says what serves it.
+        route: &'a Route<'a>,
     },
     /// The request asked for ws, and was refused as C refuses it: the
     /// connection closes once the refusal has gone.
@@ -87,7 +89,7 @@ pub enum Refusal {
     Dropped,
 }
 
-/// The most headers a response carries, the listener's and the
+/// The most headers a response carries, the vhost's, the route's and the
 /// application's together.
 pub const MAX_HEADERS: usize = 64;
 
@@ -101,9 +103,9 @@ pub struct Response<'a> {
     /// How long its payload is, or `None` for as long as it goes on, which
     /// the connection's close ends.
     pub content_length: Option<u64>,
-    /// The application's own headers, after the listener's.  The ones the
-    /// connection writes itself (its framing, `connection`, `upgrade`) are
-    /// refused.
+    /// The application's own headers, after the vhost's and the route's.
+    /// The ones the connection writes itself (its framing, `connection`,
+    /// `upgrade`) are refused.
     pub headers: &'a [(&'a [u8], &'a [u8])],
 }
 
@@ -112,7 +114,8 @@ pub struct Response<'a> {
 pub enum RespondError {
     /// The stream is gone, or is not one a response is made on.
     Gone,
-    /// More than [`MAX_HEADERS`], the listener's and the application's.
+    /// More than [`MAX_HEADERS`], the vhost's, the route's and the
+    /// application's.
     TooManyHeaders,
     /// As the connection refused it.
     Refused(server::RespondError),
@@ -134,7 +137,26 @@ impl core::error::Error for RespondError {}
 #[derive(Debug)]
 pub struct Txn<'a, S> {
     pub(crate) server: &'a mut Server<S>,
-    pub(crate) headers: &'a [(&'a [u8], &'a [u8])],
+    pub(crate) listener: &'a Listener<'a>,
+    /// The vhost, among the listener's.
+    pub(crate) vhost: usize,
+    /// The route the request's path matched, among the vhost's, and how
+    /// much of the path that was.
+    pub(crate) route: Option<(usize, usize)>,
+    pub(crate) now: Instant,
+}
+
+/// Where a request was routed: [`Txn::route`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Routed<'a> {
+    /// The route, whose `to` says what serves it.
+    pub route: &'a Route<'a>,
+    /// Its place among the vhost's.
+    pub index: usize,
+    /// The rest of the path under the route's, without the `/` between:
+    /// `a/b` for `/x/a/b` on `/x`.  Decoded and made safe as
+    /// [`Txn::path`] is.
+    pub rest: &'a [u8],
 }
 
 /// The request methods, each with the token holding its target.
@@ -152,7 +174,7 @@ const METHODS: [(Token, &[u8]); 8] = [
 /// The longest header name looked up.
 const MAX_NAME: usize = 64;
 
-impl<S: AsRef<[u8]> + AsMut<[u8]>> Txn<'_, S> {
+impl<'a, S: AsRef<[u8]> + AsMut<[u8]>> Txn<'a, S> {
     const fn table(&self) -> &HeaderTable<S> {
         self.server.request()
     }
@@ -175,8 +197,41 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Txn<'_, S> {
     /// its arguments; for `CONNECT`, the authority.
     #[must_use]
     pub fn path(&self) -> Option<&[u8]> {
-        let (t, _) = self.method_token()?;
-        self.table().first(t)
+        request_path(self.table())
+    }
+
+    /// The listener the request came in on.
+    #[must_use]
+    pub const fn listener(&self) -> &'a Listener<'a> {
+        self.listener
+    }
+
+    /// The vhost the request is for: the one its `Host` named, or the
+    /// listener's first.
+    #[must_use]
+    pub fn vhost(&self) -> &'a Vhost<'a> {
+        // checked by Ss::new: a listener has a vhost, and the first is
+        // the fallback
+        self.listener
+            .vhosts
+            .get(self.vhost)
+            .or(self.listener.vhosts.first())
+            .unwrap_or(&NO_VHOST)
+    }
+
+    /// The route the request's path matched, of the vhost's, or `None`
+    /// if none did: C's `lws_find_mount()`.  Then nothing serves it, and
+    /// the stream answers as it chooses, [`Txn::status`] with 404 say.
+    #[must_use]
+    pub fn route(&self) -> Option<Routed<'_>> {
+        let (index, len) = self.route?;
+        let route = self.vhost().routes.get(index)?;
+        let rest = self.path()?.get(len..).unwrap_or_default();
+        Some(Routed {
+            route,
+            index,
+            rest: rest.strip_prefix(b"/").unwrap_or(rest),
+        })
     }
 
     /// The request's arguments, each decoded, in order: the query split at
@@ -205,8 +260,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Txn<'_, S> {
         }
     }
 
-    /// Answers the request: the listener's headers, then the
-    /// application's.  Its payload, if it has any, is the stream's to
+    /// Answers the request: the vhost's headers, then the route's, then
+    /// the application's.  Its payload, if it has any, is the stream's to
     /// give when it is asked ([`Kind::Tx`]), the last of it saying so.
     /// A stream that answers later, once it has the body, say, does so
     /// with [`crate::ss::Ss::respond`].
@@ -215,25 +270,119 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Txn<'_, S> {
     ///
     /// [`RespondError`], and the request is still unanswered.
     pub fn respond(&mut self, r: Response<'_>) -> Result<(), RespondError> {
-        respond(self.server, self.headers, r)
+        respond(self.server, self.own_headers(), r)
+    }
+
+    /// Answers the request with C's status page for `code`, under the
+    /// vhost's and the route's headers, and is done with it: what
+    /// `lws_return_http_status()` answers for a request nothing serves,
+    /// the connection kept for the next.  A HEAD gets the page's head
+    /// alone.  A 404 on a vhost with a [`Vhost::not_found`] document is
+    /// a redirect to it instead, as C's is, unless the request was for
+    /// the document itself.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError`], and the request is still unanswered.
+    pub fn status(&mut self, code: u16) -> Result<(), RespondError> {
+        if code == 404 {
+            if let Some(doc) = self.vhost().not_found {
+                let is_doc = self.path().is_some_and(|p| {
+                    p.strip_prefix(b"/").unwrap_or(p)
+                        == doc.as_bytes().strip_prefix(b"/").unwrap_or(doc.as_bytes())
+                });
+                if !is_doc {
+                    return self.redirect(302, doc.as_bytes());
+                }
+            }
+        }
+        let own = self.own_headers();
+        let mut all: [(&[u8], &[u8]); MAX_HEADERS] = [(&[], &[]); MAX_HEADERS];
+        let n = gather(&mut all, own, &[])?;
+        self.server
+            .status(self.now, code, all.get(..n).unwrap_or_default())
+            .map_err(RespondError::Refused)
+    }
+
+    /// Answers the request with a redirect to `location`, with `code`
+    /// (301, 302, 307, 308), as C's `lws_http_redirect()` composes it,
+    /// under the vhost's and the route's headers, and is done with it.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError`], and the request is still unanswered.
+    pub fn redirect(&mut self, code: u16, location: &[u8]) -> Result<(), RespondError> {
+        let own = self.own_headers();
+        let mut all: [(&[u8], &[u8]); MAX_HEADERS] = [(&[], &[]); MAX_HEADERS];
+        let n = gather(&mut all, own, &[])?;
+        self.server
+            .redirect(self.now, code, location, all.get(..n).unwrap_or_default())
+            .map_err(RespondError::Refused)
+    }
+
+    /// The vhost's headers and the route's.
+    fn own_headers(&self) -> Own<'a> {
+        let vhost = self.vhost();
+        Own {
+            vhost: vhost.headers,
+            route: self
+                .route
+                .and_then(|(i, _)| vhost.routes.get(i))
+                .map_or(&[][..], |r| r.headers),
+        }
     }
 }
 
-/// Answers `server`'s request with `r`, after the listener's `headers`.
+/// A vhost for a listener that has none, which [`crate::ss::Ss::new`]
+/// refuses: never served.
+static NO_VHOST: Vhost<'static> = Vhost {
+    name: "",
+    routes: &[],
+    headers: &[],
+    not_found: None,
+};
+
+/// The headers a response carries before the application's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Own<'a> {
+    pub(crate) vhost: &'a [(&'a [u8], &'a [u8])],
+    pub(crate) route: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// The request's path, as [`Txn::path`] gives it.
+pub(crate) fn request_path<S: AsRef<[u8]> + AsMut<[u8]>>(t: &HeaderTable<S>) -> Option<&[u8]> {
+    let (tok, _) = METHODS.iter().copied().find(|(t_, _)| t.is_present(*t_))?;
+    t.first(tok)
+}
+
+/// Fills `all` with `own`'s headers then `app`'s: how many.
+fn gather<'a>(
+    all: &mut [(&'a [u8], &'a [u8]); MAX_HEADERS],
+    own: Own<'a>,
+    app: &'a [(&'a [u8], &'a [u8])],
+) -> Result<usize, RespondError> {
+    let n = own
+        .vhost
+        .len()
+        .checked_add(own.route.len())
+        .and_then(|n| n.checked_add(app.len()))
+        .filter(|n| *n <= MAX_HEADERS)
+        .ok_or(RespondError::TooManyHeaders)?;
+    let each = own.vhost.iter().chain(own.route).chain(app);
+    for (slot, h) in all.iter_mut().zip(each) {
+        *slot = *h;
+    }
+    Ok(n)
+}
+
+/// Answers `server`'s request with `r`, after its `own` headers.
 pub(crate) fn respond<S: AsRef<[u8]> + AsMut<[u8]>>(
     server: &mut Server<S>,
-    headers: &[(&[u8], &[u8])],
+    own: Own<'_>,
     r: Response<'_>,
 ) -> Result<(), RespondError> {
     let mut all: [(&[u8], &[u8]); MAX_HEADERS] = [(&[], &[]); MAX_HEADERS];
-    let n = headers
-        .len()
-        .checked_add(r.headers.len())
-        .filter(|n| *n <= MAX_HEADERS)
-        .ok_or(RespondError::TooManyHeaders)?;
-    for (slot, h) in all.iter_mut().zip(headers.iter().chain(r.headers)) {
-        *slot = *h;
-    }
+    let n = gather(&mut all, own, r.headers)?;
     server
         .respond(H1Response {
             status: r.status,

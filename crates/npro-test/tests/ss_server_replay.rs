@@ -26,7 +26,7 @@ mod ss_server_replay {
     use npro_io::driver::{Buffers, NetBuffers, Want};
     use npro_ss::event::{End, Filled, Kind, Response, Txn};
     use npro_ss::id::{ConnId, ListenerId};
-    use npro_ss::policy::{Deflate, Listener, Payload, Tls, Ws, WsServer};
+    use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
     use npro_ss::ss::{ConnStorage, Slot, Ss};
     use npro_test::{StepKind, Transcript, vendored};
     use npro_ws::pmd;
@@ -129,11 +129,11 @@ mod ss_server_replay {
                 .with_limit(Token::GetUri, NonZeroU16::new(33).unwrap())
                 .with_limit(Token::UserAgent, NonZeroU16::new(16).unwrap()),
         };
-        Listener {
-            name: "sansio",
-            bind: "unix:/sansio",
-            tls: Tls::Plain,
-            h1: Config::new(h1),
+        // C's apps serve everything on their vhost: one route, over all
+        let routes: &'static [Route<'static>] = vec![Route {
+            path: "/",
+            matching: Match::Prefix,
+            to: "app",
             ws: match is {
                 Is::Sansio => Ws::Taken(WsServer {
                     protocols: &PROTOCOLS,
@@ -144,6 +144,21 @@ mod ss_server_replay {
                 Is::Uri => Ws::NotTaken,
             },
             headers: &[],
+        }]
+        .leak();
+        let vhosts: &'static [Vhost<'static>] = vec![Vhost {
+            name: "sansio",
+            routes,
+            headers: &[],
+            not_found: None,
+        }]
+        .leak();
+        Listener {
+            name: "sansio",
+            bind: "unix:/sansio",
+            tls: Tls::Plain,
+            h1: Config::new(h1),
+            vhosts,
         }
     }
 
@@ -236,8 +251,9 @@ mod ss_server_replay {
                         Then::Nothing
                     }
                 }
-                Kind::ServerUpgrade { protocol } => {
+                Kind::ServerUpgrade { protocol, route } => {
                     assert!(PROTOCOLS.contains(&protocol));
+                    assert_eq!(route.to, "app");
                     Then::Nothing
                 }
                 Kind::UpgradeRefused(_)

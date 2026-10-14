@@ -6,9 +6,9 @@ use npro_core::random::SeededRandom;
 use npro_core::time::Instant;
 use npro_h1::server::Config;
 use npro_io::driver::{Buffers, NetBuffers, Want};
-use npro_ss::event::{End, Filled, Kind, Response};
+use npro_ss::event::{End, Filled, Kind, Response, Txn};
 use npro_ss::id::{ConnId, ListenerId, StreamId};
-use npro_ss::policy::{Deflate, Listener, Payload, Tls, Ws, WsServer};
+use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
 use npro_ss::ss::{AcceptError, CallError, ConnStorage, Slot, Ss};
 
 use crate::targets::{control, finding};
@@ -28,6 +28,63 @@ type S<'s> = Ss<'s, (), Vec<u8>, SeededRandom>;
 
 const PROTOCOLS: [&[u8]; 1] = [b"echo"];
 
+/// The h1 listener's vhosts: `a` serving everything but `/none`, with a
+/// route under it, and `b` serving `/only` alone.
+const H1_VHOSTS: [Vhost<'static>; 2] = [
+    Vhost {
+        name: "a",
+        routes: &[
+            Route {
+                path: "/",
+                matching: Match::Prefix,
+                to: "app",
+                ws: Ws::NotTaken,
+                headers: &[],
+            },
+            Route {
+                path: "/under",
+                matching: Match::Prefix,
+                to: "under",
+                ws: Ws::NotTaken,
+                headers: &[(b"x-route", b"under")],
+            },
+        ],
+        headers: &[(b"x-vhost", b"1")],
+        not_found: None,
+    },
+    Vhost {
+        name: "b",
+        routes: &[Route {
+            path: "/only",
+            matching: Match::Exact,
+            to: "only",
+            ws: Ws::NotTaken,
+            headers: &[],
+        }],
+        headers: &[],
+        not_found: None,
+    },
+];
+
+/// The ws listener's vhost: ws taken on `/`, with permessage-deflate.
+const WS_VHOSTS: [Vhost<'static>; 1] = [Vhost {
+    name: "ws",
+    routes: &[Route {
+        path: "/",
+        matching: Match::Prefix,
+        to: "echo",
+        ws: Ws::Taken(WsServer {
+            protocols: &PROTOCOLS,
+            default: Some(0),
+            payload: Payload::Binary,
+            deflate: Deflate::Offered,
+        }),
+        headers: &[],
+    }],
+    headers: &[],
+    not_found: None,
+}];
+
 fn listeners() -> [Listener<'static>; 2] {
     [
         Listener {
@@ -35,21 +92,14 @@ fn listeners() -> [Listener<'static>; 2] {
             bind: "unix:/h1",
             tls: Tls::Plain,
             h1: Config::default(),
-            ws: Ws::NotTaken,
-            headers: &[(b"x-vhost", b"1")],
+            vhosts: &H1_VHOSTS,
         },
         Listener {
             name: "ws",
             bind: "unix:/ws",
             tls: Tls::Plain,
             h1: Config::default(),
-            ws: Ws::Taken(WsServer {
-                protocols: &PROTOCOLS,
-                default: Some(0),
-                payload: Payload::Binary,
-                deflate: Deflate::Offered,
-            }),
-            headers: &[],
+            vhosts: &WS_VHOSTS,
         },
     ]
 }
@@ -91,6 +141,38 @@ struct Run<'s> {
     accepted: usize,
     /// How the application last chose to answer.
     how: u8,
+}
+
+/// A request routed as the policy says: the route's path leads the
+/// request's, the rest is what is left of it, and on `a`, which serves
+/// everything, nothing goes unrouted.
+fn check_routed(txn: &Txn<'_, Vec<u8>>) {
+    let path = txn.path().unwrap_or_default();
+    match txn.route() {
+        Some(r) => {
+            let under = path.strip_prefix(r.route.path.as_bytes());
+            let rest = under.map(|u| u.strip_prefix(b"/").unwrap_or(u));
+            if rest != Some(r.rest) {
+                finding(
+                    TARGET,
+                    format_args!(
+                        "{} routed to {} with rest {}",
+                        path.escape_ascii(),
+                        r.route.path,
+                        r.rest.escape_ascii()
+                    ),
+                );
+            }
+        }
+        None => {
+            if txn.vhost().name == "a" && path.starts_with(b"/") {
+                finding(
+                    TARGET,
+                    format_args!("{} unrouted on a", path.escape_ascii()),
+                );
+            }
+        }
+    }
 }
 
 /// Takes the next byte of `ops`, or 0 once there are none.
@@ -192,9 +274,14 @@ impl Run<'_> {
             let stream = ev.stream;
             let then = match ev.kind {
                 Kind::ServerTxn(mut txn) => {
-                    let _ = (txn.method(), txn.path(), txn.header(b"host"));
+                    let _ = (txn.method(), txn.header(b"host"));
+                    check_routed(&txn);
                     let length = (how & 2 == 0).then_some(u64::from(how >> 4));
-                    if how & 1 == 0 {
+                    if txn.route().is_none() {
+                        // nothing serves it: C's page, as the stream says
+                        let _ = txn.status(404);
+                        Then::Nothing
+                    } else if how & 1 == 0 {
                         // an answer may be refused, as the role says: the
                         // stream goes on, unanswered
                         let ok = txn

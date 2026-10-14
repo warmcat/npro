@@ -29,9 +29,14 @@ use npro_io::tls::{NoTls, RecordLayer};
 use npro_ws::conn::{self as ws, Ws};
 use npro_ws::handshake::{self, MAX_101};
 
-use crate::event::{End, Event, Kind, Refusal, RespondError, Response, Tx, TxWant, Txn, respond};
+use crate::event::{
+    End, Event, Kind, Own, Refusal, RespondError, Response, Tx, TxWant, Txn, request_path, respond,
+};
 use crate::id::{ConnId, ListenerId, StreamId};
-use crate::policy::{Deflate, Listener, Tls, Ws as WsPolicy, WsServer};
+use crate::policy::{
+    Deflate, Listener, MAX_ROUTES, MAX_VHOSTS, Payload, Route, Tls, Vhost, Ws as WsPolicy,
+    WsServer, find_route, find_vhost,
+};
 
 /// The storage one connection is carried in, given back when it is done
 /// with to carry the next.
@@ -104,10 +109,45 @@ enum Link<S, R, T> {
 struct Live<S, R, T> {
     driver: Driver<S, R, S, T>,
     listener: ListenerId,
+    /// Where its last request was routed, if one was.
+    routed: Option<Routed>,
     /// The h1 role's storage, once a change of role gave it back.
     h1: Spare<npro_h1::Storage<S>>,
     /// tls' buffers, when the connection is not tls.
     net: Spare<NetBuffers<S>>,
+}
+
+/// Where a request was routed, by place in the listener's policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Routed {
+    vhost: usize,
+    /// The route, and how much of the path matched it; `None` if none
+    /// did.
+    route: Option<(usize, usize)>,
+}
+
+impl Routed {
+    /// The vhost, and the route if there was one, of `l`'s.
+    fn in_listener<'p>(
+        self,
+        l: &'p Listener<'p>,
+    ) -> Option<(&'p Vhost<'p>, Option<&'p Route<'p>>)> {
+        let v = l.vhosts.get(self.vhost)?;
+        let r = match self.route {
+            None => None,
+            Some((i, _)) => Some(v.routes.get(i)?),
+        };
+        Some((v, r))
+    }
+
+    /// The headers a response on it carries before the application's.
+    fn own<'p>(self, l: &'p Listener<'p>) -> Option<Own<'p>> {
+        let (v, r) = self.in_listener(l)?;
+        Some(Own {
+            vhost: v.headers,
+            route: r.map_or(&[][..], |r| r.headers),
+        })
+    }
 }
 
 /// Storage a connection may or may not be using.
@@ -131,6 +171,26 @@ pub enum NewError {
         /// Why.
         why: ListenerError,
     },
+    /// A vhost is not as it must be.
+    Vhost {
+        /// Its listener.
+        listener: ListenerId,
+        /// Which, by its place among the listener's.
+        vhost: usize,
+        /// Why.
+        why: VhostError,
+    },
+    /// A route is not as it must be.
+    Route {
+        /// Its listener.
+        listener: ListenerId,
+        /// Its vhost, by its place among the listener's.
+        vhost: usize,
+        /// Which, by its place among the vhost's.
+        route: usize,
+        /// Why.
+        why: RouteError,
+    },
     /// A slot's storage cannot carry a connection.
     Slot {
         /// Which, by its place in the table.
@@ -143,6 +203,30 @@ pub enum NewError {
 /// What is wrong with a listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerError {
+    /// It serves no vhost.
+    NoVhosts,
+    /// It serves more than [`MAX_VHOSTS`].
+    TooManyVhosts,
+}
+
+/// What is wrong with a vhost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VhostError {
+    /// Its name is empty.
+    NoName,
+    /// Another on the listener has its name.
+    Duplicate,
+    /// It has more than [`MAX_ROUTES`].
+    TooManyRoutes,
+}
+
+/// What is wrong with a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteError {
+    /// Its path does not start with `/`.
+    Path,
+    /// Another of the vhost's has its path.
+    Duplicate,
     /// It takes ws with no subprotocols.
     NoProtocols,
     /// Its default subprotocol is not one of them.
@@ -171,6 +255,17 @@ impl core::fmt::Display for NewError {
         match self {
             Self::TooMany => f.write_str("more slots or listeners than ids"),
             Self::Listener { listener, why } => write!(f, "{listener}: {why:?}"),
+            Self::Vhost {
+                listener,
+                vhost,
+                why,
+            } => write!(f, "{listener}, vhost {vhost}: {why:?}"),
+            Self::Route {
+                listener,
+                vhost,
+                route,
+                why,
+            } => write!(f, "{listener}, vhost {vhost}, route {route}: {why:?}"),
             Self::Slot { slot, why } => write!(f, "slot {slot}: {why:?}"),
         }
     }
@@ -255,21 +350,83 @@ pub struct Ss<'s, U, S, R, T = NoTls> {
     ended: Option<usize>,
 }
 
-fn check_listener(l: &Listener<'_>) -> Result<(), ListenerError> {
-    let WsPolicy::Taken(w) = l.ws else {
+fn check_route(r: &Route<'_>, before: &[Route<'_>]) -> Result<(), RouteError> {
+    if !r.path.starts_with('/') {
+        return Err(RouteError::Path);
+    }
+    if before.iter().any(|b| b.path == r.path) {
+        return Err(RouteError::Duplicate);
+    }
+    let WsPolicy::Taken(w) = r.ws else {
         return Ok(());
     };
     if w.protocols.is_empty() {
-        return Err(ListenerError::NoProtocols);
+        return Err(RouteError::NoProtocols);
     }
     if w.default.is_some_and(|d| d >= w.protocols.len()) {
-        return Err(ListenerError::NoSuchDefault);
+        return Err(RouteError::NoSuchDefault);
     }
     match w.deflate {
         Deflate::Off => Ok(()),
         Deflate::Offered if cfg!(feature = "pmd") => Ok(()),
-        Deflate::Offered => Err(ListenerError::DeflateNotBuilt),
+        Deflate::Offered => Err(RouteError::DeflateNotBuilt),
     }
+}
+
+fn check_vhost(v: &Vhost<'_>, before: &[Vhost<'_>]) -> Result<(), VhostError> {
+    if v.name.is_empty() {
+        return Err(VhostError::NoName);
+    }
+    if before.iter().any(|b| b.name.eq_ignore_ascii_case(v.name)) {
+        return Err(VhostError::Duplicate);
+    }
+    if v.routes.len() > MAX_ROUTES {
+        return Err(VhostError::TooManyRoutes);
+    }
+    Ok(())
+}
+
+/// Checks the listener's policy, each error saying where.
+fn check_listener(id: ListenerId, l: &Listener<'_>) -> Result<(), NewError> {
+    let wrong = match l.vhosts.len() {
+        0 => Some(ListenerError::NoVhosts),
+        n if n > MAX_VHOSTS => Some(ListenerError::TooManyVhosts),
+        _ => None,
+    };
+    if let Some(why) = wrong {
+        return Err(NewError::Listener { listener: id, why });
+    }
+    for (vi, v) in l.vhosts.iter().enumerate() {
+        check_vhost(v, l.vhosts.get(..vi).unwrap_or_default()).map_err(|why| NewError::Vhost {
+            listener: id,
+            vhost: vi,
+            why,
+        })?;
+        for (ri, r) in v.routes.iter().enumerate() {
+            check_route(r, v.routes.get(..ri).unwrap_or_default()).map_err(|why| {
+                NewError::Route {
+                    listener: id,
+                    vhost: vi,
+                    route: ri,
+                    why,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether any route of the listener's takes permessage-deflate.
+fn takes_deflate(l: &Listener<'_>) -> bool {
+    l.vhosts.iter().flat_map(|v| v.routes).any(|r| {
+        matches!(
+            r.ws,
+            WsPolicy::Taken(WsServer {
+                deflate: Deflate::Offered,
+                ..
+            })
+        )
+    })
 }
 
 fn check_slot<S: AsRef<[u8]>>(
@@ -316,20 +473,9 @@ where
             return Err(NewError::TooMany);
         }
         for (i, l) in (0..).zip(listeners) {
-            check_listener(l).map_err(|why| NewError::Listener {
-                listener: ListenerId::new(i),
-                why,
-            })?;
+            check_listener(ListenerId::new(i), l)?;
         }
-        let deflate = listeners.iter().any(|l| {
-            matches!(
-                l.ws,
-                WsPolicy::Taken(WsServer {
-                    deflate: Deflate::Offered,
-                    ..
-                })
-            )
-        });
+        let deflate = listeners.iter().any(takes_deflate);
         let tls = listeners
             .iter()
             .any(|l| matches!(l.tls, Tls::Server { .. }));
@@ -402,6 +548,7 @@ where
         slot.conn = Link::Live(Live {
             driver,
             listener,
+            routed: None,
             h1: Spare::InUse,
             net,
         });
@@ -615,10 +762,14 @@ where
         let l = listeners
             .get(usize::try_from(live.listener.index()).unwrap_or(usize::MAX))
             .ok_or(RespondError::Gone)?;
+        let own = live
+            .routed
+            .and_then(|at| at.own(l))
+            .ok_or(RespondError::Gone)?;
         let RoleMut::H1Server(server) = live.driver.conn().role_mut() else {
             return Err(RespondError::Gone);
         };
-        respond(server, l.headers, r)
+        respond(server, own, r)
     }
 
     /// The stream has payload to write: once its connection can take it,
@@ -709,6 +860,7 @@ where
             let Live {
                 driver,
                 listener,
+                routed,
                 h1,
                 ..
             } = live;
@@ -718,16 +870,20 @@ where
             };
             // the chance to write, if it asked and can
             if *tx != TxWant::Idle && driver.is_writable() {
+                let payload = routed
+                    .and_then(|r| r.in_listener(l))
+                    .and_then(|(_, r)| r)
+                    .map_or(Payload::Binary, |r| match r.ws {
+                        WsPolicy::Taken(w) => w.payload,
+                        WsPolicy::NotTaken => Payload::Binary,
+                    });
                 return Some(Event {
                     stream: id,
                     user,
                     kind: Kind::Tx(Tx {
                         driver,
                         want: tx,
-                        payload: match l.ws {
-                            WsPolicy::Taken(w) => w.payload,
-                            WsPolicy::NotTaken => crate::policy::Payload::Binary,
-                        },
+                        payload,
                         now,
                     }),
                 });
@@ -738,7 +894,7 @@ where
                 return Some(Event {
                     stream: id,
                     user,
-                    kind: told(event, role, l, h1, now),
+                    kind: told(event, role, l, routed, h1, now),
                 });
             }
         }
@@ -807,6 +963,7 @@ fn told<'a, S, R, T>(
     event: ConnEvent<'a>,
     conn: &'a mut Conn<S, R>,
     l: &'a Listener<'a>,
+    routed: &mut Option<Routed>,
     h1: &mut Spare<npro_h1::Storage<S>>,
     now: Instant,
 ) -> Kind<'a, S, R, T>
@@ -815,7 +972,7 @@ where
     R: Random,
 {
     match event {
-        ConnEvent::H1Server(server::Event::Request) => request(conn, l, h1, now),
+        ConnEvent::H1Server(server::Event::Request) => request(conn, l, routed, h1, now),
         ConnEvent::H1Server(server::Event::Body(data))
         | ConnEvent::H1Client(npro_h1::client::Event::Body(data))
         | ConnEvent::Raw(npro_io::raw::Event::Data(data)) => Kind::Rx {
@@ -847,11 +1004,13 @@ where
     }
 }
 
-/// A request's head is in: one asking for ws on a listener that takes it
-/// is answered here, any other is the stream's.
+/// A request's head is in: it is routed, to the vhost its `Host` names
+/// and the route its path matches; one asking for ws on a route that
+/// takes it is answered here, any other is the stream's.
 fn request<'a, S, R, T>(
     conn: &'a mut Conn<S, R>,
     l: &'a Listener<'a>,
+    routed: &mut Option<Routed>,
     spare: &mut Spare<npro_h1::Storage<S>>,
     now: Instant,
 ) -> Kind<'a, S, R, T>
@@ -859,27 +1018,43 @@ where
     S: AsRef<[u8]> + AsMut<[u8]>,
     R: Random,
 {
-    // what the request is decided first, from a look at it: the role is
-    // borrowed to answer only once the answer is known
-    let taken = match (conn.role(), l.ws) {
-        (Role::H1Server(server), WsPolicy::Taken(w)) if asks_for_ws(server) => Some(w),
-        (
-            Role::H1Server(_)
-            | Role::H1Client(_)
-            | Role::WsServer(_)
-            | Role::WsClient(_)
-            | Role::Raw(_),
-            WsPolicy::Taken(_) | WsPolicy::NotTaken,
-        ) => None,
-    };
-    let Some(w) = taken else {
-        let RoleMut::H1Server(server) = conn.role_mut() else {
+    // where it goes, and what it is, decided first from a look at it: the
+    // role is borrowed to answer only once the answer is known
+    let (at, taken) = match conn.role() {
+        Role::H1Server(server) => {
+            let t = server.request();
+            let vhost = find_vhost(l.vhosts, t.first(Token::Host)).unwrap_or(0);
+            let path = request_path(t).unwrap_or_default();
+            let found = l.vhosts.get(vhost).and_then(|v| find_route(v.routes, path));
+            let at = Routed {
+                vhost,
+                route: found.map(|(i, rest)| (i, path.len().saturating_sub(rest.len()))),
+            };
+            let taken = match at.in_listener(l).and_then(|(_, on)| on) {
+                Some(on) if asks_for_ws(server) => match on.ws {
+                    WsPolicy::Taken(w) => Some((on, w)),
+                    WsPolicy::NotTaken => None,
+                },
+                Some(_) | None => None,
+            };
+            (at, taken)
+        }
+        Role::H1Client(_) | Role::WsServer(_) | Role::WsClient(_) | Role::Raw(_) => {
             // never so: a request comes from an h1 server
+            return Kind::PeerClose { code: None };
+        }
+    };
+    *routed = Some(at);
+    let Some((route, w)) = taken else {
+        let RoleMut::H1Server(server) = conn.role_mut() else {
             return Kind::PeerClose { code: None };
         };
         return Kind::ServerTxn(Txn {
             server,
-            headers: l.headers,
+            listener: l,
+            vhost: at.vhost,
+            route: at.route,
+            now,
         });
     };
     let RoleMut::H1Server(server) = conn.role_mut() else {
@@ -887,12 +1062,12 @@ where
     };
     let (ws, protocol) = match handshake(server, &w, now) {
         Ok(agreed) => agreed,
-        Err(r) => return Kind::UpgradeRefused(r),
+        Err(refusal) => return Kind::UpgradeRefused(refusal),
     };
     match conn.accept_ws(ws) {
         Ok(storage) => {
             *spare = Spare::Idle(storage);
-            Kind::ServerUpgrade { protocol }
+            Kind::ServerUpgrade { protocol, route }
         }
         // never so: the request was just found awaiting its answer
         Err(_) => Kind::UpgradeRefused(Refusal::Dropped),
@@ -1007,14 +1182,29 @@ mod tests {
 
     const ECHO: [&[u8]; 2] = [b"chat", b"echo"];
 
+    /// One vhost, one route serving everything, taking ws as `ws` says.
     fn listener(ws: WsPolicy<'static>) -> Listener<'static> {
+        let routes: &'static [Route<'static>] = alloc::vec![Route {
+            path: "/",
+            matching: crate::policy::Match::Prefix,
+            to: "app",
+            ws,
+            headers: &[],
+        }]
+        .leak();
+        let vhosts: &'static [Vhost<'static>] = alloc::vec![Vhost {
+            name: "test",
+            routes,
+            headers: &[(b"x-vhost", b"1")],
+            not_found: None,
+        }]
+        .leak();
         Listener {
             name: "test",
             bind: "unix:/test",
             tls: Tls::Plain,
             h1: server::Config::default(),
-            ws,
-            headers: &[(b"x-vhost", b"1")],
+            vhosts,
         }
     }
 
@@ -1050,7 +1240,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Seen {
         Txn(StreamId, Vec<u8>),
-        Upgrade(Vec<u8>),
+        /// The subprotocol, and the route's `to`.
+        Upgrade(Vec<u8>, alloc::string::String),
         Refused(Refusal),
         Rx(Vec<u8>, End),
         Tx,
@@ -1081,7 +1272,9 @@ mod tests {
                     }
                     Seen::Txn(stream, path)
                 }
-                Kind::ServerUpgrade { protocol } => Seen::Upgrade(protocol.to_vec()),
+                Kind::ServerUpgrade { protocol, route } => {
+                    Seen::Upgrade(protocol.to_vec(), route.to.into())
+                }
                 Kind::UpgradeRefused(r) => Seen::Refused(r),
                 Kind::Rx { data, end } => Seen::Rx(data.to_vec(), end),
                 Kind::Tx(t) => {
@@ -1226,11 +1419,192 @@ mod tests {
         assert_eq!(serve(&mut ss, true), []);
     }
 
+    const ROUTES: [Route<'static>; 3] = [
+        Route {
+            path: "/",
+            matching: crate::policy::Match::Prefix,
+            to: "files",
+            ws: WsPolicy::NotTaken,
+            headers: &[],
+        },
+        Route {
+            path: "/sai",
+            matching: crate::policy::Match::Prefix,
+            to: "proxy",
+            ws: WsPolicy::NotTaken,
+            headers: &[(b"x-route", b"sai")],
+        },
+        Route {
+            path: "/chat",
+            matching: crate::policy::Match::Exact,
+            to: "echo",
+            ws: WsPolicy::Taken(WsServer {
+                protocols: &ECHO,
+                default: None,
+                payload: Payload::Text,
+                deflate: Deflate::Off,
+            }),
+            headers: &[],
+        },
+    ];
+
+    /// Two vhosts: `a` with [`ROUTES`], `b` with none.
+    fn two_vhosts() -> Listener<'static> {
+        const VHOSTS: [Vhost<'static>; 2] = [
+            Vhost {
+                name: "a",
+                routes: &ROUTES,
+                headers: &[(b"x-vhost", b"a")],
+                not_found: None,
+            },
+            Vhost {
+                name: "b",
+                routes: &[],
+                headers: &[(b"x-vhost", b"b")],
+                not_found: Some("/404.html"),
+            },
+        ];
+        Listener {
+            vhosts: &VHOSTS,
+            ..listener(WsPolicy::NotTaken)
+        }
+    }
+
+    #[test]
+    fn a_request_is_routed_by_host_and_path_and_answered_under_their_headers() {
+        let ls = [two_vhosts()];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        read(
+            &mut ss,
+            conn,
+            b"GET /sai/x/y HTTP/1.1\r\nHost: A:8080\r\n\r\n\
+              GET /nothing HTTP/1.1\r\nHost: b\r\n\r\n\
+              GET /sai HTTP/1.1\r\nHost: other\r\n\r\n\
+              GET /404.html HTTP/1.1\r\nHost: b\r\n\r\n",
+        );
+        let mut n = 0u32;
+        let mut out = Vec::new();
+        // each request's answer goes before the next is taken
+        for _ in 0..100 {
+            if n == 4 {
+                break;
+            }
+            let Some(ev) = ss.poll_event(T0) else {
+                out.extend(written(&mut ss, conn));
+                continue;
+            };
+            let stream = ev.stream;
+            let mut t = match ev.kind {
+                Kind::ServerTxn(t) => t,
+                Kind::Tx(tx) => {
+                    // the empty answer's end, as C's EOM says it
+                    tx.fill(|_| Filled::Last(0));
+                    continue;
+                }
+                Kind::ServerUpgrade { .. }
+                | Kind::UpgradeRefused(_)
+                | Kind::Rx { .. }
+                | Kind::Pong
+                | Kind::PeerClose { .. }
+                | Kind::Disconnected => continue,
+            };
+            match n {
+                0 => {
+                    assert_eq!(t.vhost().name, "a");
+                    let r = t.route().unwrap();
+                    assert_eq!((r.index, r.route.to, r.rest), (1, "proxy", &b"x/y"[..]));
+                    t.respond(Response {
+                        status: 200,
+                        content_type: None,
+                        content_length: Some(0),
+                        headers: &[(b"x-app", b"1")],
+                    })
+                    .unwrap();
+                    ss.request_tx(stream).unwrap();
+                }
+                1 => {
+                    // b has no routes: nothing serves it, and the stream
+                    // says so, which with b's 404 document is a redirect
+                    // to it, the connection kept
+                    assert_eq!(t.vhost().name, "b");
+                    assert_eq!(t.route(), None);
+                    t.status(404).unwrap();
+                }
+                2 => {
+                    // a Host naming no vhost is the first's
+                    assert_eq!(t.vhost().name, "a");
+                    let r = t.route().unwrap();
+                    assert_eq!((r.index, r.rest), (1, &b""[..]));
+                    t.status(403).unwrap();
+                }
+                _ => {
+                    // the document itself, not found, gets the page
+                    assert_eq!(t.vhost().name, "b");
+                    t.status(404).unwrap();
+                }
+            }
+            n = n.checked_add(1).unwrap();
+        }
+        assert_eq!(n, 4);
+        out.extend(written(&mut ss, conn));
+        let text = alloc::string::String::from_utf8_lossy(&out);
+        let mut answers = text.split("HTTP/1.1 ").filter(|a| !a.is_empty());
+        assert_eq!(
+            answers.next(),
+            Some("200 OK\r\ncontent-length: 0\r\nx-vhost: a\r\nx-route: sai\r\nx-app: 1\r\n\r\n")
+        );
+        assert_eq!(
+            answers.next(),
+            Some(
+                "302 Redirect\r\nlocation: /404.html\r\ncontent-type: text/html\r\n\
+                 content-length: 0\r\nx-vhost: b\r\n\r\n"
+            )
+        );
+        assert!(answers.next().unwrap().starts_with(
+            "403 Forbidden\r\ncontent-type: text/html\r\nx-vhost: a\r\nx-route: sai\r\n\
+             content-length: 173\r\n"
+        ));
+        let not_found = answers.next().unwrap();
+        assert!(not_found.starts_with("404 Not Found\r\ncontent-type: text/html\r\n"));
+        assert!(not_found.ends_with("<h1>404</h1></body></html>"));
+        assert_eq!(answers.next(), None);
+    }
+
+    #[test]
+    fn ws_is_taken_on_the_route_that_takes_it_and_on_no_other() {
+        let ls = [two_vhosts()];
+        let mut sl = slots(2);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let a = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        read(&mut ss, a, UPGRADE);
+        assert_eq!(
+            serve(&mut ss, true),
+            [Seen::Upgrade(b"echo".to_vec(), "echo".into())]
+        );
+        // the same request under /sai is the proxy's to answer
+        let b = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let under_sai =
+            alloc::string::String::from_utf8_lossy(UPGRADE).replace("/chat", "/sai/chat");
+        read(&mut ss, b, under_sai.as_bytes());
+        assert!(matches!(
+            serve(&mut ss, true).first(),
+            Some(Seen::Txn(_, p)) if p == b"/sai/chat"
+        ));
+    }
+
     #[test]
     fn the_listeners_headers_go_first_and_together_are_bounded() {
         let many = [(&b"x-a"[..], &b"1"[..]); MAX_HEADERS];
-        let ls = [Listener {
+        let vhosts = [Vhost {
+            name: "test",
+            routes: &ROUTES,
             headers: &many,
+            not_found: None,
+        }];
+        let ls = [Listener {
+            vhosts: &vhosts,
             ..listener(WsPolicy::NotTaken)
         }];
         let mut sl = slots(1);
@@ -1276,7 +1650,10 @@ mod tests {
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
         read(&mut ss, conn, UPGRADE);
-        assert_eq!(serve(&mut ss, true), [Seen::Upgrade(b"echo".to_vec())]);
+        assert_eq!(
+            serve(&mut ss, true),
+            [Seen::Upgrade(b"echo".to_vec(), "app".into())]
+        );
         let first = written(&mut ss, conn);
         assert!(first.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(first.ends_with(b"Sec-WebSocket-Protocol: echo\r\n\r\n"));
@@ -1349,27 +1726,115 @@ mod tests {
     }
 
     #[test]
-    fn the_policy_and_the_storage_are_checked() {
+    fn the_policy_is_checked() {
         let no_protocols = WsPolicy::Taken(WsServer {
             protocols: &[],
             default: None,
             payload: Payload::Text,
             deflate: Deflate::Off,
         });
-        for (l, why) in [
-            (listener(no_protocols), ListenerError::NoProtocols),
-            (listener(ws(Some(2))), ListenerError::NoSuchDefault),
+        let at = |why| NewError::Route {
+            listener: ListenerId::new(0),
+            vhost: 0,
+            route: 0,
+            why,
+        };
+        for (l, want) in [
+            (listener(no_protocols), at(RouteError::NoProtocols)),
+            (listener(ws(Some(2))), at(RouteError::NoSuchDefault)),
+            (
+                Listener {
+                    vhosts: &[],
+                    ..listener(WsPolicy::NotTaken)
+                },
+                NewError::Listener {
+                    listener: ListenerId::new(0),
+                    why: ListenerError::NoVhosts,
+                },
+            ),
         ] {
             let ls = [l];
             let mut sl = slots(1);
+            assert_eq!(Ss::new(&ls, &mut sl).err(), Some(want));
+        }
+        let no_name = [Vhost {
+            name: "",
+            routes: &[],
+            headers: &[],
+            not_found: None,
+        }];
+        let twice = [
+            Vhost {
+                name: "a",
+                routes: &[],
+                headers: &[],
+                not_found: None,
+            },
+            Vhost {
+                name: "A",
+                routes: &[],
+                headers: &[],
+                not_found: None,
+            },
+        ];
+        for (vhosts, vhost, why) in [
+            (&no_name[..], 0, VhostError::NoName),
+            (&twice[..], 1, VhostError::Duplicate),
+        ] {
+            let ls = [Listener {
+                vhosts,
+                ..listener(WsPolicy::NotTaken)
+            }];
+            let mut sl = slots(1);
             assert_eq!(
                 Ss::new(&ls, &mut sl).err(),
-                Some(NewError::Listener {
+                Some(NewError::Vhost {
                     listener: ListenerId::new(0),
+                    vhost,
                     why
                 })
             );
         }
+        let no_slash = [Route {
+            path: "x",
+            ..ROUTES[0]
+        }];
+        let same_path = [ROUTES[0], ROUTES[1], ROUTES[1]];
+        for (routes, route, why) in [
+            (&no_slash[..], 0, RouteError::Path),
+            (&same_path[..], 2, RouteError::Duplicate),
+        ] {
+            let vhosts = [Vhost {
+                name: "a",
+                routes,
+                headers: &[],
+                not_found: None,
+            }];
+            let ls = [Listener {
+                vhosts: &vhosts,
+                ..listener(WsPolicy::NotTaken)
+            }];
+            let mut sl = slots(1);
+            assert_eq!(
+                Ss::new(&ls, &mut sl).err(),
+                Some(NewError::Route {
+                    listener: ListenerId::new(0),
+                    vhost: 0,
+                    route,
+                    why
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_storage_is_checked() {
+        let at = |why| NewError::Route {
+            listener: ListenerId::new(0),
+            vhost: 0,
+            route: 0,
+            why,
+        };
         let ls = [listener(WsPolicy::NotTaken)];
         let mut small: Slots = vec![Slot::new(storage(64, 0))];
         assert_eq!(
@@ -1407,10 +1872,7 @@ mod tests {
                 why: SlotError::Inflate,
             }
         } else {
-            NewError::Listener {
-                listener: ListenerId::new(0),
-                why: ListenerError::DeflateNotBuilt,
-            }
+            at(RouteError::DeflateNotBuilt)
         };
         assert_eq!(Ss::new(&deflate, &mut for_deflate).err(), Some(want));
     }

@@ -24,7 +24,7 @@ mod runner {
     use npro_io::threads::Stop;
     use npro_ss::event::{Filled, Kind, Response};
     use npro_ss::id::ListenerId;
-    use npro_ss::policy::{Listener, Tls, Ws};
+    use npro_ss::policy::{Listener, Match, Route, Tls, Vhost, Ws};
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -63,14 +63,26 @@ mod runner {
         (leak(cert), leak(key))
     }
 
+    const VHOSTS: [Vhost<'static>; 1] = [Vhost {
+        name: "localhost",
+        routes: &[Route {
+            path: "/",
+            matching: Match::Prefix,
+            to: "app",
+            ws: Ws::NotTaken,
+            headers: &[],
+        }],
+        headers: &[(b"x-runner", b"1")],
+        not_found: None,
+    }];
+
     fn listener(name: &'static str, tls: Tls<'static>) -> Listener<'static> {
         Listener {
             name,
             bind: "127.0.0.1:0",
             tls,
             h1: Config::default(),
-            ws: Ws::NotTaken,
-            headers: &[(b"x-runner", b"1")],
+            vhosts: &VHOSTS,
         }
     }
 
