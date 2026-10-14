@@ -133,7 +133,7 @@ struct Mark {
 /// use npro_h1::table::HeaderTable;
 /// use npro_h1::token::Token;
 ///
-/// let mut t = HeaderTable::new([0u8; 256])?;
+/// let mut t = HeaderTable::new([0u8; 256]).map_err(|(e, _)| e)?;
 /// t.create(Token::ClientUri, b"/x")?;
 /// assert_eq!(t.first(Token::ClientUri), Some(&b"/x"[..]));
 /// assert!(!t.is_present(Token::Host));
@@ -156,12 +156,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> HeaderTable<S> {
     ///
     /// # Errors
     ///
-    /// [`CapacityTooLarge`] if `data` is longer than [`MAX_CAPACITY`].
-    pub fn new(data: S) -> Result<Self, CapacityTooLarge> {
-        if data.as_ref().len() > MAX_CAPACITY {
-            return Err(CapacityTooLarge);
+    /// [`CapacityTooLarge`] if `data` is longer than [`MAX_CAPACITY`],
+    /// with `data` given back.
+    pub fn new(data: S) -> Result<Self, (CapacityTooLarge, S)> {
+        let Ok(capacity) = u16::try_from(data.as_ref().len()) else {
+            return Err((CapacityTooLarge, data));
+        };
+        if usize::from(capacity) > MAX_CAPACITY {
+            return Err((CapacityTooLarge, data));
         }
-        let capacity = u16::try_from(data.as_ref().len()).map_err(|_| CapacityTooLarge)?;
         Ok(Self {
             data,
             capacity,
@@ -737,10 +740,9 @@ mod tests {
     #[test]
     fn storage_past_the_cap_is_refused() {
         assert!(HeaderTable::new(vec![0u8; MAX_CAPACITY]).is_ok());
-        assert_eq!(
-            HeaderTable::new(vec![0u8; MAX_CAPACITY + 1]).err(),
-            Some(CapacityTooLarge)
-        );
+        let (e, back) = HeaderTable::new(vec![0u8; MAX_CAPACITY + 1]).unwrap_err();
+        assert_eq!(e, CapacityTooLarge);
+        assert_eq!(back.len(), MAX_CAPACITY + 1);
     }
 
     #[test]

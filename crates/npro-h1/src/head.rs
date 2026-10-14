@@ -409,7 +409,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Head<S> {
     ///
     /// [`CapacityTooLarge`] if `storage` is past the most a table holds.
     pub fn new(storage: S, side: Side, config: Config) -> Result<Self, CapacityTooLarge> {
-        Ok(Self::with_table(HeaderTable::new(storage)?, side, config))
+        Ok(Self::with_table(
+            HeaderTable::new(storage).map_err(|(e, _)| e)?,
+            side,
+            config,
+        ))
     }
 
     /// A head to parse into `table`, after what it holds: how a client

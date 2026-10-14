@@ -555,6 +555,24 @@ impl core::fmt::Display for NewError {
 
 impl core::error::Error for NewError {}
 
+/// A request refused by [`Client::new`], with the storage it was to be
+/// made in given back, so a caller's slot keeps it.
+#[derive(Debug)]
+pub struct RequestRefused<S> {
+    /// Why.
+    pub why: NewError,
+    /// The storage, as it was given.
+    pub storage: Storage<S>,
+}
+
+impl<S> core::fmt::Display for RequestRefused<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.why)
+    }
+}
+
+impl<S: core::fmt::Debug> core::error::Error for RequestRefused<S> {}
+
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     /// A connection to make `req`, keeping it and its response in
     /// `storage`'s table, as C keeps a client's request in the ah it
@@ -562,15 +580,46 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Client<S> {
     ///
     /// # Errors
     ///
-    /// [`NewError`] if the storage is too large, the request does not fit,
-    /// or one of its headers is refused.
-    pub fn new(storage: Storage<S>, req: Request<'_>) -> Result<Self, NewError> {
-        let (asked, up) = prepared(&req)?;
-        let mut own = Own::new(storage.out);
-        own.compose(|o| request_head(o, &req))
-            .map_err(NewError::Head)?;
-        let mut t = HeaderTable::new(storage.table).map_err(NewError::Capacity)?;
-        tabled(&mut t, &req)?;
+    /// [`RequestRefused`] if the storage is too large, the request does
+    /// not fit, or one of its headers is refused: the storage comes back
+    /// with it.
+    pub fn new(storage: Storage<S>, req: Request<'_>) -> Result<Self, RequestRefused<S>> {
+        let (asked, up) = match prepared(&req) {
+            Ok(p) => p,
+            Err(why) => return Err(RequestRefused { why, storage }),
+        };
+        let Storage { table, out } = storage;
+        let mut own = Own::new(out);
+        if let Err(e) = own.compose(|o| request_head(o, &req)) {
+            return Err(RequestRefused {
+                why: NewError::Head(e),
+                storage: Storage {
+                    table,
+                    out: own.into_storage(),
+                },
+            });
+        }
+        let mut t = match HeaderTable::new(table) {
+            Ok(t) => t,
+            Err((e, table)) => {
+                return Err(RequestRefused {
+                    why: NewError::Capacity(e),
+                    storage: Storage {
+                        table,
+                        out: own.into_storage(),
+                    },
+                });
+            }
+        };
+        if let Err(why) = tabled(&mut t, &req) {
+            return Err(RequestRefused {
+                why,
+                storage: Storage {
+                    table: t.into_storage(),
+                    out: own.into_storage(),
+                },
+            });
+        }
         Ok(Self {
             head: Head::with_table(t, Side::Client, head::Config::new()),
             asked,
@@ -1538,8 +1587,13 @@ mod tests {
         assert_eq!(&body[..n], b"abc");
     }
 
+    /// Why a request was refused, the storage let go.
+    fn why<S>(r: Result<Client<S>, RequestRefused<S>>) -> Result<Client<S>, NewError> {
+        r.map_err(|r| r.why)
+    }
+
     fn with_headers(headers: &[(&[u8], &[u8])]) -> Result<Client<[u8; 1024]>, NewError> {
-        Client::new(
+        why(Client::new(
             Storage {
                 table: [0u8; 1024],
                 out: [0u8; 1024],
@@ -1555,7 +1609,7 @@ mod tests {
                 headers,
                 body: RequestBody::None,
             },
-        )
+        ))
     }
 
     #[test]
@@ -1863,7 +1917,10 @@ mod tests {
                 body: RequestBody::Chunked,
             },
         );
-        assert_eq!(r.err(), Some(NewError::UpgradeWithBody));
+        let refused = r.unwrap_err();
+        assert_eq!(refused.why, NewError::UpgradeWithBody);
+        // the storage comes back, untouched
+        assert_eq!(refused.storage.table.len(), 1024);
     }
 
     #[test]

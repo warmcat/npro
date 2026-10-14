@@ -58,7 +58,7 @@ fn parsed(h: &Head<Vec<u8>>, verdict: Result<Progress, Refused>) -> Parsed {
 
 fn head(target: &str, side: Side, cap: usize, config: Config) -> Head<Vec<u8>> {
     let mut table = HeaderTable::new(vec![0u8; cap])
-        .unwrap_or_else(|e| finding(target, format_args!("a table of {cap}: {e}")));
+        .unwrap_or_else(|(e, _)| finding(target, format_args!("a table of {cap}: {e}")));
     if side == Side::Client {
         // a client's table holds its own request first
         for (t, v) in [(Token::ClientUri, &b"/x"[..]), (Token::ClientHost, b"h")] {
