@@ -333,7 +333,8 @@ pub fn proxy(data: &[u8]) {
     }
     // a client that went before its answer (one that stopped short of
     // its upload, say) got none; one still there must have one
-    if taken > 0 && !client_gone && !out.starts_with(b"HTTP/1.1 ") {
+    // answered in the version the request asked in
+    if taken > 0 && !client_gone && !out.starts_with(b"HTTP/1.") {
         finding(
             TARGET,
             format_args!("a request taken on, {} bytes answered", out.len()),

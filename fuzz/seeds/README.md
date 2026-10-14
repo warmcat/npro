@@ -55,7 +55,8 @@ The protocol crates' targets start from the C library's corpora
   cookie answered with a length, a POST's body passed on, an answer
   with no length, a connect that fails, an origin gone mid-head, a
   chunked upload refused, and a HEAD answered with cookies and a
-  location.
+  location; `regress-http10` is an HTTP/1.0 request, whose answer the
+  harness once expected in HTTP/1.1.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer
