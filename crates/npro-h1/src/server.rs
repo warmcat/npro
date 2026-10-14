@@ -912,6 +912,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             return Err(RespondError::NotNow);
         }
         let version = self.version;
+        // a 1xx, 204 or 304 has no payload, whatever its length says
+        // (RFC 9110 6.4.1), as a HEAD's answer has none
+        let bodiless = matches!(r.status, 100..=199 | 204 | 304);
         self.own.compose(|own| {
             status_line(own, version, r.status)?;
             if let Some(ct) = r.content_type {
@@ -923,18 +926,17 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 own.push(b"content-length: ")?;
                 own.push_u64(n)?;
                 own.push(b"\r\n")?;
-            } else {
+            } else if !bodiless {
                 // there is no length: the connection's close ends it
                 own.push(b"connection: close\r\n")?;
             }
             own.push_headers(r.headers, &RESERVED)?;
             own.push(b"\r\n")
         })?;
-        if r.content_length.is_none() {
+        if r.content_length.is_none() && !bodiless {
             t.keep_alive = false;
         }
-        // a HEAD's answer has no payload, whatever its length says
-        t.reply = Reply::Payload(if t.head_request {
+        t.reply = Reply::Payload(if t.head_request || bodiless {
             Some(0)
         } else {
             r.content_length
@@ -1410,6 +1412,30 @@ mod tests {
             Err(RespondError::Header(_))
         ));
         assert!(other.is_awaiting_answer());
+    }
+
+    #[test]
+    fn a_304_has_no_payload_and_keeps_the_connection() {
+        let mut s = server_out(MIN_OUT);
+        s.respond(Response {
+            status: 304,
+            content_type: None,
+            content_length: None,
+            headers: &[(b"etag", b"\"x\"")],
+        })
+        .unwrap();
+        let mut out = [0u8; 256];
+        let tx = s.tx(T0, &mut out, &mut Nothing);
+        assert_eq!(
+            &out[..tx.written],
+            b"HTTP/1.1 304 Not Modified\r\netag: \"x\"\r\n\r\n"
+        );
+        s.complete(T0);
+        assert!(s.close().is_none());
+        assert_eq!(
+            s.rx(T0, b"GET /n HTTP/1.1\r\n\r\n").event,
+            Some(Event::Request)
+        );
     }
 
     #[test]
