@@ -665,9 +665,57 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                 return Err(RespondError::NotNow);
             }
         }
+        let one;
+        let headers: &[(&[u8], &[u8])] = match extra {
+            Some(h) => {
+                one = [h];
+                &one
+            }
+            None => &[],
+        };
         self.own
-            .compose(|o| status_page(o, self.version, code, b"", extra))?;
+            .compose(|o| status_page(o, self.version, code, b"", headers, Page::Whole))?;
         self.refusing(now);
+        Ok(())
+    }
+
+    /// Answers the request in hand with C's status page for `code`, as
+    /// `lws_return_http_status()` does, `headers` after its own, and is
+    /// done with the transaction at `now`, as [`Server::complete`] is: a
+    /// 404 for what nothing serves, the connection kept for the next
+    /// request.  A HEAD is answered with the page's head alone.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError::NotNow`] if there is no request in hand, or it is
+    /// answered already; [`RespondError::Header`] if one of `headers` is
+    /// refused; [`RespondError::TooLong`] if the page does not fit.  The
+    /// request is then still unanswered.
+    pub fn status(
+        &mut self,
+        now: Instant,
+        code: u16,
+        headers: &[(&[u8], &[u8])],
+    ) -> Result<(), RespondError> {
+        let Phase::Request(mut t) = self.phase else {
+            return Err(RespondError::NotNow);
+        };
+        if t.reply != Reply::Awaited {
+            return Err(RespondError::NotNow);
+        }
+        let version = self.version;
+        let page = if t.head_request {
+            Page::HeadOnly
+        } else {
+            Page::Whole
+        };
+        self.own
+            .compose(|o| status_page(o, version, code, b"", headers, page))?;
+        // the page is the connection's own bytes: nothing is owed
+        t.reply = Reply::Payload(Some(0));
+        t.completed = true;
+        self.phase = Phase::Request(t);
+        self.settle(now);
         Ok(())
     }
 
@@ -678,7 +726,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         // if it did not, nothing would be written before the shutdown
         let _ = self
             .own
-            .compose(|o| status_page(o, version, code, text, None));
+            .compose(|o| status_page(o, version, code, text, &[], Page::Whole));
         self.refusing(now);
     }
 
@@ -1086,14 +1134,24 @@ fn status_line<S: AsRef<[u8]> + AsMut<[u8]>>(
     own.push(b"\r\n")
 }
 
+/// How much of a status page is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    /// Its head and its body.
+    Whole,
+    /// Its head alone, saying the body's length: a HEAD's answer.
+    HeadOnly,
+}
+
 /// C's status page: `_lws_return_http_status()` and
-/// `lws_http_status_page_body()`.
+/// `lws_http_status_page_body()`, with `headers` after its own.
 fn status_page<S: AsRef<[u8]> + AsMut<[u8]>>(
     own: &mut Own<S>,
     v: Version,
     code: u16,
     text: &[u8],
-    extra: Option<(&[u8], &[u8])>,
+    headers: &[(&[u8], &[u8])],
+    page: Page,
 ) -> Result<(), RespondError> {
     const PRE: &[u8] = b"<html><head><meta charset=utf-8 http-equiv=\"Content-Language\" \
 content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>\
@@ -1107,15 +1165,14 @@ content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/>
         .ok_or(RespondError::TooLong)?;
     status_line(own, v, code)?;
     own.push(b"content-type: text/html\r\n")?;
-    if let Some((name, value)) = extra {
-        own.push(name)?;
-        own.push(b": ")?;
-        own.push(value)?;
-        own.push(b"\r\n")?;
-    }
+    own.push_headers(headers, &RESERVED)?;
     own.push(b"content-length: ")?;
     own.push_u64(u64::try_from(body_len).map_err(|_| RespondError::TooLong)?)?;
     own.push(b"\r\n\r\n")?;
+    match page {
+        Page::Whole => {}
+        Page::HeadOnly => return Ok(()),
+    }
     own.push(PRE)?;
     own.push(code_text)?;
     own.push(b"</h1>")?;
@@ -1246,6 +1303,46 @@ mod tests {
         let next = s.rx(T0, &rest[3..]);
         assert_eq!(next.event, Some(Event::Request));
         assert_eq!(s.request().first(Token::GetUri), Some(&b"/n"[..]));
+    }
+
+    #[test]
+    fn a_status_page_answers_and_the_connection_is_kept() {
+        let mut s = server_with(
+            MIN_OUT,
+            b"GET /x HTTP/1.1\r\nHost: x\r\n\r\nHEAD /y HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        s.status(T0, 404, &[(b"x-vhost", b"1")]).unwrap();
+        // answered: a second answer is refused
+        assert_eq!(s.status(T0, 404, &[]), Err(RespondError::NotNow));
+        let mut out = [0u8; MIN_OUT];
+        let tx = s.tx(T0, &mut out, &mut Nothing);
+        let page = &out[..tx.written];
+        assert!(
+            page.starts_with(
+                b"HTTP/1.1 404 Not Found\r\ncontent-type: text/html\r\nx-vhost: 1\r\n\
+                content-length: 173\r\n\r\n<html>"
+            ),
+            "{}",
+            page.escape_ascii()
+        );
+        assert!(page.ends_with(b"<h1>404</h1></body></html>"));
+        assert!(s.close().is_none());
+        // the pipelined HEAD is next, and gets the head alone
+        assert_eq!(
+            s.rx(T0, b"HEAD /y HTTP/1.1\r\nHost: x\r\n\r\n").event,
+            Some(Event::Request)
+        );
+        s.status(T0, 403, &[]).unwrap();
+        let head = s.tx(T0, &mut out, &mut Nothing);
+        assert!(out[..head.written].ends_with(b"content-length: 173\r\n\r\n"));
+        assert!(s.close().is_none());
+        // a reserved header is refused, and the request still unanswered
+        let mut r = server_out(MIN_OUT);
+        assert!(matches!(
+            r.status(T0, 404, &[(b"content-length", b"0")]),
+            Err(RespondError::Header(_))
+        ));
+        assert!(r.is_awaiting_answer());
     }
 
     #[test]
@@ -1645,7 +1742,7 @@ mod tests {
             for v in [Version::Http10, Version::Http11] {
                 let mut own = Own::new([0u8; MIN_OUT]);
                 assert_eq!(
-                    own.compose(|o| status_page(o, v, code, text, None)),
+                    own.compose(|o| status_page(o, v, code, text, &[], Page::Whole)),
                     Ok(()),
                     "{code}"
                 );
