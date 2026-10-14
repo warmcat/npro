@@ -26,7 +26,11 @@
 //!   a worker thread does it, and what it came to is applied to the host
 //!   under the lock, followed by the application's turn, as C's
 //!   `LWS_WITH_ASYNC_QUEUE` takes the file server's reads off the service
-//!   thread.
+//!   thread;
+//! - **connects** the host asks for ([`Host::next_connect`]) are made by
+//!   a thread each, since std's connect blocks, resolving a name with the
+//!   platform's resolver on the way; a connection made gets its reader
+//!   and writer as an accepted one does.
 //!
 //! Time is std's monotonic clock, as [`Clock`] gives it.  tls is the
 //! host's: the adapter makes each connection's record layer as `tls`
@@ -34,7 +38,9 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -385,6 +391,30 @@ impl<'a, H: Host, A: FnMut(&mut H, Instant, &Jobs<'a, H>)> Shared<'a, H, A> {
     }
 }
 
+/// What makes a connection's tls, for [`serve`]: a listener's, given
+/// the listener, and an outbound connection's, given the server name.
+/// A closure from a listener makes only the first, and refuses every
+/// connect that asks for tls.
+pub trait Makes<H: Host> {
+    /// The record layer for a connection accepted on `listener`, or
+    /// `None` for a plain listener.
+    fn for_listener(&self, listener: H::Listener) -> Option<H::Tls>;
+
+    /// The record layer for a connection made to `server_name`, or
+    /// `None` if it cannot be made, which fails the connect.
+    fn for_connect(&self, server_name: &str) -> Option<H::Tls>;
+}
+
+impl<H: Host, F: Fn(H::Listener) -> Option<H::Tls>> Makes<H> for F {
+    fn for_listener(&self, listener: H::Listener) -> Option<H::Tls> {
+        self(listener)
+    }
+
+    fn for_connect(&self, _: &str) -> Option<H::Tls> {
+        None
+    }
+}
+
 /// How many worker threads [`serve`] has for jobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Workers(pub usize);
@@ -401,15 +431,17 @@ impl Default for Workers {
 ///
 /// Each of `listeners` is accepted on, by a thread of its own; each
 /// connection accepted gets its tls from `tls`, given its listener
-/// (`None` for a plain one), and a reader and a writer thread.  After any
-/// of them changed something, `app` is given the host, at that time, to
-/// act on: to loop on the host's events, and answer them.  It runs under
-/// the lock, so it must not block: what would, it gives to the [`Jobs`]
-/// it is given, done by `workers` threads (at least one).
+/// (`None` for a plain one), and a reader and a writer thread; each
+/// connection the host asks for is made by a thread of its own, with
+/// its tls from `tls` too.  After any of them changed something, `app`
+/// is given the host, at that time, to act on: to loop on the host's
+/// events, and answer them.  It runs under the lock, so it must not
+/// block: what would, it gives to the [`Jobs`] it is given, done by
+/// `workers` threads (at least one).
 pub fn serve<'a, H, A, M>(
     host: H,
     listeners: Vec<(H::Listener, Listening)>,
-    tls: M,
+    tls: &M,
     app: A,
     workers: Workers,
     stop: &'a Stop,
@@ -419,7 +451,7 @@ where
     H::Listener: Send,
     H::Conn: Send,
     A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
-    M: Fn(H::Listener) -> Option<H::Tls> + Sync,
+    M: Makes<H> + Sync,
 {
     let (tx, rx) = mpsc::channel::<Job<'a, H>>();
     let shared = Shared {
@@ -439,13 +471,15 @@ where
     let rx = Mutex::new(rx);
     thread::scope(|scope| {
         for (id, l) in accepting {
-            let (shared, tls) = (&shared, &tls);
+            let shared = &shared;
             scope.spawn(move || accept(scope, shared, id, &l, tls));
         }
         for _ in 0..workers.0.max(1) {
             let (shared, rx) = (&shared, &rx);
             scope.spawn(move || work(shared, rx));
         }
+        let shared = &shared;
+        scope.spawn(move || connector(scope, shared, tls));
     });
     lock(&stop.listeners).clear();
     shared
@@ -453,6 +487,138 @@ where
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
         .host
+}
+
+/// A connect the host asked for, as the connector took it.
+struct Asked<C> {
+    conn: C,
+    address: String,
+    tls: Option<String>,
+}
+
+/// Takes the connects the host wants, as they come, and gives each to a
+/// thread of its own, until stopped.
+fn connector<'scope, 'a, H, A, M>(
+    scope: &'scope Scope<'scope, '_>,
+    shared: &'scope Shared<'a, H, A>,
+    tls: &'scope M,
+) where
+    H: Host + Send,
+    H::Conn: Send,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
+    M: Makes<H> + Sync,
+{
+    let mut asked: Vec<Asked<H::Conn>> = Vec::new();
+    loop {
+        {
+            let mut s = lock(&shared.state);
+            loop {
+                if shared.stop.is_stopping() {
+                    return;
+                }
+                while let Some((conn, c)) = s.host.next_connect() {
+                    asked.push(Asked {
+                        conn,
+                        address: c.address.to_owned(),
+                        tls: c.tls.map(str::to_owned),
+                    });
+                }
+                if !asked.is_empty() {
+                    break;
+                }
+                s = shared
+                    .changed
+                    .wait_timeout(s, ACCEPT_RETRY)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+        for a in asked.drain(..) {
+            scope.spawn(move || connect_one(scope, shared, tls, a));
+        }
+    }
+}
+
+/// Connects where `a` says, off the loop, and tells the host how it
+/// went; a connection made gets its reader and writer.
+fn connect_one<'scope, 'a, H, A, M>(
+    scope: &'scope Scope<'scope, '_>,
+    shared: &'scope Shared<'a, H, A>,
+    tls: &M,
+    a: Asked<H::Conn>,
+) where
+    H: Host + Send,
+    H::Conn: Send,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
+    M: Makes<H> + Sync,
+{
+    let Asked {
+        conn,
+        address,
+        tls: server_name,
+    } = a;
+    let made = connect(&address);
+    let layer = match (&server_name, &made) {
+        (Some(name), Ok(_)) => match tls.for_connect(name) {
+            Some(l) => Ok(Some(l)),
+            None => Err(()),
+        },
+        (None, _) | (Some(_), Err(_)) => Ok(None),
+    };
+    let (Ok(socket), Ok(layer)) = (made, layer) else {
+        let mut s = lock(&shared.state);
+        let now = shared.clock.now();
+        if s.host.connect_failed(now, conn).is_ok() {
+            shared.acted(&mut s, now);
+        }
+        return;
+    };
+    let (Ok(rd), Some(key)) = (socket.try_clone(), shared.stop.keep(&socket)) else {
+        // stopping, or the socket cannot be shared: as a connect failed
+        let mut s = lock(&shared.state);
+        let now = shared.clock.now();
+        if s.host.connect_failed(now, conn).is_ok() {
+            shared.acted(&mut s, now);
+        }
+        return;
+    };
+    {
+        let mut s = lock(&shared.state);
+        let now = shared.clock.now();
+        if s.host.connected(now, conn, layer).is_err() {
+            // the host is done with it already
+            shared.stop.forget(key);
+            return;
+        }
+        shared.acted(&mut s, now);
+    }
+    scope.spawn(move || read(shared, conn, rd));
+    scope.spawn(move || {
+        write(shared, conn, socket);
+        shared.stop.forget(key);
+    });
+}
+
+/// Connects to `addr`, as [`bind`] reads addresses, resolving a name
+/// with the platform's resolver, which blocks.
+fn connect(addr: &str) -> io::Result<Socket> {
+    if let Some(path) = addr.strip_prefix("unix:") {
+        return connect_unix(path);
+    }
+    TcpStream::connect(addr).map(Socket::Tcp)
+}
+
+#[cfg(unix)]
+fn connect_unix(path: &str) -> io::Result<Socket> {
+    UnixStream::connect(path).map(Socket::Unix)
+}
+
+#[cfg(not(unix))]
+fn connect_unix(_: &str) -> io::Result<Socket> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no unix domain sockets here",
+    ))
 }
 
 /// Does jobs as they come, until stopped: each with no lock held, then
@@ -501,7 +667,7 @@ fn accept<'scope, 'a, H, A, M>(
     H::Listener: Send,
     H::Conn: Send,
     A: FnMut(&mut H, Instant, &Jobs<'a, H>) + Send,
-    M: Fn(H::Listener) -> Option<H::Tls> + Sync,
+    M: Makes<H> + Sync,
 {
     loop {
         if shared.stop.is_stopping() {
@@ -521,7 +687,7 @@ fn accept<'scope, 'a, H, A, M>(
         let conn = {
             let mut s = lock(&shared.state);
             let now = shared.clock.now();
-            let Ok(conn) = s.host.accepted(now, id, tls(id)) else {
+            let Ok(conn) = s.host.accepted(now, id, tls.for_listener(id)) else {
                 // the host would not take it: it is closed
                 shared.stop.forget(key);
                 continue;

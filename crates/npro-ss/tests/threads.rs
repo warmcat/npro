@@ -204,7 +204,7 @@ mod threads {
         let stop = Stop::new();
         thread::scope(|scope| {
             let server =
-                scope.spawn(|| serve(ss, serving, |_| None, app, Workers::default(), &stop));
+                scope.spawn(|| serve(ss, serving, &|_| None, app, Workers::default(), &stop));
             client(&bound);
             stop.stop();
             server.join().unwrap();

@@ -32,3 +32,8 @@ rustls = ["dep:rustls"]
 
 [lints]
 workspace = true
+
+# the threads adapter connecting out: needs the adapter
+[[test]]
+name              = "connect"
+required-features = ["std"]

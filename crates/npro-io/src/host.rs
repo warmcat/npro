@@ -28,9 +28,25 @@ impl core::fmt::Display for Gone {
 
 impl core::error::Error for Gone {}
 
+/// A connection the host wants made: [`Host::next_connect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Connect<'a> {
+    /// Where to, as the adapter reads addresses: `unix:/path`, or a host
+    /// and port, `example.com:443`, resolved by the adapter.
+    pub address: &'a str,
+    /// The server name to make the connection's tls for, or `None` for a
+    /// plain connection.
+    pub tls: Option<&'a str>,
+}
+
 /// Many connections, driven by id: see the module's description.  Each
 /// call is the driver's of the same name, on the connection `conn`
 /// names, and is [`Gone`] if it has gone.
+///
+/// A host that connects out as well says so with [`Host::next_connect`],
+/// and is told how it went by [`Host::connected`] or
+/// [`Host::connect_failed`]; one that only listens leaves those as they
+/// are.
 pub trait Host {
     /// A listener, as the host names it.
     type Listener: Copy;
@@ -115,4 +131,38 @@ pub trait Host {
     ///
     /// [`Gone`].
     fn released(&mut self, conn: Self::Conn) -> Result<(), Gone>;
+
+    /// A connection the host wants made, if there is one: the adapter
+    /// takes it, connects off its loop, and says how it went.  Asked
+    /// after every turn of the application, until `None`.
+    fn next_connect(&mut self) -> Option<(Self::Conn, Connect<'_>)> {
+        None
+    }
+
+    /// The adapter connected `conn`, at `now`, with `tls` its tls if the
+    /// connect asked for it: the connection is driven from here.
+    ///
+    /// # Errors
+    ///
+    /// [`Gone`].
+    fn connected(
+        &mut self,
+        _now: Instant,
+        _conn: Self::Conn,
+        tls: Option<Self::Tls>,
+    ) -> Result<(), Gone> {
+        drop(tls);
+        Err(Gone)
+    }
+
+    /// The adapter could not connect `conn`: the address did not resolve
+    /// or the connect was refused, or the tls it asked for could not be
+    /// made.
+    ///
+    /// # Errors
+    ///
+    /// [`Gone`].
+    fn connect_failed(&mut self, _now: Instant, _conn: Self::Conn) -> Result<(), Gone> {
+        Err(Gone)
+    }
 }

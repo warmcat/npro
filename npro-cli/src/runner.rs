@@ -200,7 +200,7 @@ impl Bound<'_> {
         threads::serve(
             ss,
             listening.collect(),
-            make_tls,
+            &make_tls,
             |ss: &mut Streams<'_, U>, now, jobs| app(ss, now, jobs),
             workers,
             stop,
