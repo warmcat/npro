@@ -16,6 +16,7 @@ npro-h1   = { path = "../npro-h1" }
 npro-io   = { path = "../npro-io" }
 npro-json = { path = "../npro-json" }
 npro-ss   = { path = "../npro-ss", features = ["pmd"] }
+npro-files = { path = "../npro-files" }
 npro-test = { path = "../npro-test" }
 npro-ws   = { path = "../npro-ws", features = ["pmd"] }
 

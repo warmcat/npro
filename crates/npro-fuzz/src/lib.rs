@@ -20,12 +20,14 @@
 
 #![forbid(unsafe_code)]
 
+mod files;
 mod h1;
 mod json;
 mod ss;
 mod targets;
 mod ws;
 
+pub use files::files;
 pub use h1::{chunked, h1_request, h1_response, uri};
 pub use json::json;
 pub use ss::ss_server;
@@ -72,11 +74,13 @@ pub enum Target {
     WsPmd,
     /// [`ss_server`]: npro-ss's server streams, driven every which way.
     SsServer,
+    /// [`files`]: npro-files serving requests from a tree in memory.
+    Files,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -90,6 +94,7 @@ impl Target {
         Self::WsClient,
         Self::WsPmd,
         Self::SsServer,
+        Self::Files,
     ];
 
     /// The target's name.
@@ -109,6 +114,7 @@ impl Target {
             Self::WsClient => "ws-client",
             Self::WsPmd => "ws-pmd",
             Self::SsServer => "ss-server",
+            Self::Files => "files",
         }
     }
 
@@ -133,6 +139,7 @@ impl Target {
             Self::WsClient => ws_client(data),
             Self::WsPmd => ws_pmd(data),
             Self::SsServer => ss_server(data),
+            Self::Files => files(data),
         }
     }
 }

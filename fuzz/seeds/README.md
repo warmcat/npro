@@ -43,6 +43,11 @@ The protocol crates' targets start from the C library's corpora
   hangup, a POST's body, a stream destroyed, a head that times out, a ws
   echo and close, ws with permessage-deflate, an upgrade refused, and the
   slots running out.
+- `files`: written for it, a control byte then the request: a file, a
+  directory's default document, a route asked for without its `/`, a
+  HEAD with a matching `if-none-match`, a large file, a path reaching
+  outside the mount, a request for what is not there followed by one
+  for the 404 document, and a request for the application's route.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

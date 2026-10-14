@@ -257,6 +257,11 @@ fn ss_server() {
 }
 
 #[test]
+fn files() {
+    smoke(Target::Files, seeded).unwrap();
+}
+
+#[test]
 fn every_target_has_a_smoke_test() {
     // the tests above, by name: a new target needs its own
     let tested = [
@@ -273,6 +278,7 @@ fn every_target_has_a_smoke_test() {
         "ws-client",
         "ws-pmd",
         "ss-server",
+        "files",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

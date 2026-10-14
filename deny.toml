@@ -46,6 +46,7 @@ allow = [
 	"npro-io",
 	"npro-json",
 	"npro-ss",
+	"npro-files",
 	"npro-fuzz",
 	"npro-test",
 

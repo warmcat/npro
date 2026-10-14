@@ -597,6 +597,26 @@ never waits on a disk.  The reads go through a small file-ops trait, as
 C's `lws_plat_file_ops`, so a romfs or a test's in-memory tree serve the
 same way.
 
+*Built (2026-10-14)* as `npro-files`, no_std, a service over npro-ss'
+streams: `serve()` answers a request on a files route from a `Mount`
+(root, default document, cache rule, extra mime types) as C's
+`lws_http_serve()` does: the `/` redirect for a route asked for without
+it, the path composed under the root into storage of C's 1024 bytes
+with `..` components and `\` refused 403, the directory's default
+document, the suffix's type (the mount's first, then C's table, else
+415), C's cache-control forms (`no-store` by default), C's ETag and the
+304 for a matching `if-none-match`, a HEAD's head alone, and the
+vhost's 404 document through `Txn::status()`.  Opening is the runner's
+`Fs` trait, on the turn, as C opens; the bytes go through `Serving`,
+which asks for each chunk (16KiB) as a read the runner does off the
+turn and hands back, a file that shrank ending short so the connection
+closes, as C's `file_had_it`.  C's `h1-404-keepalive` transcript
+replays through it byte for byte; its fuzz target checks every path it
+opens is under its mount.  Not yet: precompressed variants, byte
+ranges, interpreted files, basic auth, on-the-fly compression, and
+refusing a symbolic link that leaves the root, which C does not do
+either.
+
 **The proxy** forwards each request to its origin, `unix:/path` or
 `http://..`, always as h1, whatever the return side is (h1 now, h2 and
 h3 later): C's translated headers and `X-Forwarded-For`, the bodies both

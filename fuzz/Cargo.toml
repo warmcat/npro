@@ -115,3 +115,10 @@ path  = "fuzz_targets/ss_server.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "files"
+path  = "fuzz_targets/files.rs"
+test  = false
+doc   = false
+bench = false

@@ -1,0 +1,23 @@
+[package]
+name        = "npro-files"
+description = "npro's file service: a directory served under a route, sans-IO, the reads the runner's"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "http", "static"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-ss = { path = "../npro-ss", version = "0.0.2" }
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+npro-h1.workspace = true
+npro-io.workspace = true
+
+[lints]
+workspace = true

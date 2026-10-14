@@ -12,6 +12,11 @@
 //! npro-ss as the listener says; and the `sansio-uri` vhost, answering
 //! with the request's path and arguments.
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "an integration test sees all of its crate's dependencies; this one does not use npro-files"
+)]
+
 // held to clippy's rules for tests
 #[cfg(test)]
 mod ss_server_replay {
