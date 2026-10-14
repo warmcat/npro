@@ -837,8 +837,13 @@ code for exactly this trust model.
   code (login, deaddrop, dnssec-monitor, webrtc) contained and apart
   from the core; linking every service into one process would grow a
   monolith.  Services that are code, not configuration, run in
-  processes of their own.  *(How they are bound, found and started,
-  open: 3 below.)*
+  processes of their own.
+- 2026-10-14: `npro` supervises them: it spawns the instances the
+  deployment layer declares, as their users, and restarts them
+  (ss-policy.md, "Instances and the supervisor").  The platform's
+  service manager starts only the supervisor.  Privilege is the
+  supervisor's alone; the front holds none.  A datagram listener is the
+  instance's own and reached directly.
 
 ## Open
 
@@ -850,8 +855,8 @@ For Andy:
    proposed as `npro get URL`, `npro ws URL`, `--policy FILE` and `-p`
    fragments.
 2. SSPC's two questions above, when it is built.
-3. **Services in their own processes**: what links into the front and
-   what does not, how a route is bound to an instance's socket, how an
-   instance knows which it is, how it is started, guards (the login
-   interceptor) when the login is elsewhere, and instances with udp
-   listeners of their own (webrtc).
+3. **The login guard**: the JWT cookie is checked in the front, on
+   every request to a guarded route, with the login itself in an
+   instance of its own; the identity goes to the instance in a header
+   the front sets after stripping any the client sent.  Proposed, not
+   yet confirmed.

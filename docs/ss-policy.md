@@ -46,9 +46,11 @@ configuration language.
   left unbound, fails resolution, and the error names its path, for
   example `vhosts."warmcat.com".routes[2].to: no endpoint
   "mirror.wss"`.
-- **npro is not an orchestrator.**  It defines the policy, resolves it
-  and serves it to the processes that need it.  Starting, restarting and
-  placing processes is systemd's job, or whatever the deployment uses.
+- **npro starts its own instances.**  One supervisor process is what the
+  platform's service manager starts; it spawns and restarts the
+  instances the deployment layer declares ("Instances and the
+  supervisor", below).  Placing them on machines is still the
+  operator's.
 
 ## Parameters
 
@@ -301,10 +303,52 @@ On one machine, a front reaches an instance over a unix domain socket
 whose permissions admit only the two of them.  Across machines, over tcp
 with mutual tls, using the same identities as the distribution link.
 
+### Instances and the supervisor
+
+A service that is code rather than configuration (login, deaddrop,
+webrtc, dnssec-monitor) runs in a process of its own, so the server
+process does not grow into a monolith as everything is linked into it,
+and so each has its own user, crash domain and dependency graph (Andy,
+2026-10-12).  It is a crate that ships its own small binary on the same
+runner library as `npro`.
+
+Keeping systemd as the thing that starts each instance would split the
+configuration: the unit file holding the identity and containment, the
+policy everything else, and a different dialect on each platform.  So
+(Andy, 2026-10-14) **`npro` is the supervisor**, and the one thing the
+platform's service manager starts: one unit, plist or service.  It:
+
+- reads the deployment layer and spawns each instance that declares an
+  `exec`, as the `user` it names, with its capabilities dropped and
+  its rlimits set, by `std::process::Command` and nothing `unsafe`;
+- restarts one that exits, with the instance's retry policy, and
+  captures its stdout and stderr into the log;
+- passes the instance its name, so it knows which fragment is its;
+- leaves alone an instance with a `bind` and no `exec` (gitohashi, sai,
+  lwsws during the move): that is expected to be running already, and is
+  only proxied to.
+
+The front is one more child.  **Privilege lives in the supervisor and
+nowhere else**: it opens no public socket, holds `CAP_SETUID`,
+`CAP_SETGID` and `CAP_NET_BIND_SERVICE`, and hands the bind capability
+only to a child that binds below 1024.  On Windows a child runs as the
+same user, which is that platform's limit.  CGI is the same spawn,
+short-lived.
+
+What a platform does at cgroup level, `SocketBindAllow`,
+`ProtectSystem`, namespaces, applies once to the whole npro tree by its
+one unit, rather than per instance: coarser, taken for the sake of one
+configuration; per-child seccomp or namespaces may come later.
+
+A datagram listener (webrtc's `media`) is the instance's own: it binds
+the port its fragment gives, the front announces it through the exported
+`public-host`, and the public reaches it directly.  Only the signalling
+ws is proxied.
+
 ### Health
 
-systemd keeps processes running.  The front sees whether each instance
-is healthy by proxying to it: failed connects and timeouts.  It uses that
+The supervisor sees exits; the front sees whether each instance is
+healthy by proxying to it: failed connects and timeouts.  It uses that
 for a fast 503 on the routes of an instance that is down, for backing off
 its reconnects with the instance's retry policy, and for the status page.
 An optional active probe may come later.
@@ -399,8 +443,15 @@ and references cover what it was used for), and `conf.d` order.
   Fronts are participants like any other.  The C flow stays production,
   and npro is not on the path of switching warmcat.com and
   libwebsockets.org to it.
-- 2026-10-08: npro does not supervise processes; systemd does.  npro
-  knows their health from proxying to them.
+- 2026-10-08: npro does not supervise processes; systemd does.
+  **Reopened and reversed, 2026-10-14**: `npro` is the supervisor and
+  spawns its instances from the deployment layer, the platform's service
+  manager starting only it, so the configuration is in one place and the
+  same on every platform.  The front knows an instance's health from
+  proxying to it, the supervisor from its exit.
+- 2026-10-12: services that are code run in processes of their own,
+  reached over a unix domain socket; the server process is not where
+  they are linked in.
 
 - 2026-10-12: defaults come in fixed layers, built in, system, user,
   the policy, then the command line's fragments, each overriding those
