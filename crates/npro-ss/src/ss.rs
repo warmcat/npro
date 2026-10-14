@@ -950,15 +950,24 @@ where
             .ok_or(Gone)
     }
 
-    /// The stream's own state.
+    /// The stream's own state.  A stream just told it is gone
+    /// ([`Kind::Disconnected`], [`Kind::ConnectFailed`]) still has it,
+    /// until the next [`Ss::poll_event`]: for what it holds to be taken
+    /// out, as a proxy takes what the origin sent but the client has not
+    /// yet been given.  Every other call on such a stream is refused.
     ///
     /// # Errors
     ///
     /// [`Gone`], if the stream is.
     pub fn user(&mut self, id: StreamId) -> Result<&mut U, Gone> {
-        match &mut self.live_stream(id)?.stream {
-            Stream::Live { user, .. } => Ok(user),
-            Stream::Free | Stream::Ending { .. } | Stream::Ended(_) => Err(Gone),
+        let slot = self
+            .slots
+            .get_mut(usize::try_from(id.slot).map_err(|_| Gone)?)
+            .filter(|s| s.stream_generation == id.generation)
+            .ok_or(Gone)?;
+        match &mut slot.stream {
+            Stream::Live { user, .. } | Stream::Ended(user) => Ok(user),
+            Stream::Free | Stream::Ending { .. } => Err(Gone),
         }
     }
 
@@ -1052,6 +1061,42 @@ where
             return Err(RespondError::Gone);
         };
         respond(server, own, r)
+    }
+
+    /// Answers the request in hand on the stream with C's status page for
+    /// `code`, at `now`, as [`Txn::status`] does: for a stream answering
+    /// after its [`Kind::ServerTxn`], a proxy whose origin could not be
+    /// reached, say.
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError`], and the request is still unanswered.
+    pub fn status(&mut self, now: Instant, id: StreamId, code: u16) -> Result<(), RespondError> {
+        let listeners: &'s [Listener<'s>] = self.listeners;
+        let slot = self.live_stream(id).map_err(|_| RespondError::Gone)?;
+        let Link::Live(live) = &mut slot.conn else {
+            return Err(RespondError::Gone);
+        };
+        let Side::Accepted(listener) = live.side else {
+            return Err(RespondError::Gone);
+        };
+        let l = listeners
+            .get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
+            .ok_or(RespondError::Gone)?;
+        let at = live.routed.ok_or(RespondError::Gone)?;
+        let (vhost, route) = at.in_listener(l).ok_or(RespondError::Gone)?;
+        let RoleMut::H1Server(server) = live.driver.conn().role_mut() else {
+            return Err(RespondError::Gone);
+        };
+        let mut txn = Txn {
+            server,
+            listener: l,
+            vhost: at.vhost,
+            route: at.route,
+            now,
+        };
+        let _ = (vhost, route);
+        txn.status(code)
     }
 
     /// The stream has payload to write: once its connection can take it,
@@ -1653,9 +1698,16 @@ mod tests {
             Ok(Want::Release(npro_io::driver::Outcome::Delivered))
         ));
         ss.released(conn).unwrap();
-        assert_eq!(serve(&mut ss, true), [Seen::Disconnected(stream)]);
-        assert_eq!(serve(&mut ss, true), []);
+        {
+            let told = ss.poll_event(T0).unwrap();
+            assert!(matches!(told.kind, Kind::Disconnected));
+            assert_eq!(told.stream, stream);
+        }
+        // told, its state is still there until the next look, and no
+        // call but that is taken
         assert_eq!(ss.request_tx(stream), Err(CallError::Gone));
+        assert!(ss.user(stream).is_ok());
+        assert_eq!(serve(&mut ss, true), []);
         assert!(ss.user(stream).is_err());
         assert!(ss.want(T0, conn).is_err());
         assert_eq!(ss.released(conn), Err(Gone));
