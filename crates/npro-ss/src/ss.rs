@@ -19,18 +19,20 @@ use core::mem;
 use npro_core::close::Close;
 use npro_core::random::Random;
 use npro_core::time::Instant;
+use npro_h1::client::{self as h1c, Client, Request};
 use npro_h1::server::{self, NoPayload, Server};
 use npro_h1::table::MAX_CAPACITY;
 use npro_h1::token::Token;
 use npro_io::conn::{Conn, Event as ConnEvent, Role, RoleMut};
 use npro_io::driver::{Buffers, Driver, NetBuffers, Parts, Want};
-use npro_io::host::Host;
+use npro_io::host::{Connect, Host};
 use npro_io::tls::{NoTls, RecordLayer};
 use npro_ws::conn::{self as ws, Ws};
 use npro_ws::handshake::{self, MAX_101};
 
 use crate::event::{
-    End, Event, Kind, Own, Refusal, RespondError, Response, Tx, TxWant, Txn, request_path, respond,
+    End, Event, Flow, Kind, Own, Refusal, Resp, RespondError, Response, Tx, TxWant, Txn,
+    request_path, respond,
 };
 use crate::id::{ConnId, ListenerId, StreamId};
 use crate::policy::{
@@ -79,23 +81,42 @@ impl<U, S, R, T> Slot<U, S, R, T> {
 enum Stream<U> {
     /// There is none.
     Free,
-    /// Accepted on a listener, its connection in the same slot.
-    Accepted { user: U, tx: TxWant },
-    /// Its connection is gone, which it is yet to be told.
-    Ending(U),
+    /// Accepted on a listener, or connecting out, its connection in the
+    /// same slot.
+    Live {
+        user: U,
+        tx: TxWant,
+        /// Whether what the peer sends is given to it.
+        rx: Flow,
+    },
+    /// Its connection is gone, or was never made, which it is yet to be
+    /// told.
+    Ending { user: U, why: Loss },
     /// It was told, and is let go at the next event.
     Ended(U),
 }
 
+/// How a stream lost its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loss {
+    /// It was gone.
+    Disconnected,
+    /// It could not be made.
+    ConnectFailed,
+}
+
+/// The longest address a stream connects to, as the adapter reads it,
+/// and the longest server name its tls is for.
+pub const MAX_ADDRESS: usize = 256;
+
 /// Where a slot's connection is.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a slot is room for a connection: free, it is the same size as in use, by design"
-)]
 enum Link<S, R, T> {
     /// There is none: its storage waits for the next.
     Free(ConnStorage<S>),
+    /// Asked of the adapter, with its request composed, until it is made
+    /// or fails.
+    Connecting(Connecting<S>),
     /// Carried by a driver.
     Live(Live<S, R, T>),
     /// Never so: the storage was lost making a connection that could not
@@ -104,11 +125,57 @@ enum Link<S, R, T> {
     Lost,
 }
 
+/// A connection the adapter is to make, and what it will carry.
+#[derive(Debug)]
+struct Connecting<S> {
+    client: Client<S>,
+    bufs: Buffers<S>,
+    net: NetBuffers<S>,
+    address: Name,
+    tls: Option<Name>,
+    /// The adapter has taken it.
+    asked: bool,
+}
+
+/// An address or a server name, copied in.
+#[derive(Clone, Copy, Debug)]
+struct Name {
+    bytes: [u8; MAX_ADDRESS],
+    len: usize,
+}
+
+impl Name {
+    fn of(s: &str) -> Option<Self> {
+        let mut n = Self {
+            bytes: [0; MAX_ADDRESS],
+            len: s.len(),
+        };
+        n.bytes.get_mut(..s.len())?.copy_from_slice(s.as_bytes());
+        Some(n)
+    }
+
+    fn as_str(&self) -> &str {
+        self.bytes
+            .get(..self.len)
+            .and_then(|b| core::str::from_utf8(b).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Which side a connection was made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    /// Accepted on this listener.
+    Accepted(ListenerId),
+    /// Made out, to a stream's peer.
+    Client,
+}
+
 /// A connection, and the storage it is not using.
 #[derive(Debug)]
 struct Live<S, R, T> {
     driver: Driver<S, R, S, T>,
-    listener: ListenerId,
+    side: Side,
     /// Where its last request was routed, if one was.
     routed: Option<Routed>,
     /// The h1 role's storage, once a change of role gave it back.
@@ -297,6 +364,29 @@ impl core::fmt::Display for AcceptError {
 
 impl core::error::Error for AcceptError {}
 
+/// Why a stream could not be made to connect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectError {
+    /// Every slot is in use.
+    Full,
+    /// The address, or the server name, is longer than [`MAX_ADDRESS`].
+    AddressTooLong,
+    /// The request was refused, as the h1 client refuses it.
+    Request(h1c::NewError),
+}
+
+impl core::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Full => f.write_str("no slot free"),
+            Self::AddressTooLong => write!(f, "an address longer than {MAX_ADDRESS}"),
+            Self::Request(e) => write!(f, "request refused: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for ConnectError {}
+
 /// An id whose stream or connection is gone: the adapter's, as a
 /// [`Host`]'s.
 pub use npro_io::host::Gone;
@@ -310,6 +400,8 @@ pub enum Call {
     RequestTx,
     /// It has a ws message this long to write: [`Ss::request_tx_len`].
     RequestTxLen(u64),
+    /// Whether what its peer sends is given to it: [`Ss::flow`].
+    Flow(Flow),
     /// It is done with: [`Ss::destroy`].
     Destroy,
 }
@@ -483,7 +575,7 @@ where
             match &s.conn {
                 Link::Free(c) => check_slot(c, deflate, tls),
                 // a slot is made free; one in use came from another Ss
-                Link::Live(_) | Link::Lost => Err(SlotError::Table),
+                Link::Connecting(_) | Link::Live(_) | Link::Lost => Err(SlotError::Table),
             }
             .map_err(|why| NewError::Slot { slot: i, why })?;
         }
@@ -547,19 +639,181 @@ where
         };
         slot.conn = Link::Live(Live {
             driver,
-            listener,
+            side: Side::Accepted(listener),
             routed: None,
             h1: Spare::InUse,
             net,
         });
-        slot.stream = Stream::Accepted {
+        slot.stream = Stream::Live {
             user: U::default(),
             tx: TxWant::Idle,
+            rx: Flow::Given,
         };
         Ok(ConnId {
             slot: index,
             generation: slot.conn_generation,
         })
+    }
+
+    /// A stream connecting out, to `address` (`unix:/path`, or a host and
+    /// port, as the adapter reads them), over tls for the server name
+    /// `tls` if given, asking `request` once connected, with `user` its
+    /// own state.  The adapter is asked for the connection
+    /// ([`Ss::next_connect`]); the stream is told the answer's head
+    /// ([`Kind::Response`]), its body ([`Kind::Rx`]), or that the
+    /// connection could not be made ([`Kind::ConnectFailed`]).  The
+    /// request's body, if it has one, is pulled from the stream as it
+    /// asks to write.  The first form of a client stream: no retry, no
+    /// redirect followed, the connection closed after.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError`], and no stream is made.
+    pub fn connect(
+        &mut self,
+        address: &str,
+        tls: Option<&str>,
+        request: Request<'_>,
+        user: U,
+    ) -> Result<StreamId, ConnectError> {
+        let address = Name::of(address).ok_or(ConnectError::AddressTooLong)?;
+        let tls = match tls {
+            None => None,
+            Some(t) => Some(Name::of(t).ok_or(ConnectError::AddressTooLong)?),
+        };
+        let (index, slot) = (0u32..)
+            .zip(self.slots.iter_mut())
+            .find(|(_, s)| matches!((&s.stream, &s.conn), (Stream::Free, Link::Free(_))))
+            .ok_or(ConnectError::Full)?;
+        let Link::Free(storage) = mem::replace(&mut slot.conn, Link::Lost) else {
+            return Err(ConnectError::Full);
+        };
+        let ConnStorage { h1, bufs, net } = storage;
+        let client = match Client::new(h1, request) {
+            Ok(c) => c,
+            Err(h1c::RequestRefused { why, storage: back }) => {
+                slot.conn = Link::Free(ConnStorage {
+                    h1: back,
+                    bufs,
+                    net,
+                });
+                return Err(ConnectError::Request(why));
+            }
+        };
+        slot.conn = Link::Connecting(Connecting {
+            client,
+            bufs,
+            net,
+            address,
+            tls,
+            asked: false,
+        });
+        slot.stream = Stream::Live {
+            user,
+            tx: TxWant::Idle,
+            rx: Flow::Given,
+        };
+        Ok(StreamId {
+            slot: index,
+            generation: slot.stream_generation,
+        })
+    }
+
+    /// A connection a stream wants made, not yet given to the adapter,
+    /// if there is one: the adapter connects, and says how it went
+    /// ([`Ss::connected`], [`Ss::connect_failed`]).
+    pub fn next_connect(&mut self) -> Option<(ConnId, Connect<'_>)> {
+        let (index, slot) = (0u32..)
+            .zip(self.slots.iter_mut())
+            .find(|(_, s)| matches!(&s.conn, Link::Connecting(Connecting { asked: false, .. })))?;
+        let Link::Connecting(c) = &mut slot.conn else {
+            return None;
+        };
+        c.asked = true;
+        Some((
+            ConnId {
+                slot: index,
+                generation: slot.conn_generation,
+            },
+            Connect {
+                address: c.address.as_str(),
+                tls: c.tls.as_ref().map(Name::as_str),
+            },
+        ))
+    }
+
+    /// The slot of a connection being made, by its id.
+    fn connecting(&mut self, id: ConnId) -> Result<&mut Slot<U, S, R, T>, Gone> {
+        self.slots
+            .get_mut(usize::try_from(id.slot).map_err(|_| Gone)?)
+            .filter(|s| s.conn_generation == id.generation && matches!(s.conn, Link::Connecting(_)))
+            .ok_or(Gone)
+    }
+
+    /// The adapter made the connection, at `now`, with `tls` its record
+    /// layer if it was asked for: it is driven from here by its id, and
+    /// its request goes.
+    ///
+    /// # Errors
+    ///
+    /// [`Gone`], if no such connection was asked for.
+    pub fn connected(&mut self, now: Instant, id: ConnId, tls: Option<T>) -> Result<(), Gone> {
+        let slot = self.connecting(id)?;
+        let Link::Connecting(c) = mem::replace(&mut slot.conn, Link::Lost) else {
+            return Err(Gone);
+        };
+        let conn = Conn::h1_client(c.client);
+        let (driver, net) = match (tls, c.tls) {
+            (None, None) => (Driver::plain(conn, c.bufs), Spare::Idle(c.net)),
+            (Some(layer), Some(_)) => (
+                Driver::with_tls(conn, c.bufs, layer, c.net, now),
+                Spare::InUse,
+            ),
+            // not what was asked for: the slot is lost rather than carry
+            // a connection with the wrong security
+            (None, Some(_)) | (Some(_), None) => return Err(Gone),
+        };
+        let mut live = Live {
+            driver,
+            side: Side::Client,
+            routed: None,
+            h1: Spare::InUse,
+            net,
+        };
+        // a stream destroyed while connecting: nothing to carry
+        if !matches!(slot.stream, Stream::Live { .. }) {
+            live.driver.hangup(now);
+        }
+        slot.conn = Link::Live(live);
+        Ok(())
+    }
+
+    /// The adapter could not make the connection, at `now`: its storage
+    /// is ready for the next, and its stream is told
+    /// ([`Kind::ConnectFailed`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Gone`], if no such connection was asked for.
+    pub fn connect_failed(&mut self, _now: Instant, id: ConnId) -> Result<(), Gone> {
+        let slot = self.connecting(id)?;
+        let Link::Connecting(c) = mem::replace(&mut slot.conn, Link::Lost) else {
+            return Err(Gone);
+        };
+        slot.conn = Link::Free(ConnStorage {
+            h1: c.client.into_storage(),
+            bufs: c.bufs,
+            net: c.net,
+        });
+        slot.conn_generation = slot.conn_generation.wrapping_add(1);
+        slot.stream = match mem::replace(&mut slot.stream, Stream::Free) {
+            Stream::Live { user, .. } => Stream::Ending {
+                user,
+                why: Loss::ConnectFailed,
+            },
+            s @ (Stream::Free | Stream::Ending { .. } | Stream::Ended(_)) => s,
+        };
+        Ok(())
     }
 
     fn live(&mut self, id: ConnId) -> Result<&mut Live<S, R, T>, Gone> {
@@ -570,7 +824,7 @@ where
             .ok_or(Gone)?;
         match &mut slot.conn {
             Link::Live(l) => Ok(l),
-            Link::Free(_) | Link::Lost => Err(Gone),
+            Link::Free(_) | Link::Connecting(_) | Link::Lost => Err(Gone),
         }
     }
 
@@ -677,18 +931,21 @@ where
         }
         slot.conn_generation = slot.conn_generation.wrapping_add(1);
         slot.stream = match mem::replace(&mut slot.stream, Stream::Free) {
-            Stream::Accepted { user, .. } => Stream::Ending(user),
+            Stream::Live { user, .. } => Stream::Ending {
+                user,
+                why: Loss::Disconnected,
+            },
             // a stream destroyed first has no one to tell
-            s @ (Stream::Free | Stream::Ending(_) | Stream::Ended(_)) => s,
+            s @ (Stream::Free | Stream::Ending { .. } | Stream::Ended(_)) => s,
         };
         Ok(())
     }
 
-    fn accepted_stream(&mut self, id: StreamId) -> Result<&mut Slot<U, S, R, T>, Gone> {
+    fn live_stream(&mut self, id: StreamId) -> Result<&mut Slot<U, S, R, T>, Gone> {
         self.slots
             .get_mut(usize::try_from(id.slot).map_err(|_| Gone)?)
             .filter(|s| {
-                s.stream_generation == id.generation && matches!(s.stream, Stream::Accepted { .. })
+                s.stream_generation == id.generation && matches!(s.stream, Stream::Live { .. })
             })
             .ok_or(Gone)
     }
@@ -699,9 +956,9 @@ where
     ///
     /// [`Gone`], if the stream is.
     pub fn user(&mut self, id: StreamId) -> Result<&mut U, Gone> {
-        match &mut self.accepted_stream(id)?.stream {
-            Stream::Accepted { user, .. } => Ok(user),
-            Stream::Free | Stream::Ending(_) | Stream::Ended(_) => Err(Gone),
+        match &mut self.live_stream(id)?.stream {
+            Stream::Live { user, .. } => Ok(user),
+            Stream::Free | Stream::Ending { .. } | Stream::Ended(_) => Err(Gone),
         }
     }
 
@@ -711,39 +968,61 @@ where
     ///
     /// [`CallError`], and nothing is done.
     pub fn call(&mut self, now: Instant, id: StreamId, call: Call) -> Result<(), CallError> {
-        let slot = self.accepted_stream(id)?;
-        let Stream::Accepted { tx, .. } = &mut slot.stream else {
+        let slot = self.live_stream(id)?;
+        let Stream::Live { tx, rx, .. } = &mut slot.stream else {
             return Err(CallError::Gone);
         };
-        let Link::Live(live) = &mut slot.conn else {
-            return Err(CallError::Gone);
+        let live = match &mut slot.conn {
+            Link::Live(live) => Some(live),
+            // still being made: a call waits on the connection, but a
+            // destroy ends the stream now
+            Link::Connecting(_) => None,
+            Link::Free(_) | Link::Lost => return Err(CallError::Gone),
         };
-        match call {
-            Call::RequestTx => {
+        match (call, live) {
+            (Call::RequestTx, _) => {
                 if *tx == TxWant::Idle {
                     *tx = TxWant::Wanted;
                 }
             }
-            Call::RequestTxLen(len) => match live.driver.conn().role_mut() {
+            (Call::Flow(f), _) => *rx = f,
+            (Call::RequestTxLen(len), Some(live)) => match live.driver.conn().role_mut() {
                 RoleMut::WsServer(_) | RoleMut::WsClient(_) => *tx = TxWant::Message(len),
                 RoleMut::H1Server(_) | RoleMut::H1Client(_) | RoleMut::Raw(_) => {
                     return Err(CallError::Protocol);
                 }
             },
-            Call::Destroy => {
-                match live.driver.conn().role_mut() {
-                    RoleMut::H1Server(s) => s.abort(),
-                    RoleMut::WsServer(w) => w.close_when_flushed(now),
-                    RoleMut::WsClient(w) => w.close_when_flushed(now),
-                    RoleMut::Raw(r) => r.close(Close::Shutdown),
-                    // the client's own close comes with client streams
-                    RoleMut::H1Client(_) => live.driver.hangup(now),
+            (Call::RequestTxLen(_), None) => return Err(CallError::Protocol),
+            (Call::Destroy, live) => {
+                if let Some(live) = live {
+                    match live.driver.conn().role_mut() {
+                        RoleMut::H1Server(s) => s.abort(),
+                        RoleMut::WsServer(w) => w.close_when_flushed(now),
+                        RoleMut::WsClient(w) => w.close_when_flushed(now),
+                        RoleMut::Raw(r) => r.close(Close::Shutdown),
+                        // a client's transaction is dropped by closing
+                        RoleMut::H1Client(_) => live.driver.hangup(now),
+                    }
                 }
                 slot.stream = Stream::Free;
                 slot.stream_generation = slot.stream_generation.wrapping_add(1);
             }
         }
         Ok(())
+    }
+
+    /// Whether what the stream's peer sends is given to it: C's
+    /// `lws_rx_flow_control()`.  Held, what comes stays in the
+    /// connection's buffer, and once that is full nothing more is read
+    /// from the socket, so the peer is held back; given again, it is
+    /// told what waited.  For a proxy, which reads a side only when the
+    /// other has room.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Gone`], if the stream is.
+    pub fn flow(&mut self, id: StreamId, flow: Flow) -> Result<(), CallError> {
+        self.call(Instant::from_micros(0), id, Call::Flow(flow))
     }
 
     /// Answers the request in hand on the stream, as [`Txn::respond`]
@@ -755,12 +1034,15 @@ where
     /// [`RespondError`], and the request is still unanswered.
     pub fn respond(&mut self, id: StreamId, r: Response<'_>) -> Result<(), RespondError> {
         let listeners: &'s [Listener<'s>] = self.listeners;
-        let slot = self.accepted_stream(id).map_err(|_| RespondError::Gone)?;
+        let slot = self.live_stream(id).map_err(|_| RespondError::Gone)?;
         let Link::Live(live) = &mut slot.conn else {
             return Err(RespondError::Gone);
         };
+        let Side::Accepted(listener) = live.side else {
+            return Err(RespondError::Gone);
+        };
         let l = listeners
-            .get(usize::try_from(live.listener.index()).unwrap_or(usize::MAX))
+            .get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
             .ok_or(RespondError::Gone)?;
         let own = live
             .routed
@@ -836,9 +1118,10 @@ where
                 slot: index,
                 generation: *stream_generation,
             };
-            // a stream whose connection is gone is told so, and let go
-            if let Stream::Ending(_) = stream {
-                let Stream::Ending(told) = mem::replace(stream, Stream::Free) else {
+            // a stream whose connection is gone, or was never made, is
+            // told so, and let go
+            if let Stream::Ending { .. } = stream {
+                let Stream::Ending { user: told, why } = mem::replace(stream, Stream::Free) else {
                     continue;
                 };
                 *stream = Stream::Ended(told);
@@ -849,29 +1132,35 @@ where
                 return Some(Event {
                     stream: id,
                     user,
-                    kind: Kind::Disconnected,
+                    kind: match why {
+                        Loss::Disconnected => Kind::Disconnected,
+                        Loss::ConnectFailed => Kind::ConnectFailed,
+                    },
                 });
             }
-            let (Stream::Accepted { user, tx }, Link::Live(live)) = (stream, conn) else {
+            let (Stream::Live { user, tx, rx }, Link::Live(live)) = (stream, conn) else {
                 // no stream, or none to tell: a destroyed stream's
-                // connection is the adapter's to carry to its end
+                // connection is the adapter's to carry to its end, and
+                // one being made has nothing yet
                 continue;
             };
             let Live {
                 driver,
-                listener,
+                side,
                 routed,
                 h1,
                 ..
             } = live;
-            let Some(l) = listeners.get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
-            else {
-                continue;
+            let l = match side {
+                Side::Accepted(listener) => {
+                    listeners.get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
+                }
+                Side::Client => None,
             };
             // the chance to write, if it asked and can
             if *tx != TxWant::Idle && driver.is_writable() {
-                let payload = routed
-                    .and_then(|r| r.in_listener(l))
+                let payload = l
+                    .and_then(|l| routed.and_then(|r| r.in_listener(l)))
                     .and_then(|(_, r)| r)
                     .map_or(Payload::Binary, |r| match r.ws {
                         WsPolicy::Taken(w) => w.payload,
@@ -888,7 +1177,11 @@ where
                     }),
                 });
             }
-            // what the peer sent, if anything: the last look at this slot
+            // what the peer sent, if anything, unless the stream holds
+            // it back: the last look at this slot
+            if *rx == Flow::Held {
+                continue;
+            }
             if let Some(step) = driver.poll_rx(now) {
                 let (event, role) = step.into_parts();
                 return Some(Event {
@@ -956,13 +1249,26 @@ where
     fn released(&mut self, conn: ConnId) -> Result<(), Gone> {
         Ss::released(self, conn)
     }
+
+    fn next_connect(&mut self) -> Option<(ConnId, Connect<'_>)> {
+        Ss::next_connect(self)
+    }
+
+    fn connected(&mut self, now: Instant, conn: ConnId, tls: Option<T>) -> Result<(), Gone> {
+        Ss::connected(self, now, conn, tls)
+    }
+
+    fn connect_failed(&mut self, now: Instant, conn: ConnId) -> Result<(), Gone> {
+        Ss::connect_failed(self, now, conn)
+    }
 }
 
-/// What a stream is told of its connection's event.
+/// What a stream is told of its connection's event: `l` is the listener
+/// an accepted one came in on.
 fn told<'a, S, R, T>(
     event: ConnEvent<'a>,
     conn: &'a mut Conn<S, R>,
-    l: &'a Listener<'a>,
+    l: Option<&'a Listener<'a>>,
     routed: &mut Option<Routed>,
     h1: &mut Spare<npro_h1::Storage<S>>,
     now: Instant,
@@ -971,36 +1277,45 @@ where
     S: AsRef<[u8]> + AsMut<[u8]>,
     R: Random,
 {
-    match event {
-        ConnEvent::H1Server(server::Event::Request) => request(conn, l, routed, h1, now),
-        ConnEvent::H1Server(server::Event::Body(data))
-        | ConnEvent::H1Client(npro_h1::client::Event::Body(data))
-        | ConnEvent::Raw(npro_io::raw::Event::Data(data)) => Kind::Rx {
+    match (event, l) {
+        (ConnEvent::H1Server(server::Event::Request), Some(l)) => request(conn, l, routed, h1, now),
+        (
+            ConnEvent::H1Server(server::Event::Body(data))
+            | ConnEvent::H1Client(h1c::Event::Body(data))
+            | ConnEvent::Raw(npro_io::raw::Event::Data(data)),
+            _,
+        ) => Kind::Rx {
             data,
             end: End::More,
         },
-        ConnEvent::H1Server(server::Event::BodyEnd)
-        | ConnEvent::H1Client(npro_h1::client::Event::BodyEnd) => Kind::Rx {
+        (
+            ConnEvent::H1Server(server::Event::BodyEnd) | ConnEvent::H1Client(h1c::Event::BodyEnd),
+            _,
+        ) => Kind::Rx {
             data: &[],
             end: End::Last,
         },
-        // no client streams yet: their response comes with them
-        ConnEvent::H1Client(npro_h1::client::Event::Response) => Kind::Rx {
-            data: &[],
-            end: End::More,
+        (ConnEvent::H1Client(h1c::Event::Response), _) => match conn.role() {
+            Role::H1Client(client) => Kind::Response(Resp { client }),
+            // never so: the response came from an h1 client
+            Role::H1Server(_) | Role::WsServer(_) | Role::WsClient(_) | Role::Raw(_) => {
+                Kind::PeerClose { code: None }
+            }
         },
-        ConnEvent::Ws(ws::Event::Message { data, last, .. }) => Kind::Rx {
+        (ConnEvent::Ws(ws::Event::Message { data, last, .. }), _) => Kind::Rx {
             data,
             end: if last { End::Last } else { End::More },
         },
-        ConnEvent::Ws(ws::Event::Pong(_)) => Kind::Pong,
-        ConnEvent::Ws(ws::Event::PeerClose(c)) => Kind::PeerClose {
+        (ConnEvent::Ws(ws::Event::Pong(_)), _) => Kind::Pong,
+        (ConnEvent::Ws(ws::Event::PeerClose(c)), _) => Kind::PeerClose {
             code: match c.payload() {
                 [a, b, ..] => Some(u16::from_be_bytes([*a, *b])),
                 [] | [_] => None,
             },
         },
-        ConnEvent::Raw(npro_io::raw::Event::PeerClosed) => Kind::PeerClose { code: None },
+        // a request on no listener is never so: it comes in on one
+        (ConnEvent::Raw(npro_io::raw::Event::PeerClosed), _)
+        | (ConnEvent::H1Server(server::Event::Request), None) => Kind::PeerClose { code: None },
     }
 }
 
@@ -1286,7 +1601,9 @@ mod tests {
                 }
                 Kind::Pong => Seen::Pong,
                 Kind::PeerClose { code } => Seen::PeerClose(code),
-                Kind::Disconnected => Seen::Disconnected(stream),
+                Kind::Response(_) | Kind::ConnectFailed | Kind::Disconnected => {
+                    Seen::Disconnected(stream)
+                }
             });
             if tx {
                 ss.request_tx(stream).unwrap();
@@ -1508,6 +1825,8 @@ mod tests {
                 | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::Response(_)
+                | Kind::ConnectFailed
                 | Kind::Disconnected => continue,
             };
             match n {
@@ -1723,6 +2042,196 @@ mod tests {
             }
         }
         assert!(checked);
+    }
+
+    /// A client request for `/x`, closing after.
+    const fn get_x() -> Request<'static> {
+        Request {
+            method: b"GET",
+            path: b"/x",
+            host: Some(b"origin"),
+            origin: None,
+            scheme: h1c::Scheme::Http,
+            no_cache: false,
+            connection: h1c::Connection::Close,
+            headers: &[],
+            body: h1c::RequestBody::None,
+        }
+    }
+
+    #[test]
+    fn a_stream_connects_out_and_is_told_the_answer() {
+        let ls = [listener(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect("unix:/origin", None, get_x(), b"mine".to_vec())
+            .unwrap();
+        // nothing is told before the connection is made
+        assert!(ss.poll_event(T0).is_none());
+        let (conn, c) = ss.next_connect().unwrap();
+        assert_eq!((c.address, c.tls), ("unix:/origin", None));
+        assert!(ss.next_connect().is_none());
+        // a call that needs the connection waits; the user is there
+        assert_eq!(ss.request_tx_len(stream, 1), Err(CallError::Protocol));
+        assert_eq!(ss.user(stream).unwrap(), b"mine");
+        ss.connected(T0, conn, None).unwrap();
+        assert_eq!(
+            written(&mut ss, conn),
+            b"GET /x HTTP/1.1\r\nHost: origin\r\nconnection: close\r\n\r\n"
+        );
+        read(
+            &mut ss,
+            conn,
+            b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nSet-Cookie: a=1\r\n\
+              Set-Cookie: b=2\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let mut seen = Vec::new();
+        while let Some(ev) = ss.poll_event(T0) {
+            assert_eq!(ev.stream, stream);
+            seen.push(match ev.kind {
+                Kind::Response(r) => {
+                    assert_eq!(r.status(), 201);
+                    assert_eq!(r.header(b"Content-Type"), Some(&b"text/plain"[..]));
+                    assert_eq!(
+                        r.values(b"set-cookie").collect::<Vec<_>>(),
+                        [&b"a=1"[..], b"b=2"]
+                    );
+                    assert_eq!(r.values(b"x-none").count(), 0);
+                    Seen::Tx
+                }
+                Kind::Rx { data, end } => Seen::Rx(data.to_vec(), end),
+                Kind::Disconnected => Seen::Disconnected(stream),
+                Kind::ServerTxn(_)
+                | Kind::ServerUpgrade { .. }
+                | Kind::UpgradeRefused(_)
+                | Kind::Tx(_)
+                | Kind::Pong
+                | Kind::PeerClose { .. }
+                | Kind::ConnectFailed => panic!("{:?}", mem::discriminant(&ev.kind)),
+            });
+        }
+        assert_eq!(
+            seen,
+            [
+                Seen::Tx,
+                Seen::Rx(b"hello".to_vec(), End::More),
+                Seen::Rx(Vec::new(), End::Last)
+            ]
+        );
+        // the origin closes, as asked: the connection is carried to its
+        // end, the stream is told, and let go
+        read(&mut ss, conn, b"");
+        let mut released = false;
+        for _ in 0..10 {
+            // the FIN is seen as the connection is looked at
+            while ss.poll_event(T0).is_some() {}
+            match ss.want(T0, conn) {
+                Ok(Want::HalfClose) => ss.half_closed(T0, conn).unwrap(),
+                Ok(Want::Release(_)) => {
+                    released = true;
+                    break;
+                }
+                Ok(Want::Io(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(released);
+        ss.released(conn).unwrap();
+        let mut told = 0;
+        while let Some(ev) = ss.poll_event(T0) {
+            assert!(matches!(ev.kind, Kind::Disconnected));
+            told += 1;
+        }
+        assert_eq!(told, 1);
+        assert!(ss.user(stream).is_err());
+        // the slot takes the next
+        assert!(ss.connect("unix:/again", None, get_x(), Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_connect_that_fails_tells_the_stream_and_frees_the_slot() {
+        let ls = [listener(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect("nowhere:1", Some("nowhere"), get_x(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            ss.connect("x:1", None, get_x(), Vec::new()).err(),
+            Some(ConnectError::Full)
+        );
+        let (conn, c) = ss.next_connect().unwrap();
+        assert_eq!(c.tls, Some("nowhere"));
+        ss.connect_failed(T0, conn).unwrap();
+        assert_eq!(ss.connect_failed(T0, conn), Err(Gone));
+        let mut seen = Vec::new();
+        while let Some(ev) = ss.poll_event(T0) {
+            seen.push(matches!(ev.kind, Kind::ConnectFailed));
+        }
+        assert_eq!(seen, [true]);
+        assert!(ss.user(stream).is_err());
+        assert_eq!(ss.request_tx(stream), Err(CallError::Gone));
+        // the slot is free again, for a connection or an accept
+        ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        // an address too long, and a request the client refuses, make no
+        // stream and keep the slot
+        let long = alloc::string::String::from_utf8(alloc::vec![b'a'; MAX_ADDRESS + 1]).unwrap();
+        let mut sl2 = slots(1);
+        let mut ss2 = Ss::new(&ls, &mut sl2).unwrap();
+        assert_eq!(
+            ss2.connect(&long, None, get_x(), Vec::new()).err(),
+            Some(ConnectError::AddressTooLong)
+        );
+        let bad = Request {
+            headers: &[(b"content-length", b"1")],
+            ..get_x()
+        };
+        assert!(matches!(
+            ss2.connect("x:1", None, bad, Vec::new()),
+            Err(ConnectError::Request(_))
+        ));
+        assert!(ss2.connect("x:1", None, get_x(), Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_held_stream_is_told_nothing_until_it_is_given_again() {
+        let ls = [listener(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let stream = StreamId {
+            slot: 0,
+            generation: 0,
+        };
+        ss.flow(stream, Flow::Held).unwrap();
+        read(&mut ss, conn, b"GET /one HTTP/1.1\r\n\r\n");
+        // what came waits in the connection
+        assert_eq!(serve(&mut ss, true), []);
+        assert_eq!(serve(&mut ss, true), []);
+        ss.flow(stream, Flow::Given).unwrap();
+        assert!(matches!(
+            serve(&mut ss, true).first(),
+            Some(Seen::Txn(_, p)) if p == b"/one"
+        ));
+    }
+
+    #[test]
+    fn a_stream_destroyed_while_connecting_is_hung_up_once_made() {
+        let ls = [listener(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect("unix:/origin", None, get_x(), Vec::new())
+            .unwrap();
+        let (conn, _) = ss.next_connect().unwrap();
+        ss.destroy(T0, stream).unwrap();
+        assert_eq!(ss.destroy(T0, stream), Err(CallError::Gone));
+        ss.connected(T0, conn, None).unwrap();
+        assert!(matches!(ss.want(T0, conn), Ok(Want::Release(_))));
+        ss.released(conn).unwrap();
+        assert!(ss.poll_event(T0).is_none());
+        assert!(ss.connect("unix:/again", None, get_x(), Vec::new()).is_ok());
     }
 
     #[test]

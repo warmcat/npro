@@ -231,6 +231,8 @@ pub fn act<'s, 'j>(
             | Kind::Rx { .. }
             | Kind::Pong
             | Kind::PeerClose { .. }
+            | Kind::Response(_)
+            | Kind::ConnectFailed
             | Kind::Disconnected => {}
         }
         if wants_tx {

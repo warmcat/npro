@@ -4,12 +4,13 @@ use core::time::Duration;
 
 use npro_core::random::SeededRandom;
 use npro_core::time::Instant;
+use npro_h1::client::{Connection, Request, RequestBody, Scheme};
 use npro_h1::server::Config;
 use npro_io::driver::{Buffers, NetBuffers, Want};
-use npro_ss::event::{End, Filled, Kind, Response, Txn};
+use npro_ss::event::{End, Filled, Kind, Resp, Response, Txn};
 use npro_ss::id::{ConnId, ListenerId, StreamId};
 use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
-use npro_ss::ss::{AcceptError, CallError, ConnStorage, Slot, Ss};
+use npro_ss::ss::{AcceptError, CallError, ConnStorage, ConnectError, Slot, Ss};
 
 use crate::targets::{control, finding};
 
@@ -175,6 +176,21 @@ fn check_routed(txn: &Txn<'_, Vec<u8>>) {
     }
 }
 
+/// A client stream's response head is in: its status and its headers
+/// are readable, and the stream may ask to write, which gives nothing.
+fn response_seen(r: &Resp<'_, Vec<u8>>, how: u8) -> Then {
+    let _ = (
+        r.status(),
+        r.header(b"content-type"),
+        r.values(b"set-cookie").count(),
+    );
+    if how & 1 == 0 {
+        Then::Tx
+    } else {
+        Then::Nothing
+    }
+}
+
 /// Takes the next byte of `ops`, or 0 once there are none.
 fn take(ops: &mut &[u8]) -> u8 {
     let (b, rest) = ops.split_first().map_or((0, &[][..]), |(b, r)| (*b, r));
@@ -222,6 +238,50 @@ impl Run<'_> {
         unreleased
             .saturating_add(self.accepted.saturating_sub(ended))
             .saturating_add(1)
+    }
+
+    /// A stream connecting out, `arg` choosing its request's body: it
+    /// takes a slot, as an accept does.
+    fn connect(&mut self, arg: u8) {
+        let must = self.holding() < SLOTS;
+        let body = match arg & 3 {
+            0 => RequestBody::None,
+            1 => RequestBody::Length(u64::from(arg >> 2)),
+            2 => RequestBody::Chunked,
+            _ => RequestBody::Length(0),
+        };
+        let req = Request {
+            method: if arg & 4 == 0 { b"GET" } else { b"POST" },
+            path: b"/x",
+            host: Some(b"origin"),
+            origin: None,
+            scheme: Scheme::Http,
+            no_cache: false,
+            connection: Connection::Close,
+            headers: &[],
+            body,
+        };
+        match self.ss.connect("unix:/origin", None, req, ()) {
+            Ok(_) => self.accepted = self.accepted.saturating_add(1),
+            Err(ConnectError::Full) if !must => {}
+            Err(e) => finding(TARGET, format_args!("connect refused: {e}")),
+        }
+    }
+
+    /// The adapter's answer to the next connect asked for, if one is:
+    /// made, or failed, as `arg` says.
+    fn answer_connect(&mut self, arg: u8) {
+        let Some((conn, _)) = self.ss.next_connect() else {
+            return;
+        };
+        if arg & 8 == 0 {
+            if self.ss.connected(self.now, conn, None).is_err() {
+                finding(TARGET, format_args!("{conn} asked for, not taken"));
+            }
+            self.conns.push((conn, false));
+        } else if self.ss.connect_failed(self.now, conn).is_err() {
+            finding(TARGET, format_args!("{conn} asked for, not failed"));
+        }
     }
 
     fn accept(&mut self, listener: u8) {
@@ -325,7 +385,8 @@ impl Run<'_> {
                     }
                     Then::Nothing
                 }
-                Kind::Disconnected => Then::Gone,
+                Kind::Disconnected | Kind::ConnectFailed => Then::Gone,
+                Kind::Response(r) => response_seen(&r, how),
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
                 | Kind::Pong
@@ -500,12 +561,24 @@ pub fn ss_server(data: &[u8]) {
                     let _ = run.ss.read_done(run.now, c, 0);
                 }
             }
-            _ => run.settle(),
+            _ => {
+                if arg & 16 == 0 {
+                    run.connect(arg);
+                } else {
+                    run.answer_connect(arg);
+                }
+            }
         }
         run.settle();
         run.audit();
     }
-    // the end: everything hung up, carried to its release, and told
+    // the end: a connect never answered fails; everything hung up,
+    // carried to its release, and told
+    while let Some((conn, _)) = run.ss.next_connect() {
+        if run.ss.connect_failed(run.now, conn).is_err() {
+            finding(TARGET, format_args!("{conn} asked for, not failed"));
+        }
+    }
     for (c, released) in run.conns.clone() {
         if !released {
             let _ = run.ss.hangup(run.now, c);

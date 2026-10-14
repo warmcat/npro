@@ -335,6 +335,9 @@ Not yet, in this half:
 - the request's path and headers are not given to a stream whose
   request became ws, beyond its route: they would have to be copied
   into the stream's metadata;
+- a request's body is pulled by the client role only for a
+  `Content-Length`: a chunked request body's chunks are not declared
+  through the stream yet;
 - the 101 and the h1 role's own refusal pages carry none of the
   vhost's headers, where C adds them; the status page a stream answers
   with (`Txn::status()`) does;
@@ -351,6 +354,40 @@ Not yet, in this half:
 streams over real sockets (2026-10-12): its tests serve h1 over TCP and
 a unix domain socket, echo ws, send an answer far larger than the
 buffers, and take more clients than there are slots.
+
+### The client half, first form
+
+Built 2026-10-14, as far as the proxy needs it.  `Ss::connect(address,
+tls, request, user)` makes a stream in a free slot with its h1 request
+composed, and asks the adapter for the connection: `Ss::next_connect()`
+gives the adapter what to connect (`unix:/path` or a host and port, and
+the server name if tls), `connected()` or `connect_failed()` is its
+answer, and from there the connection is driven by its id as an
+accepted one is.  The stream is told `Response` when the answer's head
+is in (the peer has agreed: C's `ESTABLISHED_CLIENT_HTTP`, and the
+`Connected` of the sketch), with the status and the headers by name,
+each value of a repeated one; `Rx` for the body and its end; `Tx` for
+the request's body, pulled as it goes; `Disconnected` when the
+connection goes; `ConnectFailed` when it could not be made, after
+which the stream is gone.  A request the h1 client refuses makes no
+stream and keeps the slot's storage: `Client::new()` gives it back.
+`Ss::flow()` holds a stream's rx (C's `lws_rx_flow_control()`): what
+its peer sends waits in the connection's buffer, and once that is full
+the socket is not read, so the peer is held back; for a proxy, which
+reads a side only when the other has room.
+
+C's h1 client transcripts replay through a client stream as they do
+through the client role (`ss_client_replay.rs`); the threads test
+fetches an answer from its own listener by a stream connecting out;
+the fuzz target makes streams connect, with a body or not, and
+answers or fails their connects.
+
+Not yet, of the sketch: streamtypes from the policy (the address and
+the request are the caller's for now), retry and backoff, redirects
+followed, a connection kept warm and joined, dns beyond the adapter's
+blocking resolver, tls on a connection made (the adapter's `Makes` has
+the hook; no runner makes one yet), ws client streams, and `QosAck` /
+`QosNack`.
 
 Tests: C's server transcripts (h1, ws, permessage-deflate) replay
 through an accepted stream as they do through the driver; unit tests

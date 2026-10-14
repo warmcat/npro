@@ -41,8 +41,9 @@ The protocol crates' targets start from the C library's corpora
 - `ss-server`: written for it, a control byte first, then the operations
   `crates/npro-fuzz/src/ss.rs` reads: a GET answered, two pipelined and a
   hangup, a POST's body, a stream destroyed, a head that times out, a ws
-  echo and close, ws with permessage-deflate, an upgrade refused, and the
-  slots running out.
+  echo and close, ws with permessage-deflate, an upgrade refused, the
+  slots running out, a stream connecting out with a GET and with a
+  POST's body, and a connect that fails.
 - `files`: written for it, a control byte then the request: a file, a
   directory's default document, a route asked for without its `/`, a
   HEAD with a matching `if-none-match`, a large file, a path reaching

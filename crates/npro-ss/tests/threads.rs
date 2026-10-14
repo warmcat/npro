@@ -20,6 +20,7 @@ mod threads {
 
     use npro_core::random::SeededRandom;
     use npro_core::time::Instant;
+    use npro_h1::client::{Connection, Request, RequestBody, Scheme};
     use npro_h1::server::Config;
     use npro_io::driver::{Buffers, NetBuffers};
     use npro_io::threads::{Jobs, Listening, Stop, Workers, bind, serve};
@@ -35,7 +36,13 @@ mod threads {
         at: usize,
         /// A ws message being gathered, to echo whole.
         msg: Vec<u8>,
+        /// A client stream's: the accepted stream whose answer it fetches.
+        fetching_for: Option<StreamId>,
     }
+
+    /// What `/fetch` is answered with: `/hello`'s answer, fetched from
+    /// this very server by a stream connecting out.
+    const FETCH: &[u8] = b"/hello";
 
     type S<'s> = Ss<'s, App, Vec<u8>, SeededRandom>;
 
@@ -103,6 +110,11 @@ mod threads {
         Message(u64),
         /// The answer comes from a job, off the application's turn.
         Job,
+        /// The answer is fetched from this server, by a stream
+        /// connecting out.
+        Fetch,
+        /// A fetched answer, for the stream that asked.
+        Deliver(StreamId, Vec<u8>),
     }
 
     /// What `/job` answers, made on a worker thread.
@@ -111,7 +123,7 @@ mod threads {
     /// The application: an h1 request is answered with its path, or for
     /// `/big`, [`BIG`] bytes, or for `/job`, what a job comes to; a ws
     /// message is echoed.
-    fn app<'s, 'j>(ss: &mut S<'s>, now: Instant, jobs: &Jobs<'j, S<'s>>) {
+    fn app<'s, 'j>(ss: &mut S<'s>, now: Instant, jobs: &Jobs<'j, S<'s>>, self_addr: &str) {
         while let Some(ev) = ss.poll_event(now) {
             let (stream, user): (StreamId, &mut App) = (ev.stream, ev.user);
             let then = match ev.kind {
@@ -121,12 +133,13 @@ mod threads {
                         // far more than the buffers hold
                         b"/big" => (vec![b'x'; BIG], Then::Tx),
                         b"/job" => (Vec::new(), Then::Job),
+                        b"/fetch" => (Vec::new(), Then::Fetch),
                         p => (p.to_vec(), Then::Tx),
                     };
-                    let len = if path == b"/job" {
-                        FROM_JOB.len()
-                    } else {
-                        out.len()
+                    let len = match path {
+                        b"/job" => FROM_JOB.len(),
+                        b"/fetch" => FETCH.len(),
+                        _ => out.len(),
                     };
                     user.out = out;
                     user.at = 0;
@@ -141,12 +154,16 @@ mod threads {
                 }
                 Kind::Rx { data, end } => {
                     user.msg.extend_from_slice(data);
-                    if end == End::Last {
+                    if end != End::Last {
+                        Then::Nothing
+                    } else if let Some(asked) = user.fetching_for {
+                        // a client stream's body is whole: for the stream
+                        // that asked for it
+                        Then::Deliver(asked, core::mem::take(&mut user.msg))
+                    } else {
                         user.out = core::mem::take(&mut user.msg);
                         user.at = 0;
                         Then::Message(u64::try_from(user.out.len()).unwrap())
-                    } else {
-                        Then::Nothing
                     }
                 }
                 Kind::Tx(tx) => {
@@ -163,16 +180,31 @@ mod threads {
                     });
                     Then::Nothing
                 }
+                Kind::Response(r) => {
+                    assert_eq!(r.status(), 200);
+                    Then::Nothing
+                }
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::ConnectFailed
                 | Kind::Disconnected => Then::Nothing,
             };
             match then {
                 Then::Nothing => {}
                 Then::Tx => ss.request_tx(stream).unwrap(),
                 Then::Message(len) => ss.request_tx_len(stream, len).unwrap(),
+                Then::Fetch => fetch(ss, stream, self_addr),
+                Then::Deliver(asked, body) => {
+                    if let Ok(u) = ss.user(asked) {
+                        u.out = body;
+                        u.at = 0;
+                        ss.request_tx(asked).unwrap();
+                    }
+                    // the client stream is done with
+                    ss.destroy(now, stream).unwrap();
+                }
                 Then::Job => jobs.spawn(move || {
                     // off the turn, with no lock held: it may take its time
                     thread::sleep(core::time::Duration::from_millis(20));
@@ -190,12 +222,42 @@ mod threads {
         }
     }
 
+    /// A stream connecting out to this server, at `self_addr`, to fetch
+    /// `/hello` for the stream `asked`.
+    fn fetch(ss: &mut S<'_>, asked: StreamId, self_addr: &str) {
+        ss.connect(
+            self_addr,
+            None,
+            Request {
+                method: b"GET",
+                path: FETCH,
+                host: Some(b"test"),
+                origin: None,
+                scheme: Scheme::Http,
+                no_cache: false,
+                connection: Connection::Close,
+                headers: &[],
+                body: RequestBody::None,
+            },
+            App {
+                fetching_for: Some(asked),
+                ..App::default()
+            },
+        )
+        .unwrap();
+    }
+
     /// Serves `listeners`, bound where each says, in `n` slots, while
     /// `client` runs, given the listeners bound; then stops.
     fn with_server(listeners: &[Listener<'static>], n: usize, client: impl FnOnce(&[Listening])) {
         let mut sl = slots(n);
         let ss = Ss::new(listeners, &mut sl).unwrap();
         let bound: Vec<Listening> = listeners.iter().map(|l| bind(l.bind).unwrap()).collect();
+        // the first listener's address, for a stream connecting back
+        let self_addr = bound
+            .first()
+            .and_then(|b| b.local_addr().unwrap())
+            .map_or(String::new(), |a| a.to_string());
         let mut serving = Vec::new();
         for (i, b) in (0..).zip(&bound) {
             let id = ListenerId::new(i);
@@ -203,8 +265,16 @@ mod threads {
         }
         let stop = Stop::new();
         thread::scope(|scope| {
-            let server =
-                scope.spawn(|| serve(ss, serving, &|_| None, app, Workers::default(), &stop));
+            let server = scope.spawn(|| {
+                serve(
+                    ss,
+                    serving,
+                    &|_| None,
+                    |ss: &mut S<'_>, now, jobs| app(ss, now, jobs, &self_addr),
+                    Workers::default(),
+                    &stop,
+                )
+            });
             client(&bound);
             stop.stop();
             server.join().unwrap();
@@ -253,6 +323,18 @@ mod threads {
             c.write_all(b"GET /job HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                 .unwrap();
             assert!(all(c).ends_with(b"\r\n\r\nfrom a job"));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
+    fn an_answer_fetched_by_a_stream_connecting_out_is_delivered() {
+        with_server(&[listener("127.0.0.1:0")], 4, |l| {
+            let mut c = tcp(&l[0]);
+            c.write_all(b"GET /fetch HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let got = all(c);
+            assert!(got.ends_with(b"\r\n\r\n/hello"), "{}", got.escape_ascii());
         });
     }
 

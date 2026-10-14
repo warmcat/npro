@@ -125,6 +125,8 @@ mod runner {
                 | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::Response(_)
+                | Kind::ConnectFailed
                 | Kind::Disconnected => false,
             };
             if tx {

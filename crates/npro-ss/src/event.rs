@@ -8,6 +8,7 @@
 
 use npro_core::random::Random;
 use npro_core::time::Instant;
+use npro_h1::client::Client;
 use npro_h1::server::{self, Response as H1Response, Server, TxSource};
 use npro_h1::table::{Fragments, HeaderTable};
 use npro_h1::token::{Lookup, Token, lookup};
@@ -47,6 +48,15 @@ pub enum Kind<'a, S, R, T> {
     /// The request asked for ws, and was refused as C refuses it: the
     /// connection closes once the refusal has gone.
     UpgradeRefused(Refusal),
+    /// A stream that connected out has its answer's head, C's
+    /// `ESTABLISHED_CLIENT_HTTP`, and so is connected, as the peer has
+    /// agreed: read it through the [`Resp`].  Its body follows as
+    /// [`Kind::Rx`].
+    Response(Resp<'a, S>),
+    /// A stream that connected out could not be: the address did not
+    /// resolve, the connect was refused, or its tls could not be made.
+    /// The stream is gone, as after [`Kind::Disconnected`].
+    ConnectFailed,
     /// The peer's payload: a piece of a request's body, or of a ws
     /// message.
     Rx {
@@ -68,6 +78,104 @@ pub enum Kind<'a, S, R, T> {
     /// The stream's connection is gone, and so is the stream: its id is
     /// refused from here, and its `U` dropped before the next event.
     Disconnected,
+}
+
+/// Whether what a stream's peer sends is given to it: [`crate::ss::Ss::flow`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    /// It is, as it comes.
+    Given,
+    /// It waits in the connection's buffer, and the peer is held back
+    /// once that is full.
+    Held,
+}
+
+/// A response's head, in hand: [`Kind::Response`].
+#[derive(Debug)]
+pub struct Resp<'a, S> {
+    pub(crate) client: &'a Client<S>,
+}
+
+impl<S: AsRef<[u8]> + AsMut<[u8]>> Resp<'_, S> {
+    /// The status.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.client.status().unwrap_or(0)
+    }
+
+    /// The value of the response's header `name`, any case, without its
+    /// `:`, as [`Txn::header`] finds a request's: the first, of one that
+    /// came more than once.
+    #[must_use]
+    pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
+        header(self.client.response(), name)
+    }
+
+    /// Every value of the response's header `name`, in order, for one
+    /// that may come more than once, `set-cookie` say: each, for a
+    /// header npro knows by name, without the SP the parser keeps to
+    /// join it to the one before; the first alone for any other.
+    #[must_use]
+    pub fn values(&self, name: &[u8]) -> Values<'_> {
+        let t = self.client.response();
+        let mut key = [0u8; MAX_NAME];
+        let known = name
+            .len()
+            .checked_add(1)
+            .and_then(|len| key.get_mut(..len))
+            .and_then(|key| {
+                let (body, colon) = key.split_at_mut(name.len());
+                body.copy_from_slice(name);
+                body.make_ascii_lowercase();
+                colon.copy_from_slice(b":");
+                match lookup(key) {
+                    Lookup::Matched(tok) => Some(tok),
+                    Lookup::Prefix | Lookup::Nothing => None,
+                }
+            });
+        match known {
+            Some(tok) => Values::Each(t.fragments(tok)),
+            None => Values::One(self.header(name)),
+        }
+    }
+}
+
+/// The values of a header: [`Resp::values`].
+#[derive(Debug)]
+pub enum Values<'a> {
+    /// Each, of a header npro knows by name.
+    Each(Fragments<'a>),
+    /// The first alone, of any other.
+    One(Option<&'a [u8]>),
+}
+
+impl<'a> Iterator for Values<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        match self {
+            Self::Each(f) => f.next().map(|v| v.strip_prefix(b" ").unwrap_or(v)),
+            Self::One(v) => v.take(),
+        }
+    }
+}
+
+/// The value of the header `name` in `t`, as [`Txn::header`] finds it.
+fn header<'t, S: AsRef<[u8]> + AsMut<[u8]>>(
+    t: &'t HeaderTable<S>,
+    name: &[u8],
+) -> Option<&'t [u8]> {
+    let mut key = [0u8; MAX_NAME];
+    let len = name.len().checked_add(1)?;
+    let key = key.get_mut(..len)?;
+    let (body, colon) = key.split_at_mut(name.len());
+    body.copy_from_slice(name);
+    body.make_ascii_lowercase();
+    colon.copy_from_slice(b":");
+    match lookup(key) {
+        Lookup::Matched(tok) => t.first(tok),
+        Lookup::Prefix | Lookup::Nothing => t.unknown(key),
+    }
 }
 
 /// Whether a piece of payload ends what it is a piece of.
@@ -247,17 +355,7 @@ impl<'a, S: AsRef<[u8]> + AsMut<[u8]>> Txn<'a, S> {
     /// as C's custom headers are.
     #[must_use]
     pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
-        let mut key = [0u8; MAX_NAME];
-        let len = name.len().checked_add(1)?;
-        let key = key.get_mut(..len)?;
-        let (body, colon) = key.split_at_mut(name.len());
-        body.copy_from_slice(name);
-        body.make_ascii_lowercase();
-        colon.copy_from_slice(b":");
-        match lookup(key) {
-            Lookup::Matched(t) => self.table().first(t),
-            Lookup::Prefix | Lookup::Nothing => self.table().unknown(key),
-        }
+        header(self.table(), name)
     }
 
     /// Answers the request: the vhost's headers, then the route's, then

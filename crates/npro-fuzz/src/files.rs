@@ -212,6 +212,8 @@ fn events(ss: &mut S<'_>, answered: &mut usize) {
             | Kind::Rx { .. }
             | Kind::Pong
             | Kind::PeerClose { .. }
+            | Kind::Response(_)
+            | Kind::ConnectFailed
             | Kind::Disconnected => {}
         }
     }

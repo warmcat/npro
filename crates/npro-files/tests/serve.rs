@@ -196,6 +196,8 @@ mod serve {
                     | Kind::Rx { .. }
                     | Kind::Pong
                     | Kind::PeerClose { .. }
+                    | Kind::Response(_)
+                    | Kind::ConnectFailed
                     | Kind::Disconnected => {}
                 }
             }

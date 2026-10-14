@@ -264,6 +264,8 @@ mod ss_server_replay {
                 Kind::UpgradeRefused(_)
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::Response(_)
+                | Kind::ConnectFailed
                 | Kind::Disconnected => Then::Nothing,
             };
             match then {
