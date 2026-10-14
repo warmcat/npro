@@ -20,7 +20,7 @@ license      = "MIT"
 npro-io  = { path = "../crates/npro-io", features = ["rustls"] }
 # aws-lc-rs as rustls' provider, and std for rustls' clock and its config
 # builders: docs/dependencies.md, "The npro-aws-lc workspace"
-rustls   = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls   = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
 [dev-dependencies]
 npro-core = { path = "../crates/npro-core" }

@@ -17,7 +17,7 @@ npro-h1.workspace   = true
 npro-ws.workspace   = true
 # tls, with no crypto provider: the application gives rustls its own.
 # docs/dependencies.md
-rustls = { version = "0.23.45", default-features = false, features = ["tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["tls12"], optional = true }
 
 [dev-dependencies]
 npro-core = { workspace = true, features = ["replay"] }

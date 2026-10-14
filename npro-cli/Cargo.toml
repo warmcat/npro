@@ -34,7 +34,7 @@ npro-proxy  = { path = "../crates/npro-proxy" }
 npro-ws     = { path = "../crates/npro-ws", features = ["pmd"] }
 npro-aws-lc = { path = "../npro-aws-lc" }
 # as npro-aws-lc has it: the config builders, and the provider's random
-rustls      = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls      = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
 # dropping the capability to bind privileged ports once bound: Andy,
 # 2026-10-12; docs/dependencies.md, "The npro-cli workspace"
