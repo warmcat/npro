@@ -121,6 +121,7 @@ mod connect {
                 Connect {
                     address: &self.address,
                     tls: None,
+                    identity: None,
                 },
             ))
         }

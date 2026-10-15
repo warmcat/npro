@@ -139,6 +139,8 @@ mod files_replay {
                 }
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }

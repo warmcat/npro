@@ -354,6 +354,27 @@ impl Run<'_> {
         }
     }
 
+    /// A stream connecting out for ws, offering the echo protocol or
+    /// none as `arg` says: the input then plays the server.
+    fn connect_ws(&mut self, arg: u8) {
+        let must = self.holding() < SLOTS;
+        let offered = (arg & 1 == 0).then_some(PROTOCOLS[0]);
+        match self.ss.connect_ws(
+            "unix:/dist",
+            None,
+            b"dist",
+            b"/",
+            offered,
+            Payload::Text,
+            SeededRandom::new(u64::from(arg)),
+            (),
+        ) {
+            Ok(_) => self.accepted = self.accepted.saturating_add(1),
+            Err(ConnectError::Full) if !must => {}
+            Err(e) => finding(TARGET, format_args!("ws connect refused: {e}")),
+        }
+    }
+
     /// The adapter's answer to the next connect asked for, if one is:
     /// made, or failed, as `arg` says.
     fn answer_connect(&mut self, arg: u8) {
@@ -468,11 +489,23 @@ impl Run<'_> {
                     opened = true;
                     Then::Nothing
                 }
+                Kind::ClientUpgraded { protocol } => {
+                    // the server chose among what was offered, or nothing
+                    if protocol.is_some_and(|p| p != PROTOCOLS[0]) {
+                        finding(
+                            TARGET,
+                            format_args!("chose {}", protocol.unwrap_or_default().escape_ascii()),
+                        );
+                    }
+                    Then::Nothing
+                }
                 Kind::ServerTxnEnd(e) => {
                     ended(&mut self.open, stream, e);
                     Then::Nothing
                 }
-                Kind::Pong | Kind::PeerClose { .. } => Then::Nothing,
+                // a client stream the server would not switch is dropped,
+                // with no transaction of its own to end
+                Kind::NotUpgraded { .. } | Kind::Pong | Kind::PeerClose { .. } => Then::Nothing,
             };
             if opened {
                 self.opened(stream);
@@ -650,10 +683,12 @@ pub fn ss_server(data: &[u8]) {
                 }
             }
             _ => {
-                if arg & 16 == 0 {
-                    run.connect(arg);
-                } else {
+                if arg & 16 != 0 {
                     run.answer_connect(arg);
+                } else if arg & 8 != 0 {
+                    run.connect_ws(arg);
+                } else {
+                    run.connect(arg);
                 }
             }
         }

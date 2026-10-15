@@ -90,6 +90,8 @@ mod ss_client_replay {
                 Kind::ServerTxn(_)
                 | Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::Tx(_)
                 | Kind::Pong
                 | Kind::PeerClose { .. }

@@ -39,6 +39,11 @@ pub struct Connect<'a> {
     /// The server name to make the connection's tls for, or `None` for a
     /// plain connection.
     pub tls: Option<&'a str>,
+    /// Which of the identities the adapter's tls has to present, by
+    /// name, for a server that asks who the client is (mTLS); `None` to
+    /// present none.  What the names are is between the application and
+    /// what makes the tls.
+    pub identity: Option<&'a str>,
 }
 
 /// Many connections, driven by id: see the module's description.  Each

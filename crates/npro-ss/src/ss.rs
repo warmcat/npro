@@ -20,7 +20,7 @@ use core::net::SocketAddr;
 use npro_core::close::Close;
 use npro_core::random::Random;
 use npro_core::time::Instant;
-use npro_h1::client::{self as h1c, Client, Request};
+use npro_h1::client::{self as h1c, Client, Connection, Request, RequestBody, Scheme};
 use npro_h1::server::{self, NoPayload, Server};
 use npro_h1::table::MAX_CAPACITY;
 use npro_h1::token::Token;
@@ -29,7 +29,7 @@ use npro_io::driver::{Buffers, Driver, NetBuffers, Parts, Want};
 use npro_io::host::{Connect, Host};
 use npro_io::tls::{NoTls, RecordLayer};
 use npro_ws::conn::{self as ws, Ws};
-use npro_ws::handshake::{self, MAX_101};
+use npro_ws::handshake::{self, ClientKey, MAX_101, MAX_REQUEST_LINES};
 
 use crate::event::{
     End, Ended, Event, Flow, Kind, Own, Refusal, Resp, RespondError, Response, Tx, TxWant, Txn,
@@ -118,7 +118,7 @@ enum Link<S, R, T> {
     Free(ConnStorage<S>),
     /// Asked of the adapter, with its request composed, until it is made
     /// or fails.
-    Connecting(Connecting<S>),
+    Connecting(Connecting<S, R>),
     /// Carried by a driver.
     Live(Live<S, R, T>),
     /// Never so: the storage was lost making a connection that could not
@@ -129,27 +129,83 @@ enum Link<S, R, T> {
 
 /// A connection the adapter is to make, and what it will carry.
 #[derive(Debug)]
-struct Connecting<S> {
+struct Connecting<S, R> {
     client: Client<S>,
     bufs: Buffers<S>,
     net: NetBuffers<S>,
     address: Name,
     tls: Option<Name>,
+    identity: Option<Short>,
+    /// The ws the stream asked for, if it did.
+    ws: ClientWs<R>,
     /// The adapter has taken it.
     asked: bool,
 }
 
+/// The tls a stream connects out with: [`Ss::connect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTls<'a> {
+    /// The server name the connection's tls is for, its SNI and what
+    /// its certificate must name.
+    pub server_name: &'a str,
+    /// The identity to present if the server asks who the client is
+    /// (mTLS), by a name the adapter's tls knows; `None` for none.
+    pub identity: Option<&'a str>,
+}
+
+/// The ws of a stream that connected out.
+#[derive(Debug)]
+enum ClientWs<R> {
+    /// None was asked for: the stream is h1.
+    None,
+    /// Asked for in the request, and not yet answered.
+    Asked(WsAsk<R>),
+    /// Agreed by the server: the connection carries ws.
+    Upgraded {
+        /// The subprotocol the server chose, if one.
+        protocol: Option<Short>,
+        /// What the stream's messages are.
+        payload: Payload,
+    },
+    /// Refused, or agreed in a way the key did not accept: the connection
+    /// is hung up at the next look, as C drops it.
+    Refused,
+}
+
+/// A ws asked for on connecting, until the server answers.
+#[derive(Debug)]
+struct WsAsk<R> {
+    /// The key the request carried, which checks the server's accept.
+    key: ClientKey,
+    /// What masks the frames, once there are frames.
+    random: R,
+    /// The subprotocols offered, as the request listed them.
+    offered: Option<Short>,
+    /// What the stream's messages are.
+    payload: Payload,
+}
+
+/// The longest identity name, and the longest list of subprotocols a
+/// ws connect offers.
+pub const MAX_NAME: usize = 64;
+
 /// An address or a server name, copied in.
+type Name = Copied<MAX_ADDRESS>;
+
+/// An identity's name, or the subprotocols offered, copied in.
+type Short = Copied<MAX_NAME>;
+
+/// A string of at most `N` bytes, copied in.
 #[derive(Clone, Copy, Debug)]
-struct Name {
-    bytes: [u8; MAX_ADDRESS],
+struct Copied<const N: usize> {
+    bytes: [u8; N],
     len: usize,
 }
 
-impl Name {
+impl<const N: usize> Copied<N> {
     fn of(s: &str) -> Option<Self> {
         let mut n = Self {
-            bytes: [0; MAX_ADDRESS],
+            bytes: [0; N],
             len: s.len(),
         };
         n.bytes.get_mut(..s.len())?.copy_from_slice(s.as_bytes());
@@ -161,6 +217,10 @@ impl Name {
             .get(..self.len)
             .and_then(|b| core::str::from_utf8(b).ok())
             .unwrap_or_default()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or_default()
     }
 }
 
@@ -178,16 +238,24 @@ enum Side {
 struct Live<S, R, T> {
     driver: Driver<S, R, S, T>,
     side: Side,
+    keep: Keep<S, R>,
+    /// tls' buffers, when the connection is not tls.
+    net: Spare<NetBuffers<S>>,
+    /// The request in hand, for its transaction's end to be told.
+    open: Open,
+}
+
+/// What a connection keeps beside its driver.
+#[derive(Debug)]
+struct Keep<S, R> {
     /// Where its last request was routed, if one was.
     routed: Option<Routed>,
     /// The h1 role's storage, once a change of role gave it back.
     h1: Spare<npro_h1::Storage<S>>,
-    /// tls' buffers, when the connection is not tls.
-    net: Spare<NetBuffers<S>>,
     /// Where it was accepted from, if that has an address.
     peer: Option<SocketAddr>,
-    /// The request in hand, for its transaction's end to be told.
-    open: Open,
+    /// Its ws, for a stream that connected out.
+    ws: ClientWs<R>,
 }
 
 /// The request in hand on an accepted connection, as far as telling its
@@ -390,10 +458,13 @@ impl core::error::Error for AcceptError {}
 pub enum ConnectError {
     /// Every slot is in use.
     Full,
-    /// The address, or the server name, is longer than [`MAX_ADDRESS`].
+    /// The address or the server name is longer than [`MAX_ADDRESS`], or
+    /// the identity or the protocols offered longer than [`MAX_NAME`].
     AddressTooLong,
     /// The request was refused, as the h1 client refuses it.
     Request(h1c::NewError),
+    /// The random given for a ws connect could not draw its key.
+    Random,
 }
 
 impl core::fmt::Display for ConnectError {
@@ -402,6 +473,7 @@ impl core::fmt::Display for ConnectError {
             Self::Full => f.write_str("no slot free"),
             Self::AddressTooLong => write!(f, "an address longer than {MAX_ADDRESS}"),
             Self::Request(e) => write!(f, "request refused: {e}"),
+            Self::Random => f.write_str("no random for the ws key"),
         }
     }
 }
@@ -663,10 +735,13 @@ where
         slot.conn = Link::Live(Live {
             driver,
             side: Side::Accepted(listener),
-            routed: None,
-            h1: Spare::InUse,
+            keep: Keep {
+                routed: None,
+                h1: Spare::InUse,
+                peer,
+                ws: ClientWs::None,
+            },
             net,
-            peer,
             open: Open::Idle,
         });
         slot.stream = Stream::Live {
@@ -681,15 +756,15 @@ where
     }
 
     /// A stream connecting out, to `address` (`unix:/path`, or a host and
-    /// port, as the adapter reads them), over tls for the server name
-    /// `tls` if given, asking `request` once connected, with `user` its
-    /// own state.  The adapter is asked for the connection
-    /// ([`Ss::next_connect`]); the stream is told the answer's head
-    /// ([`Kind::Response`]), its body ([`Kind::Rx`]), or that the
-    /// connection could not be made ([`Kind::ConnectFailed`]).  The
-    /// request's body, if it has one, is pulled from the stream as it
-    /// asks to write.  The first form of a client stream: no retry, no
-    /// redirect followed, the connection closed after.
+    /// port, as the adapter reads them), over tls as `tls` says if given,
+    /// asking `request` once connected, with `user` its own state.  The
+    /// adapter is asked for the connection ([`Ss::next_connect`]); the
+    /// stream is told the answer's head ([`Kind::Response`]), its body
+    /// ([`Kind::Rx`]), or that the connection could not be made
+    /// ([`Kind::ConnectFailed`]).  The request's body, if it has one, is
+    /// pulled from the stream as it asks to write.  The first form of a
+    /// client stream: no retry, no redirect followed, the connection
+    /// closed after.
     ///
     /// # Errors
     ///
@@ -697,14 +772,106 @@ where
     pub fn connect(
         &mut self,
         address: &str,
-        tls: Option<&str>,
+        tls: Option<ClientTls<'_>>,
         request: Request<'_>,
         user: U,
     ) -> Result<StreamId, ConnectError> {
-        let address = Name::of(address).ok_or(ConnectError::AddressTooLong)?;
-        let tls = match tls {
+        self.start_connect(address, tls, request, ClientWs::None, user)
+    }
+
+    /// A stream connecting out for ws, to `address` over `tls` as
+    /// [`Ss::connect`] does, asking `path` on `host` to be upgraded,
+    /// offering `protocols` (a comma-separated list, or none), its
+    /// messages `payload`, its frames masked with what `random` draws,
+    /// which must be a source the server cannot predict: C's client
+    /// connect with a protocol.  Once the server agrees, the stream is
+    /// told so ([`Kind::ClientUpgraded`]) and from then it is ws:
+    /// messages come as [`Kind::Rx`], and one is sent by
+    /// [`Ss::request_tx_len`] and the [`Kind::Tx`] that follows.  A
+    /// server that will not switch is told as [`Kind::UpgradeRefused`]
+    /// with its status, and the connection is dropped, as C drops it.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError`], and no stream is made.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what a ws connect is made of, each its own; a struct would be these fields again"
+    )]
+    pub fn connect_ws(
+        &mut self,
+        address: &str,
+        tls: Option<ClientTls<'_>>,
+        host: &[u8],
+        path: &[u8],
+        protocols: Option<&[u8]>,
+        payload: Payload,
+        mut random: R,
+        user: U,
+    ) -> Result<StreamId, ConnectError>
+    where
+        R: Random,
+    {
+        let key = ClientKey::new(&mut random).map_err(|_| ConnectError::Random)?;
+        let mut lines = [0u8; MAX_REQUEST_LINES];
+        let n = key
+            .request_lines(protocols, None, &mut lines)
+            .ok_or(ConnectError::Request(h1c::NewError::Header(
+                h1c::HeaderRefused::Value,
+            )))?;
+        let offered = match protocols {
             None => None,
-            Some(t) => Some(Name::of(t).ok_or(ConnectError::AddressTooLong)?),
+            Some(p) => Some(
+                core::str::from_utf8(p)
+                    .ok()
+                    .and_then(Short::of)
+                    .ok_or(ConnectError::AddressTooLong)?,
+            ),
+        };
+        let request = Request {
+            method: b"GET",
+            path,
+            host: Some(host),
+            origin: Some(host),
+            scheme: if tls.is_some() {
+                Scheme::Https
+            } else {
+                Scheme::Http
+            },
+            no_cache: true,
+            connection: Connection::Upgrade(lines.get(..n).unwrap_or_default()),
+            headers: &[],
+            body: RequestBody::None,
+        };
+        let ws = ClientWs::Asked(WsAsk {
+            key,
+            random,
+            offered,
+            payload,
+        });
+        self.start_connect(address, tls, request, ws, user)
+    }
+
+    /// What [`Ss::connect`] and [`Ss::connect_ws`] share: the slot, the
+    /// request composed, and the stream made.
+    fn start_connect(
+        &mut self,
+        address: &str,
+        tls: Option<ClientTls<'_>>,
+        request: Request<'_>,
+        ws: ClientWs<R>,
+        user: U,
+    ) -> Result<StreamId, ConnectError> {
+        let address = Name::of(address).ok_or(ConnectError::AddressTooLong)?;
+        let (tls, identity) = match tls {
+            None => (None, None),
+            Some(t) => (
+                Some(Name::of(t.server_name).ok_or(ConnectError::AddressTooLong)?),
+                match t.identity {
+                    None => None,
+                    Some(i) => Some(Short::of(i).ok_or(ConnectError::AddressTooLong)?),
+                },
+            ),
         };
         let (index, slot) = (0u32..)
             .zip(self.slots.iter_mut())
@@ -731,6 +898,8 @@ where
             net,
             address,
             tls,
+            identity,
+            ws,
             asked: false,
         });
         slot.stream = Stream::Live {
@@ -763,6 +932,7 @@ where
             Connect {
                 address: c.address.as_str(),
                 tls: c.tls.as_ref().map(Name::as_str),
+                identity: c.identity.as_ref().map(Short::as_str),
             },
         ))
     }
@@ -801,10 +971,13 @@ where
         let mut live = Live {
             driver,
             side: Side::Client,
-            routed: None,
-            h1: Spare::InUse,
+            keep: Keep {
+                routed: None,
+                h1: Spare::InUse,
+                peer: None,
+                ws: c.ws,
+            },
             net,
-            peer: None,
             open: Open::Idle,
         };
         // a stream destroyed while connecting: nothing to carry
@@ -958,7 +1131,7 @@ where
             Open::Idle | Open::Held => None,
         };
         let Parts { conn, bufs, tls } = live.driver.into_parts();
-        let h1 = match (live.h1, conn.into_storage()) {
+        let h1 = match (live.keep.h1, conn.into_storage()) {
             (Spare::Idle(h1), _) | (Spare::InUse, Some(h1)) => Some(h1),
             (Spare::InUse, None) => None,
         };
@@ -1095,6 +1268,7 @@ where
             .get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
             .ok_or(RespondError::Gone)?;
         let own = live
+            .keep
             .routed
             .and_then(|at| at.own(l))
             .ok_or(RespondError::Gone)?;
@@ -1124,9 +1298,9 @@ where
         let l = listeners
             .get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
             .ok_or(RespondError::Gone)?;
-        let at = live.routed.ok_or(RespondError::Gone)?;
+        let at = live.keep.routed.ok_or(RespondError::Gone)?;
         let (vhost, route) = at.in_listener(l).ok_or(RespondError::Gone)?;
-        let peer = live.peer;
+        let peer = live.keep.peer;
         let RoleMut::H1Server(server) = live.driver.conn().role_mut() else {
             return Err(RespondError::Gone);
         };
@@ -1263,9 +1437,7 @@ where
     let Live {
         driver,
         side,
-        routed,
-        h1,
-        peer,
+        keep,
         open,
         ..
     } = live;
@@ -1275,6 +1447,13 @@ where
         }
         Side::Client => None,
     };
+    // a ws the server would not switch to: the connection is dropped,
+    // and the stream told it is gone
+    if matches!(keep.ws, ClientWs::Refused) {
+        keep.ws = ClientWs::None;
+        driver.hangup(now);
+        return None;
+    }
     // a transaction over since the last look: told before anything
     // else of the stream's, so the next request's is its own
     if let Some(e) = transaction_over(driver, open) {
@@ -1292,7 +1471,7 @@ where
         return Some(Event {
             stream: id,
             user,
-            kind: told(request, driver.conn(), l, routed, h1, now, *peer),
+            kind: told(request, driver.conn(), l, keep, now),
         });
     }
     // the chance to write, if it asked and can
@@ -1303,7 +1482,12 @@ where
             kind: Kind::Tx(Tx {
                 driver,
                 want: tx,
-                payload: payload_of(l, *routed),
+                payload: match keep.ws {
+                    ClientWs::Upgraded { payload, .. } => payload,
+                    ClientWs::None | ClientWs::Asked(_) | ClientWs::Refused => {
+                        payload_of(l, keep.routed)
+                    }
+                },
                 now,
             }),
         });
@@ -1333,7 +1517,7 @@ where
         return Some(Event {
             stream: id,
             user,
-            kind: told(event, role, l, routed, h1, now, *peer),
+            kind: told(event, role, l, keep, now),
         });
     }
     None
@@ -1493,23 +1677,32 @@ where
 }
 
 /// What a stream is told of its connection's event: `l` is the listener
-/// an accepted one came in on, and `peer` where from.
+/// an accepted one came in on, `keep` what the connection keeps beside
+/// its driver.
 fn told<'a, S, R, T>(
     event: ConnEvent<'a>,
     conn: &'a mut Conn<S, R>,
     l: Option<&'a Listener<'a>>,
-    routed: &mut Option<Routed>,
-    h1: &mut Spare<npro_h1::Storage<S>>,
+    keep: &'a mut Keep<S, R>,
     now: Instant,
-    peer: Option<SocketAddr>,
 ) -> Kind<'a, S, R, T>
 where
     S: AsRef<[u8]> + AsMut<[u8]>,
     R: Random,
 {
+    // a ws asked for on connecting: the answer is its agreement, or not
+    if matches!(
+        (&event, &keep.ws),
+        (
+            ConnEvent::H1Client(h1c::Event::Response),
+            ClientWs::Asked(_)
+        )
+    ) {
+        return client_upgrade(conn, keep, now);
+    }
     match (event, l) {
         (ConnEvent::H1Server(server::Event::Request), Some(l)) => {
-            request(conn, l, routed, h1, now, peer)
+            request(conn, l, &mut keep.routed, &mut keep.h1, now, keep.peer)
         }
         (
             ConnEvent::H1Server(server::Event::Body(data))
@@ -1548,6 +1741,67 @@ where
         // a request on no listener is never so: it comes in on one
         (ConnEvent::Raw(npro_io::raw::Event::PeerClosed), _)
         | (ConnEvent::H1Server(server::Event::Request), None) => Kind::PeerClose { code: None },
+    }
+}
+
+/// The server's answer to a ws asked for on connecting: a 101 the key
+/// accepts makes the connection ws, and the stream is told it is
+/// upgraded; anything else is told as not upgraded, and the connection
+/// is dropped at the next look, as C drops it.
+fn client_upgrade<'a, S, R, T>(
+    conn: &'a mut Conn<S, R>,
+    keep: &'a mut Keep<S, R>,
+    now: Instant,
+) -> Kind<'a, S, R, T>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+{
+    let ClientWs::Asked(ask) = mem::replace(&mut keep.ws, ClientWs::Refused) else {
+        // never so: just seen asked
+        return Kind::NotUpgraded { status: 0 };
+    };
+    let agreed = match conn.role() {
+        Role::H1Client(client) => {
+            let status = client.status();
+            ask.key
+                .check(
+                    status,
+                    client.response(),
+                    ask.offered.as_ref().map(Short::as_bytes),
+                    None,
+                )
+                .map(|checked| {
+                    checked
+                        .protocol
+                        .and_then(|p| core::str::from_utf8(p).ok())
+                        .and_then(Short::of)
+                })
+                .map_err(|_| status.unwrap_or(0))
+        }
+        // never so: the response came from an h1 client
+        Role::H1Server(_) | Role::WsServer(_) | Role::WsClient(_) | Role::Raw(_) => Err(0),
+    };
+    let chosen = match agreed {
+        Ok(p) => p,
+        Err(status) => return Kind::NotUpgraded { status },
+    };
+    let ws = Ws::client(ask.random, now);
+    match conn.upgraded_ws(ws) {
+        Ok(storage) => {
+            keep.h1 = Spare::Idle(storage);
+            keep.ws = ClientWs::Upgraded {
+                protocol: chosen,
+                payload: ask.payload,
+            };
+            let protocol = match &keep.ws {
+                ClientWs::Upgraded { protocol, .. } => protocol.as_ref().map(Short::as_bytes),
+                ClientWs::None | ClientWs::Asked(_) | ClientWs::Refused => None,
+            };
+            Kind::ClientUpgraded { protocol }
+        }
+        // never so: the client is upgraded, as the key just checked
+        Err(_) => Kind::NotUpgraded { status: 101 },
     }
 }
 
@@ -1815,6 +2069,8 @@ mod tests {
         PeerClose(Option<u16>),
         /// A transaction over: its status, and what it took.
         End(Option<u16>, u64),
+        /// A ws asked for on connecting, not switched: the status.
+        NotUpgraded(u16),
         Disconnected(StreamId),
     }
 
@@ -1843,6 +2099,10 @@ mod tests {
                 Kind::ServerUpgrade { protocol, route } => {
                     Seen::Upgrade(protocol.to_vec(), route.to.into())
                 }
+                Kind::ClientUpgraded { protocol } => {
+                    Seen::Upgrade(protocol.unwrap_or_default().to_vec(), "client".into())
+                }
+                Kind::NotUpgraded { status } => Seen::NotUpgraded(status),
                 Kind::UpgradeRefused(r) => Seen::Refused(r),
                 Kind::Rx { data, end } => Seen::Rx(data.to_vec(), end),
                 Kind::Tx(t) => {
@@ -2103,6 +2363,8 @@ mod tests {
                 }
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::ServerTxnEnd(_)
                 | Kind::Rx { .. }
                 | Kind::Pong
@@ -2333,11 +2595,11 @@ mod tests {
             path: b"/x",
             host: Some(b"origin"),
             origin: None,
-            scheme: h1c::Scheme::Http,
+            scheme: Scheme::Http,
             no_cache: false,
-            connection: h1c::Connection::Close,
+            connection: Connection::Close,
             headers: &[],
-            body: h1c::RequestBody::None,
+            body: RequestBody::None,
         }
     }
 
@@ -2387,6 +2649,8 @@ mod tests {
                 Kind::ServerTxn(_)
                 | Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::ServerTxnEnd(_)
                 | Kind::Tx(_)
                 | Kind::Pong
@@ -2438,7 +2702,15 @@ mod tests {
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let stream = ss
-            .connect("nowhere:1", Some("nowhere"), get_x(), Vec::new())
+            .connect(
+                "nowhere:1",
+                Some(ClientTls {
+                    server_name: "nowhere",
+                    identity: None,
+                }),
+                get_x(),
+                Vec::new(),
+            )
             .unwrap();
         assert_eq!(
             ss.connect("x:1", None, get_x(), Vec::new()).err(),
@@ -2947,5 +3219,188 @@ mod tests {
             "{rest:?}"
         );
         assert!(rest.contains(&Seen::End(Some(200), sent)), "{rest:?}");
+    }
+
+    /// The server's accept for the key in `request`, as RFC 6455 has it.
+    fn accept_for(request: &str) -> alloc::string::String {
+        let (_, after) = request.split_once("Sec-WebSocket-Key: ").unwrap();
+        let key = &after[..24];
+        let mut hashed = npro_core::sha1::Sha1::new();
+        hashed.update(key.as_bytes());
+        hashed.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let digest = hashed.finish();
+        let mut out = [0u8; 28];
+        npro_core::base64::encode(&digest, &mut out).unwrap();
+        alloc::string::String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn a_stream_connects_out_for_ws_and_exchanges_messages() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect_ws(
+                "unix:/dist",
+                None,
+                b"dist.example",
+                b"/",
+                Some(b"lws-cert-dist-server"),
+                Payload::Text,
+                SeededRandom::new(7),
+                Vec::new(),
+            )
+            .unwrap();
+        let (conn, c) = ss.next_connect().unwrap();
+        assert_eq!((c.address, c.tls, c.identity), ("unix:/dist", None, None));
+        ss.connected(T0, conn, None).unwrap();
+        let request = alloc::string::String::from_utf8(written(&mut ss, conn)).unwrap();
+        assert!(request.starts_with("GET / HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Host: dist.example\r\n"), "{request}");
+        assert!(
+            request.contains("Origin: http://dist.example\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: "),
+            "{request}"
+        );
+        assert!(
+            request.contains(
+                "Sec-WebSocket-Protocol: lws-cert-dist-server\r\nSec-WebSocket-Version: 13\r\n"
+            ),
+            "{request}"
+        );
+        let accept = accept_for(&request);
+        read(
+            &mut ss,
+            conn,
+            alloc::format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: lws-cert-dist-server\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            serve(&mut ss, true),
+            [Seen::Upgrade(
+                b"lws-cert-dist-server".to_vec(),
+                "client".into()
+            )]
+        );
+        // a message sent: masked, as a client's are
+        ss.request_tx_len(stream, 2).unwrap();
+        assert_eq!(serve(&mut ss, true), [Seen::Tx]);
+        let frame = written(&mut ss, conn);
+        assert_eq!(frame.len(), 8, "{}", frame.escape_ascii());
+        assert_eq!((frame[0], frame[1]), (0x81, 0x82));
+        let mask = &frame[2..6];
+        assert_eq!([frame[6] ^ mask[0], frame[7] ^ mask[1]], *b"ok");
+        // and one received, unmasked, as a server's are
+        read(&mut ss, conn, &[0x81, 2, b'h', b'i']);
+        assert_eq!(serve(&mut ss, true), [Seen::Rx(b"hi".to_vec(), End::Last)]);
+    }
+
+    #[test]
+    fn a_ws_connect_the_server_will_not_switch_is_refused_and_dropped() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect_ws(
+                "unix:/dist",
+                None,
+                b"dist.example",
+                b"/",
+                None,
+                Payload::Text,
+                SeededRandom::new(7),
+                Vec::new(),
+            )
+            .unwrap();
+        let (conn, _) = ss.next_connect().unwrap();
+        ss.connected(T0, conn, None).unwrap();
+        drop(written(&mut ss, conn));
+        read(
+            &mut ss,
+            conn,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(serve(&mut ss, true), [Seen::NotUpgraded(403)]);
+        // dropped at the next look: the adapter is asked to release it,
+        // and the stream is told it is gone
+        assert_eq!(serve(&mut ss, true), []);
+        assert!(matches!(ss.want(T0, conn), Ok(Want::Release(_))));
+        ss.released(conn).unwrap();
+        assert_eq!(serve(&mut ss, true), [Seen::Disconnected(stream)]);
+        // a 101 whose accept is wrong is no better
+        let stream2 = ss
+            .connect_ws(
+                "unix:/dist",
+                None,
+                b"dist.example",
+                b"/",
+                None,
+                Payload::Text,
+                SeededRandom::new(8),
+                Vec::new(),
+            )
+            .unwrap();
+        let (conn2, _) = ss.next_connect().unwrap();
+        ss.connected(T0, conn2, None).unwrap();
+        drop(written(&mut ss, conn2));
+        read(
+            &mut ss,
+            conn2,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n",
+        );
+        assert_eq!(serve(&mut ss, true), [Seen::NotUpgraded(101)]);
+        assert_eq!(serve(&mut ss, true), []);
+        assert!(matches!(ss.want(T0, conn2), Ok(Want::Release(_))));
+        ss.released(conn2).unwrap();
+        assert_eq!(serve(&mut ss, true), [Seen::Disconnected(stream2)]);
+    }
+
+    #[test]
+    fn a_connect_asks_for_its_tls_by_server_name_and_identity() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl: Slots = (0..1).map(|_| Slot::new(storage(512, 64))).collect();
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let stream = ss
+            .connect(
+                "dist.example:443",
+                Some(ClientTls {
+                    server_name: "dist.example",
+                    identity: Some("npro.rs"),
+                }),
+                get_x(),
+                Vec::new(),
+            )
+            .unwrap();
+        let (conn, c) = ss.next_connect().unwrap();
+        assert_eq!(
+            (c.address, c.tls, c.identity),
+            ("dist.example:443", Some("dist.example"), Some("npro.rs"))
+        );
+        // made without the tls asked for: not taken, and the slot is lost
+        // rather than carry a connection with the wrong security
+        assert_eq!(ss.connected(T0, conn, None), Err(Gone));
+        assert_eq!(serve(&mut ss, true), []);
+        assert!(ss.user(stream).is_ok());
+        let long = alloc::string::String::from_utf8(vec![b'i'; MAX_NAME + 1]).unwrap();
+        assert_eq!(
+            ss.connect(
+                "x:1",
+                Some(ClientTls {
+                    server_name: "x",
+                    identity: Some(&long),
+                }),
+                get_x(),
+                Vec::new(),
+            )
+            .err(),
+            Some(ConnectError::AddressTooLong)
+        );
     }
 }

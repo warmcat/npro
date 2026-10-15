@@ -209,6 +209,7 @@ fn events(ss: &mut S<'_>, answered: &mut usize) {
             }
             Kind::ServerUpgrade { .. }
             | Kind::UpgradeRefused(_)
+            | Kind::ClientUpgraded { .. }
             | Kind::Rx { .. }
             | Kind::Pong
             | Kind::PeerClose { .. }

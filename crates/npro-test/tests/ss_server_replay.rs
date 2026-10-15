@@ -262,6 +262,8 @@ mod ss_server_replay {
                     Then::Nothing
                 }
                 Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
                 | Kind::ServerTxnEnd(_)

@@ -52,6 +52,22 @@ pub enum Kind<'a, S, R, T> {
     /// The request asked for ws, and was refused as C refuses it: the
     /// connection closes once the refusal has gone.
     UpgradeRefused(Refusal),
+    /// A stream that asked for ws on connecting has the server's
+    /// agreement, C's `CLIENT_ESTABLISHED`: from here its payload is
+    /// messages.
+    ClientUpgraded {
+        /// The subprotocol the server chose, of those offered, if one.
+        protocol: Option<&'a [u8]>,
+    },
+    /// A stream that asked for ws on connecting
+    /// ([`crate::ss::Ss::connect_ws`]) was not switched: the server's
+    /// status, or 101 for an agreement the key did not accept.  The
+    /// connection is dropped, as C drops it, and the stream is told it
+    /// is gone.
+    NotUpgraded {
+        /// What the server answered.
+        status: u16,
+    },
     /// The request's transaction is over: what it was answered with, and
     /// what that took.  Told once for every request told, as
     /// [`Kind::ServerTxn`], [`Kind::ServerUpgrade`] or
@@ -621,15 +637,18 @@ where
             now,
         } = self;
         if let TxWant::Message(len) = *want {
-            if let RoleMut::WsServer(ws) = driver.conn().role_mut() {
-                let kind = match payload {
-                    Payload::Text => WsKind::Text,
-                    Payload::Binary => WsKind::Binary,
-                };
-                // busy with the one going: it goes on, this one waits
-                if ws.send(kind, len).is_ok() {
-                    *want = TxWant::Wanted;
-                }
+            let kind = match payload {
+                Payload::Text => WsKind::Text,
+                Payload::Binary => WsKind::Binary,
+            };
+            // busy with the one going: it goes on, this one waits
+            let begun = match driver.conn().role_mut() {
+                RoleMut::WsServer(ws) => ws.send(kind, len).is_ok(),
+                RoleMut::WsClient(ws) => ws.send(kind, len).is_ok(),
+                RoleMut::H1Server(_) | RoleMut::H1Client(_) | RoleMut::Raw(_) => false,
+            };
+            if begun {
+                *want = TxWant::Wanted;
             }
         }
         let mut pull = Pull {

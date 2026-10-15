@@ -594,6 +594,8 @@ where
             Kind::ServerTxn(_)
             | Kind::ServerUpgrade { .. }
             | Kind::UpgradeRefused(_)
+            | Kind::ClientUpgraded { .. }
+            | Kind::NotUpgraded { .. }
             | Kind::Pong
             | Kind::PeerClose { .. }
             | Kind::ServerTxnEnd(_),

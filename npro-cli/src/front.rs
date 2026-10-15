@@ -857,6 +857,8 @@ pub fn act<'s>(
                 State::Idle | State::Answered | State::File(_) | State::Cgi(_),
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ClientUpgraded { .. }
+                | Kind::NotUpgraded { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
                 | Kind::Response(_)

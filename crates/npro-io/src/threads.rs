@@ -442,9 +442,10 @@ pub trait Makes<H: Host> {
     /// `None` for a plain listener.
     fn for_listener(&self, listener: H::Listener) -> Option<H::Tls>;
 
-    /// The record layer for a connection made to `server_name`, or
-    /// `None` if it cannot be made, which fails the connect.
-    fn for_connect(&self, server_name: &str) -> Option<H::Tls>;
+    /// The record layer for a connection made to `server_name`,
+    /// presenting the identity named, if one is; or `None` if it cannot
+    /// be made, which fails the connect.
+    fn for_connect(&self, server_name: &str, identity: Option<&str>) -> Option<H::Tls>;
 }
 
 impl<H: Host, F: Fn(H::Listener) -> Option<H::Tls>> Makes<H> for F {
@@ -452,7 +453,7 @@ impl<H: Host, F: Fn(H::Listener) -> Option<H::Tls>> Makes<H> for F {
         self(listener)
     }
 
-    fn for_connect(&self, _: &str) -> Option<H::Tls> {
+    fn for_connect(&self, _: &str, _: Option<&str>) -> Option<H::Tls> {
         None
     }
 }
@@ -545,6 +546,7 @@ struct Asked<C> {
     conn: C,
     address: String,
     tls: Option<String>,
+    identity: Option<String>,
 }
 
 /// Takes the connects the host wants, as they come, and gives each to a
@@ -572,6 +574,7 @@ fn connector<'scope, 'a, H, A, M>(
                         conn,
                         address: c.address.to_owned(),
                         tls: c.tls.map(str::to_owned),
+                        identity: c.identity.map(str::to_owned),
                     });
                 }
                 if !asked.is_empty() {
@@ -607,10 +610,11 @@ fn connect_one<'scope, 'a, H, A, M>(
         conn,
         address,
         tls: server_name,
+        identity,
     } = a;
     let made = connect(&address);
     let layer = match (&server_name, &made) {
-        (Some(name), Ok(_)) => match tls.for_connect(name) {
+        (Some(name), Ok(_)) => match tls.for_connect(name, identity.as_deref()) {
             Some(l) => Ok(Some(l)),
             None => Err(()),
         },

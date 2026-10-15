@@ -430,6 +430,28 @@ fetches an answer from its own listener by a stream connecting out;
 the fuzz target makes streams connect, with a body or not, and
 answers or fails their connects.
 
+**Client ws, and identities** (2026-10-15, for the certificate
+distribution client): `Ss::connect_ws(address, tls, host, path,
+protocols, payload, random, user)` composes the upgrade request with
+npro-ws' `ClientKey` (the key from `random`, which must be a source the
+server cannot predict), and when the answer's head is in checks it as
+`ClientKey::check` does: a 101 the key accepts makes the connection ws
+(`Conn::upgraded_ws`, the h1 storage back to the slot) and the stream
+is told `ClientUpgraded { protocol }`, from when its payload is
+messages, sent by `request_tx_len` and masked by the ws client role,
+received as `Rx`, with the role's own validity pings; anything else is
+told as `NotUpgraded` with the status (101 for an agreement the key
+did not accept), and the connection is hung up at the next look, as C
+drops it, so `Disconnected` follows.  (The fuzzer caught the first
+form, which reused the server's `UpgradeRefused`: that one is followed
+by a transaction's end, and a client stream has none.)  The tls a connect asks for is
+`ClientTls { server_name, identity }`: the identity names, for the
+adapter's tls, which client certificate to present if the server asks
+(mTLS); it goes through `Connect.identity` to `Makes::for_connect
+(server_name, identity)`.  What the names mean is between the
+application and the runner.  Names are at most `MAX_NAME` (64) bytes,
+as is the protocol list offered.
+
 Not yet, of the sketch: streamtypes from the policy (the address and
 the request are the caller's for now), retry and backoff, redirects
 followed, a connection kept warm and joined, dns beyond the adapter's
@@ -1029,6 +1051,11 @@ code for exactly this trust model.
   script is silent; the script's environment and head are sans-IO in
   npro-cgi.  An answer without a length is close-delimited until the
   h1 server frames chunked output.
+- 2026-10-15: a client stream names the identity it connects with,
+  and the runner's tls holds the identities (certificate and key) by
+  name; the threads adapter gives the application timers
+  (`Jobs::after`) and its first turn at the start, for links it keeps
+  up of its own accord.
 
 ## Open
 
