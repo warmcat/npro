@@ -85,6 +85,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "npro-cgi"
+version = "0.0.2"
+dependencies = [
+ "npro-ss",
+]
+
+[[package]]
 name = "npro-core"
 version = "0.0.2"
 
@@ -99,6 +106,7 @@ dependencies = [
 name = "npro-fuzz"
 version = "0.0.2"
 dependencies = [
+ "npro-cgi",
  "npro-core",
  "npro-files",
  "npro-h1",

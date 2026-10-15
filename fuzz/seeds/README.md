@@ -61,6 +61,12 @@ The protocol crates' targets start from the C library's corpora
   chunked upload refused, and a HEAD answered with cookies and a
   location; `regress-http10` is an HTTP/1.0 request, whose answer the
   harness once expected in HTTP/1.1.
+- `cgi-head`: written for it, a control byte then what a script wrote:
+  git's `info/refs` head, a `Location` alone, LF-only lines with a
+  length, a head saying `chunked`, and an NPH script's status line,
+  which is no header; `regress-crlf-count` is a head of CRLF lines
+  near the limit, which takes more input than it keeps, as the
+  harness once did not allow for.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

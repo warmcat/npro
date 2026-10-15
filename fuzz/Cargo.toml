@@ -129,3 +129,10 @@ path  = "fuzz_targets/proxy.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "cgi-head"
+path  = "fuzz_targets/cgi_head.rs"
+test  = false
+doc   = false
+bench = false

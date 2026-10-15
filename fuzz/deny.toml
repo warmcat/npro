@@ -41,6 +41,7 @@ allow = [
 	"npro-ss",
 	"npro-files",
 	"npro-proxy",
+	"npro-cgi",
 	"npro-ws",
 	"npro-core",
 	"npro-test",

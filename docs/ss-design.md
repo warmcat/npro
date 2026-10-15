@@ -379,6 +379,30 @@ buffers, and take more clients than there are slots.
   event lends no request to take a record from, so it is not logged;
   reopening the log on a signal, for rotation.
 
+- **CGI** (2026-10-15) is `npro-cgi`, for `/repo`'s `git-http-backend`:
+  the sans-IO parts are the script's environment (`Vars::of`, C's
+  `lws_cgi()` variable for variable: `REQUEST_METHOD`, `QUERY_STRING`
+  re-encoded argument by argument, `REQUEST_URI`, `PATH_INFO` the path
+  after the route's, the `HTTP_*` C passes, `CONTENT_TYPE` and
+  `CONTENT_LENGTH`, `PATH`, `SCRIPT_PATH`, the script's own, and
+  `SERVER_SOFTWARE`) composed into 8K of caller storage and refused if
+  it does not fit, as C refuses it; and the head parsed from the
+  script's stdout as it comes (`Head`: `Status`, `Location` making a
+  302, `Content-Length`, `Transfer-Encoding: chunked` passed through,
+  the rest passed on, lines ending in CRLF or LF, 2K at most).  The
+  process is the front's: `std::process::Command` with the environment
+  and nothing else, its stdin the request's body (written off the turn,
+  the stream's reading held meanwhile), its stdout read 16K at a time
+  by the adapter's jobs as a file is, its stderr this process', killed
+  and reaped when the transaction ends or the client goes.  The
+  script's `timeout` is given to the h1 server as the time its answer
+  may take to begin (`Txn::answer_within`, C's `PENDING_TIMEOUT_CGI`);
+  once begun, the response timeout governs.  An answer with no length
+  is close-delimited, which is what C does for git (its
+  `GIT_PROJECT_ROOT` sets `explicitly_chunked`); for other scripts C
+  frames it chunked, which needs chunked output in the h1 server,
+  not yet built.  Not yet: `cgi-chroot`, the login guard's headers.
+
 ### The client half, first form
 
 Built 2026-10-14, as far as the proxy needs it.  `Ss::connect(address,
@@ -1000,6 +1024,11 @@ code for exactly this trust model.
   time, which is UTC with `+0000`, since npro reads no time zone; a
   unix domain socket's peer is `-`.  Every request told is followed by
   one `ServerTxnEnd`, which is what the line is written on.
+- 2026-10-15: CGI's process is the front's, read and written by the
+  adapter's jobs as files are, a read occupying a worker while the
+  script is silent; the script's environment and head are sans-IO in
+  npro-cgi.  An answer without a length is close-delimited until the
+  h1 server frames chunked output.
 
 ## Open
 

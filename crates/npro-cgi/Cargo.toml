@@ -1,0 +1,23 @@
+[package]
+name        = "npro-cgi"
+description = "npro's CGI service: a request's environment for a script, and the script's answer parsed, sans-IO, the process the runner's"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "http", "cgi"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-ss = { path = "../npro-ss", version = "0.0.2" }
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+npro-h1.workspace = true
+npro-io.workspace = true
+
+[lints]
+workspace = true

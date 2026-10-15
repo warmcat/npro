@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cgi;
 mod files;
 mod h1;
 mod json;
@@ -28,6 +29,7 @@ mod ss;
 mod targets;
 mod ws;
 
+pub use cgi::cgi_head;
 pub use files::files;
 pub use h1::{chunked, h1_request, h1_response, uri};
 pub use json::json;
@@ -80,11 +82,13 @@ pub enum Target {
     Files,
     /// [`proxy`]: npro-proxy between a client and an origin both played.
     Proxy,
+    /// [`cgi_head`]: a script's answer's head, as npro-cgi parses it.
+    CgiHead,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -100,6 +104,7 @@ impl Target {
         Self::SsServer,
         Self::Files,
         Self::Proxy,
+        Self::CgiHead,
     ];
 
     /// The target's name.
@@ -121,6 +126,7 @@ impl Target {
             Self::SsServer => "ss-server",
             Self::Files => "files",
             Self::Proxy => "proxy",
+            Self::CgiHead => "cgi-head",
         }
     }
 
@@ -147,6 +153,7 @@ impl Target {
             Self::SsServer => ss_server(data),
             Self::Files => files(data),
             Self::Proxy => proxy(data),
+            Self::CgiHead => cgi_head(data),
         }
     }
 }

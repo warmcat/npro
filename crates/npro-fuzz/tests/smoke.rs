@@ -222,6 +222,11 @@ fn h1_response() {
 }
 
 #[test]
+fn cgi_head() {
+    smoke(Target::CgiHead, seeded).unwrap();
+}
+
+#[test]
 fn chunked() {
     smoke(Target::Chunked, seeded).unwrap();
 }
@@ -285,6 +290,7 @@ fn every_target_has_a_smoke_test() {
         "ss-server",
         "files",
         "proxy",
+        "cgi-head",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }
