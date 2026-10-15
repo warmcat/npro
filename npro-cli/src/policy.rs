@@ -52,9 +52,11 @@
 //! runner's listeners and the services borrow it for as long as the
 //! server runs.
 
+use core::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use npro_cgi::Script;
 use npro_files::{Cache, Intermediaries, Mount, Revalidate};
 use npro_h1::server::Config as H1Config;
 use npro_json::{Config, Event, Parser, Storage};
@@ -534,6 +536,10 @@ fn keep_headers(pairs: &[(&str, &str)]) -> &'static [(&'static [u8], &'static [u
     Vec::leak(v)
 }
 
+/// How long a script may take to begin its answer when the policy does
+/// not say, in seconds.
+const DEFAULT_TIMEOUT: u64 = 30;
+
 /// The policy's Rust types from the merged layers `v`.
 ///
 /// # Errors
@@ -635,11 +641,30 @@ fn services(top: &Members<'_>) -> Result<Vec<(&'static str, Service<'static>)>, 
                     },
                 })
             }
+            "cgi" => {
+                m.only(&["type", "exec", "env", "dir", "timeout"])?;
+                let env: Vec<(&'static str, &'static str)> = m
+                    .pairs("env")?
+                    .iter()
+                    .map(|(n, val)| (keep(n), keep(val)))
+                    .collect();
+                Service::Cgi(Script {
+                    exec: keep(m.required("exec")?),
+                    env: Vec::leak(env),
+                    dir: m.string("dir")?.map(keep),
+                    timeout: Duration::from_secs(m.number("timeout")?.unwrap_or(DEFAULT_TIMEOUT)),
+                })
+            }
             other => {
                 return Err(PolicyError::NoSuch {
                     at: m.path("type"),
                     name: other.to_owned(),
-                    known: vec!["files".into(), "proxy".into(), "redirect".into()],
+                    known: vec![
+                        "files".into(),
+                        "proxy".into(),
+                        "redirect".into(),
+                        "cgi".into(),
+                    ],
                 });
             }
         };
@@ -875,7 +900,8 @@ mod tests {
         "services": { "www": { "type": "files", "root": "/srv", "cache": { "max-age": 10, "public": true },
                                "mimes": { ".tar.gz": "application/x-gtar" } },
                       "up": { "type": "proxy", "address": "unix:/tmp/o", "path": "/o" },
-                      "go": { "type": "redirect", "to": "https://x", "append-path": true } },
+                      "go": { "type": "redirect", "to": "https://x", "append-path": true },
+                      "cgi": { "type": "cgi", "exec": "/usr/bin/env", "env": { "A": "1" }, "timeout": 5 } },
         "npro": { "slots": 4 }
     }"#;
 
@@ -899,7 +925,16 @@ mod tests {
             (w.default, w.payload, w.deflate),
             (Some(1), Payload::Binary, Deflate::Off)
         );
-        assert_eq!(p.services.by_name.len(), 3);
+        assert_eq!(p.services.by_name.len(), 4);
+        assert_eq!(
+            p.services.by_name[3].1,
+            Service::Cgi(Script {
+                exec: "/usr/bin/env",
+                env: &[("A", "1")],
+                dir: None,
+                timeout: Duration::from_secs(5),
+            })
+        );
         assert!(matches!(
             p.services.by_name[0].1,
             Service::Files(Mount {
@@ -938,8 +973,8 @@ mod tests {
             "vhosts.v.routes[0].to: no \"none\"; there is "
         );
         assert_eq!(
-            bad(r#"{"services": {"s": {"type": "cgi"}}}"#),
-            "services.s.type: no \"cgi\"; there is files, proxy, redirect"
+            bad(r#"{"services": {"s": {"type": "php"}}}"#),
+            "services.s.type: no \"php\"; there is files, proxy, redirect, cgi"
         );
         assert_eq!(
             bad(r#"{"services": {"s": {"type": "files"}}}"#),

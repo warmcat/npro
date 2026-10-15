@@ -137,14 +137,16 @@ mod cli {
         let out = npro()
             .args(["serve", "--policy"])
             .arg(&policy)
-            .args(["-p", r#"{"services": {"www": {"type": "cgi"}}}"#])
+            .args(["-p", r#"{"services": {"www": {"type": "php"}}}"#])
             .output()
             .unwrap();
         drop(std::fs::remove_dir_all(&dir));
         assert!(!out.status.success());
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("policy: services.www.type: no \"cgi\"; there is files, proxy, redirect"),
+            err.contains(
+                "policy: services.www.type: no \"php\"; there is files, proxy, redirect, cgi"
+            ),
             "{err}"
         );
         // a policy file that is not there, when named, is refused

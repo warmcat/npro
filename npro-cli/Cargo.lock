@@ -141,11 +141,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "npro-cgi"
+version = "0.0.2"
+dependencies = [
+ "npro-ss",
+]
+
+[[package]]
 name = "npro-cli"
 version = "0.0.0"
 dependencies = [
  "caps",
  "npro-aws-lc",
+ "npro-cgi",
  "npro-core",
  "npro-files",
  "npro-h1",

@@ -13,18 +13,28 @@
 //!
 //! Each request on a vhost with an access log ([`Logs`]) is written to
 //! it as its transaction ends, in C's line ([`npro_ss::access`]).
+//!
+//! A cgi service ([`Service::Cgi`]) is npro-cgi: the script is spawned
+//! here, given the request as its environment, its stdin fed the
+//! request's body and its stdout read, a chunk at a time by the
+//! adapter's jobs as a file is, the head parsed and the payload passed
+//! to the client ([`Running`]).
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use npro_cgi::{DEFAULT_DIR, Head, Progress, Script, Vars};
 use npro_core::time::Instant;
 use npro_files::{Fs, Mount, Opened, Scheme, Served, Serving, serve};
 use npro_io::threads::Jobs;
 use npro_proxy::{Act, Asked, CAPACITY, Side, Storage, Upstream};
 use npro_ss::access::{MAX_LINE, Record};
-use npro_ss::event::{Ended, Filled, Kind, Txn};
+use npro_ss::event::{End, Ended, Filled, Flow, Kind, Response, Txn};
 use npro_ss::id::StreamId;
 use npro_ss::policy::{Listener, Tls};
 
@@ -39,6 +49,8 @@ pub enum Service<'p> {
     Proxy(Upstream<'p>),
     /// A redirect, the front's own: C's `>https://` mount origin.
     Redirect(Redirect<'p>),
+    /// npro-cgi, each request answered by this script.
+    Cgi(Script<'p>),
 }
 
 /// A redirect: every request on the route is answered 301 to `to`, with
@@ -240,7 +252,7 @@ pub struct StdFs;
 #[cfg(unix)]
 fn os_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    PathBuf::from(OsStr::from_bytes(bytes))
 }
 
 /// A path as the service composed it, as std names it: UTF-8, elsewhere.
@@ -311,14 +323,304 @@ pub enum State {
     /// stream or the one to the origin.  Boxed: its buffers are far
     /// larger than any other state, and a std program has a heap.
     Proxy(Box<Side<Vec<u8>>>),
+    /// A script's answer, from npro-cgi: boxed, it holds the head
+    /// being parsed.
+    Cgi(Box<Running>),
 }
 
 /// The proxy's side of a front stream, if it is one.
 fn proxy_side(u: &mut Front) -> Option<&mut Side<Vec<u8>>> {
     match &mut u.state {
         State::Proxy(s) => Some(s),
-        State::Idle | State::Answered | State::File(_) => None,
+        State::Idle | State::Answered | State::File(_) | State::Cgi(_) => None,
     }
+}
+
+/// How much of a script's output one read takes.
+const CGI_CHUNK: usize = 16 * 1024;
+
+/// A script answering a request: its process, and where its answer is.
+#[derive(Debug)]
+pub struct Running {
+    child: Child,
+    /// Its stdin, while the request's body is still to go to it; taken
+    /// by a write job while one is out, and dropped, closing it, after
+    /// the body's last piece.
+    stdin: Option<ChildStdin>,
+    /// Its stdout between reads: taken by the read job while one is
+    /// out.
+    stdout: Option<ChildStdout>,
+    answer: Answer,
+    /// What was read and not yet given, from `at`.
+    chunk: Vec<u8>,
+    at: usize,
+    /// What its stdout came to.
+    output: Output,
+}
+
+/// Where a script's answer is.
+#[derive(Debug)]
+enum Answer {
+    /// Its head is being parsed: boxed, it is the one large state.
+    Head(Box<Head>),
+    /// Its head was passed to the client, and this much of its payload
+    /// is still to come, if it gave a length.
+    Started { left: Option<u64> },
+}
+
+/// What a script's stdout came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Output {
+    /// More may come.
+    Open,
+    /// It ended: the script closed it, or exited.
+    Ended,
+}
+
+impl Running {
+    /// Spawns `script` to answer the request `txn` holds, with the
+    /// request as its environment.  `None` if it could not be: the
+    /// environment does not fit, or the program cannot be run.
+    fn spawn<S: AsRef<[u8]> + AsMut<[u8]>>(script: &Script<'_>, txn: &Txn<'_, S>) -> Option<Self> {
+        let vars = Vars::of(script, txn).ok()?;
+        let mut command = Command::new(script.exec);
+        command
+            .env_clear()
+            .current_dir(script.dir.unwrap_or(DEFAULT_DIR))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // what it says is this process' to say, as C logs it
+            .stderr(Stdio::inherit());
+        for (name, value) in vars.iter() {
+            command.env(os(name), os(value));
+        }
+        let mut child = command.spawn().ok()?;
+        let stdout = child.stdout.take();
+        let mut stdin = child.stdin.take();
+        // a request with no body: the script's stdin ends at once, so
+        // one that reads it is not left waiting
+        let has_body = txn.header(b"content-length").is_some_and(|v| v != b"0")
+            || txn.header(b"transfer-encoding").is_some();
+        if !has_body {
+            stdin = None;
+        }
+        Some(Self {
+            child,
+            stdin,
+            stdout,
+            answer: Answer::Head(Box::new(Head::new())),
+            chunk: Vec::new(),
+            at: 0,
+            output: Output::Open,
+        })
+    }
+
+    /// Whether a read of its output is wanted: none is out, it has not
+    /// ended, and what was read is given.
+    fn wants_read(&self) -> bool {
+        self.stdout.is_some() && self.output == Output::Open && self.at >= self.chunk.len()
+    }
+
+    /// Gives what was read into `buf`: how much, and whether that was
+    /// the last of the payload.
+    fn fill(&mut self, buf: &mut [u8]) -> Filled {
+        // no room is wanted for none: a HEAD's answer takes no payload
+        if buf.is_empty() {
+            return Filled::Last(0);
+        }
+        let rest = self.chunk.get(self.at..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        if let (Some(to), Some(from)) = (buf.get_mut(..n), rest.get(..n)) {
+            to.copy_from_slice(from);
+        }
+        self.at = self.at.saturating_add(n);
+        if self.at >= self.chunk.len() {
+            self.chunk.clear();
+            self.at = 0;
+        }
+        let left = match &mut self.answer {
+            Answer::Started { left: Some(left) } => {
+                *left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+                Some(*left)
+            }
+            Answer::Started { left: None } | Answer::Head(_) => None,
+        };
+        let over = left == Some(0) || (self.output == Output::Ended && self.chunk.is_empty());
+        if over {
+            Filled::Last(n)
+        } else {
+            Filled::More(n)
+        }
+    }
+
+    /// Ends the script, if it has not ended: C's `lws_cgi_kill()`.  The
+    /// process is reaped by `reap`, off the turn.
+    fn kill(mut self, jobs: &Jobs<'_, impl Send>) {
+        // one that exited already cannot be killed, and is just reaped
+        drop(self.child.kill());
+        drop(self.stdin.take());
+        drop(self.stdout.take());
+        jobs.spawn(move || {
+            drop(self.child.wait());
+            move |_: &mut _, _: Instant| {}
+        });
+    }
+}
+
+/// `bytes` as a name or value for the environment.
+#[cfg(unix)]
+fn os(bytes: &[u8]) -> Cow<'_, OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+    Cow::Borrowed(OsStr::from_bytes(bytes))
+}
+
+/// `bytes` as a name or value for the environment: as text, which an
+/// environment is on other platforms.
+#[cfg(not(unix))]
+fn os(bytes: &[u8]) -> Cow<'_, OsStr> {
+    match String::from_utf8_lossy(bytes) {
+        Cow::Borrowed(s) => Cow::Borrowed(OsStr::new(s)),
+        Cow::Owned(s) => Cow::Owned(s.into()),
+    }
+}
+
+/// Reads the next chunk of a script's output, off the turn, and hands
+/// it to the stream: its head taken as far as it goes, and once whole
+/// passed to the client as the answer; then its payload, which the
+/// stream asks to write.
+fn read_cgi_off_the_turn<'s, 'j>(
+    running: &mut Running,
+    stream: StreamId,
+    jobs: &Jobs<'j, Streams<'s, Front>>,
+) {
+    let Some(mut stdout) = running.stdout.take() else {
+        return;
+    };
+    jobs.spawn(move || {
+        let mut chunk = vec![0u8; CGI_CHUNK];
+        let got = stdout.read(&mut chunk).unwrap_or_default();
+        chunk.truncate(got);
+        move |streams: &mut Streams<'s, Front>, now: Instant| {
+            // the stream may have gone meanwhile
+            let Ok(Front {
+                state: State::Cgi(r),
+                ..
+            }) = streams.user(stream)
+            else {
+                return;
+            };
+            if got == 0 {
+                r.output = Output::Ended;
+            } else {
+                r.stdout = Some(stdout);
+            }
+            let whole = match &mut r.answer {
+                Answer::Head(head) => match head.feed(&chunk) {
+                    Ok(Progress::Done { consumed }) => {
+                        r.chunk = chunk.get(consumed..).unwrap_or_default().to_vec();
+                        true
+                    }
+                    Ok(Progress::More) if got > 0 => false,
+                    // ended in its head, or no head at all: C drops the
+                    // connection; the client gets a page
+                    Ok(Progress::More) | Err(_) => {
+                        status(streams, now, stream, 500);
+                        return;
+                    }
+                },
+                Answer::Started { .. } => {
+                    r.chunk = chunk;
+                    false
+                }
+            };
+            if whole && !answer_from_head(streams, stream) {
+                return;
+            }
+            // the chance to write brings the next read with it
+            let _ = streams.request_tx(stream);
+        }
+    });
+}
+
+/// Passes a script's head, whole, to the client as the answer: whether
+/// the stream took it.
+fn answer_from_head(streams: &mut Streams<'_, Front>, stream: StreamId) -> bool {
+    // what the head says, copied out: the answer borrows the streams
+    let (status, content_type, content_length, kept) = {
+        let Ok(Front {
+            state: State::Cgi(r),
+            ..
+        }) = streams.user(stream)
+        else {
+            return false;
+        };
+        let Answer::Head(head) = &r.answer else {
+            return true;
+        };
+        let parsed = head.parsed();
+        let kept: Vec<(Vec<u8>, Vec<u8>)> = parsed
+            .passed()
+            .map(|(n, v)| (n.to_vec(), v.to_vec()))
+            .collect();
+        (
+            parsed.status,
+            parsed.content_type.map(<[u8]>::to_vec),
+            parsed.content_length,
+            kept,
+        )
+    };
+    let headers: Vec<(&[u8], &[u8])> = kept
+        .iter()
+        .map(|(n, v)| (n.as_slice(), v.as_slice()))
+        .collect();
+    let response = Response {
+        status,
+        content_type: content_type.as_deref(),
+        content_length,
+        headers: &headers,
+    };
+    let left = content_length;
+    let taken = streams.respond(stream, response).is_ok();
+    if let Ok(Front {
+        state: State::Cgi(r),
+        ..
+    }) = streams.user(stream)
+    {
+        r.answer = Answer::Started { left };
+    }
+    taken
+}
+
+/// Writes `piece` of the request's body to the script's stdin, off the
+/// turn, the stream's reading held until it is written; `end` closes
+/// the stdin after it.
+fn write_cgi_off_the_turn<'s, 'j>(
+    running: &mut Running,
+    stream: StreamId,
+    piece: Vec<u8>,
+    end: End,
+    jobs: &Jobs<'j, Streams<'s, Front>>,
+) -> Then {
+    let Some(mut stdin) = running.stdin.take() else {
+        return Then::Nothing;
+    };
+    jobs.spawn(move || {
+        // a script that stopped reading: what is left is not its
+        let written = stdin.write_all(&piece).is_ok();
+        move |streams: &mut Streams<'s, Front>, _: Instant| {
+            if let Ok(Front {
+                state: State::Cgi(r),
+                ..
+            }) = streams.user(stream)
+            {
+                if written && end == End::More {
+                    r.stdin = Some(stdin);
+                }
+            }
+            let _ = streams.flow(stream, Flow::Given);
+        }
+    });
+    Then::Flow(Flow::Held)
 }
 
 /// What the front does after an event, since the event borrows the
@@ -327,6 +629,12 @@ enum Then {
     Nothing,
     /// The stream has payload to write.
     Tx,
+    /// A script's output is read, if a read is wanted.
+    ReadCgi,
+    /// The script is over with: ended and reaped.
+    Reap,
+    /// The stream's reading is held, or given back.
+    Flow(Flow),
     /// A request to pass on, copied out: [`npro_proxy::start`].  Boxed:
     /// it carries the onward headers.
     Start(Upstream<'static>, Box<Asked>),
@@ -469,6 +777,14 @@ fn answer(services: &Services<'static>, txn: &mut Txn<'_, Vec<u8>>, user: &mut S
             }
             Err(_) => Then::Nothing,
         },
+        Some(Service::Cgi(script)) => match Running::spawn(script, txn) {
+            Some(running) => {
+                txn.answer_within(script.timeout);
+                *user = State::Cgi(Box::new(running));
+                Then::ReadCgi
+            }
+            None => Then::Status(500),
+        },
         None => match txn.status(404) {
             Ok(()) => {
                 *user = State::Answered;
@@ -502,6 +818,15 @@ pub fn act<'s>(
                 }
                 Then::Nothing
             }
+            // a script's transaction over, or its client gone: the script
+            // is over with
+            (State::Cgi(_), Kind::ServerTxnEnd(ended)) => {
+                if let Some((at, record)) = log.take() {
+                    logs.write(at, &record, ended);
+                }
+                Then::Reap
+            }
+            (State::Cgi(_), Kind::Disconnected) => Then::Reap,
             (State::Proxy(side), kind) => Then::Acts(npro_proxy::on_event(stream, side, kind)),
             (user, Kind::ServerTxn(mut txn)) => {
                 *log = logs.record(&txn);
@@ -511,28 +836,75 @@ pub fn act<'s>(
                 tx.fill(|buf| match user {
                     State::Idle | State::Answered | State::Proxy(_) => Filled::Last(0),
                     State::File(s) => s.fill(buf),
+                    State::Cgi(r) => r.fill(buf),
                 });
-                if let State::File(serving) = user {
-                    read_off_the_turn(serving, stream, jobs);
+                match user {
+                    State::File(serving) => read_off_the_turn(serving, stream, jobs),
+                    State::Cgi(r) => {
+                        if r.wants_read() {
+                            read_cgi_off_the_turn(r, stream, jobs);
+                        }
+                    }
+                    State::Idle | State::Answered | State::Proxy(_) => {}
                 }
                 Then::Nothing
             }
+            // the request's body goes to the script
+            (State::Cgi(r), Kind::Rx { data, end }) => {
+                write_cgi_off_the_turn(r, stream, data.to_vec(), end, jobs)
+            }
             (
-                State::Idle | State::Answered | State::File(_),
+                State::Idle | State::Answered | State::File(_) | State::Cgi(_),
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
-                | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
                 | Kind::Response(_)
-                | Kind::ConnectFailed
-                | Kind::Disconnected,
+                | Kind::ConnectFailed,
+            )
+            | (
+                State::Idle | State::Answered | State::File(_),
+                Kind::Rx { .. } | Kind::Disconnected,
             ) => Then::Nothing,
         };
+        carry_out(then, stream, ss, now, jobs);
+    }
+}
+
+/// Does what an event came to, once the event has let the streams go.
+fn carry_out<'s>(
+    then: Then,
+    stream: StreamId,
+    ss: &mut Streams<'s, Front>,
+    now: Instant,
+    jobs: &Jobs<'_, Streams<'s, Front>>,
+) {
+    {
         match then {
             Then::Nothing => {}
             Then::Tx => {
                 let _ = ss.request_tx(stream);
+            }
+            Then::ReadCgi => {
+                if let Ok(Front {
+                    state: State::Cgi(r),
+                    ..
+                }) = ss.user(stream)
+                {
+                    if r.wants_read() {
+                        read_cgi_off_the_turn(r, stream, jobs);
+                    }
+                }
+            }
+            Then::Flow(f) => {
+                let _ = ss.flow(stream, f);
+            }
+            Then::Reap => {
+                if let Ok(u) = ss.user(stream) {
+                    if let State::Cgi(r) = core::mem::replace(&mut u.state, State::Answered) {
+                        r.kill(jobs);
+                    }
+                }
             }
             Then::Status(code) => status(ss, now, stream, code),
             Then::Start(up, asked) => {

@@ -33,6 +33,7 @@ allow = [
 	"npro-ss",
 	"npro-files",
 	"npro-proxy",
+	"npro-cgi",
 	"npro-core",
 	"npro-h1",
 	"npro-json",

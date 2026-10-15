@@ -69,6 +69,9 @@ authority come after; nothing here stops them):
                   "cache": { "max-age": 172800, "revalidate": false, "public": false },
                   "mimes": { ".tar.gz": "application/x-gtar" } },
     "git":      { "type": "proxy", "address": "unix:/var/run/gitohashi", "path": "/git" },
+    "repo":     { "type": "cgi", "exec": "/usr/libexec/git-core/git-http-backend",
+                  "env": { "GIT_PROJECT_ROOT": "/srv/git", "GIT_HTTP_EXPORT_ALL": "" },
+                  "dir": "/tmp", "timeout": 30 },
     "to-https": { "type": "redirect", "to": "https://example.com", "append-path": true }
   },
   "npro": { "slots": 64, "workers": 2 }
@@ -101,17 +104,30 @@ authority come after; nothing here stops them):
     or a host and port) under its `path`, with `host` the `Host` sent
     when the request had none;
   - `redirect`: 301 to `to`, the rest of the request's path appended
-    if `append-path`.
+    if `append-path`;
+  - `cgi`: each request answered by a process running `exec` (C's
+    `cgi://` origin), given the request as its environment (RFC 3875's
+    variables as lwsws sets them, `PATH_INFO` the path after the
+    route's) and the script's own `env` (C's `cgi-env`), run in `dir`
+    (`/tmp` if none, C's `cgi-chdir`), its stdin the request's body,
+    its stdout the answer: `Status`, `Location` (a 302), the headers,
+    then the payload, close-delimited when the script gives no length.
+    It may take `timeout` seconds (30 if not given, C's `cgi-timeout`)
+    to begin its answer.  Its stderr is this process' stderr.  Each read
+    of its output occupies a worker thread while it waits, so `workers`
+    should allow for the scripts expected at once.
 - **npro**: `slots`, how many streams at once; `workers`, how many
   threads for what is done off the loop (file reads).
 
 `policies/npro.rs.json` is npro.rs' policy in this form, from its lwsws
 configuration: files, git and sai proxied over their unix domain
-sockets, the port-80 redirect, and the mounts not yet ported proxied
+sockets, `/repo` served by `git-http-backend` as a cgi (its
+`GIT_PROJECT_ROOT` is a guess until the box's is known), the port-80
+redirect, and the mounts not yet ported proxied
 to an lwsws kept listening on a unix domain socket of its own (the
 path there is a placeholder until that lwsws is set up).  A test keeps
 it loading.
 
 Not in this form yet: the h1 limits and timeouts per listener (the
 defaults are C's), client streamtypes, the deployment and front layers
-with their instances, the login guard, and cgi.
+with their instances, the login guard, and `cgi-chroot`.

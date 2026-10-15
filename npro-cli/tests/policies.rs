@@ -26,6 +26,7 @@ mod policies {
         assert_eq!(p.listeners.len(), 2);
         assert!(matches!(p.listeners[0].tls, Tls::Server { .. }));
         assert_eq!(p.listeners[0].vhosts[0].routes.len(), 8);
+        assert!(p.services.by_name.iter().any(|(n, _)| *n == "repo"));
         assert_eq!(p.logs, &[("npro.rs", "/srv/log/lwsws/npro-access-log")]);
         assert_eq!((p.slots, p.workers), (256, 4));
     }

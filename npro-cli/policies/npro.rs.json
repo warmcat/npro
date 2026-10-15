@@ -26,7 +26,7 @@
         { "path": "/sai",  "to": "sai", "ws": { "protocols": ["sai"], "default": "sai", "binary": false } },
         { "path": "/npro-login-sai", "to": "lwsws" },
         { "path": "/oauth",          "to": "lwsws" },
-        { "path": "/repo",           "to": "lwsws" },
+        { "path": "/repo",           "to": "repo" },
         { "path": "/npro-login-deaddrop", "to": "lwsws" },
         { "path": "/docrepo",        "to": "lwsws" }
       ]
@@ -45,6 +45,9 @@
     },
     "git":   { "type": "proxy", "address": "unix:/var/run/gitohashi-npro", "path": "/git" },
     "sai":   { "type": "proxy", "address": "unix:/var/run/sainpro", "path": "/sai" },
+    "repo":  { "type": "cgi", "exec": "/usr/libexec/git-core/git-http-backend",
+               "env": { "GIT_PROJECT_ROOT": "/srv/git", "GIT_HTTP_EXPORT_ALL": "" },
+               "timeout": 30 },
     "lwsws": { "type": "proxy", "address": "unix:/var/run/lwsws-npro", "path": "/" },
     "to-https": { "type": "redirect", "to": "https://npro.rs", "append-path": true }
   },

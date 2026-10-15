@@ -17,6 +17,9 @@ mod front {
     use std::path::PathBuf;
     use std::thread;
 
+    use core::time::Duration;
+
+    use npro_cgi::Script;
     use npro_cli::front::{Front, Logs, Service, Services, act, check};
     use npro_cli::runner::{Streams, bind};
     use npro_files::{Cache, Intermediaries, Mount, Revalidate};
@@ -446,5 +449,177 @@ mod front {
             e.to_string(),
             "www, localhost, /: no service \"login\"; built in: www, sub, up"
         );
+    }
+
+    /// A script in `root` that answers with its head, what it was told,
+    /// and its stdin: the path to it.
+    #[cfg(unix)]
+    fn script(root: &str) -> &'static str {
+        use std::os::unix::fs::PermissionsExt;
+        let path = format!("{root}/answer.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"$PATH_INFO\" = /fail ]; then exit 3; fi\n\
+             if [ \"$PATH_INFO\" = /there ]; then printf 'Location: /elsewhere\\r\\n\\r\\n'; exit 0; fi\n\
+             printf 'Status: 201 Created\\r\\nContent-Type: text/plain\\r\\nX-Info: %s\\r\\n\\r\\n' \"$PATH_INFO\"\n\
+             printf 'method=%s query=%s uri=%s https=%s\\n' \"$REQUEST_METHOD\" \"$QUERY_STRING\" \"$REQUEST_URI\" \"$HTTPS\"\n\
+             cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.leak()
+    }
+
+    /// The services and a plain listener: the tree, and a cgi route to
+    /// `exec`.
+    fn policy_cgi(
+        root: &'static str,
+        exec: &'static str,
+    ) -> (Services<'static>, Listener<'static>) {
+        let services: &'static [(&'static str, Service<'static>)] = vec![
+            (
+                "www",
+                Service::Files(Mount {
+                    root,
+                    default: "index.html",
+                    cache: Cache::NoStore,
+                    mimes: &[],
+                }),
+            ),
+            (
+                "cgi",
+                Service::Cgi(Script {
+                    exec,
+                    env: &[("SCRIPT_OWN", "yes")],
+                    dir: Some(root),
+                    timeout: Duration::from_secs(5),
+                }),
+            ),
+        ]
+        .leak();
+        let routes: &'static [Route<'static>] = vec![
+            Route {
+                path: "/",
+                matching: Match::Prefix,
+                to: "www",
+                ws: Ws::NotTaken,
+                headers: &[],
+            },
+            Route {
+                path: "/cgi",
+                matching: Match::Prefix,
+                to: "cgi",
+                ws: Ws::NotTaken,
+                headers: &[(b"x-cgi", b"1")],
+            },
+        ]
+        .leak();
+        let vhosts: &'static [Vhost<'static>] = vec![Vhost {
+            name: "localhost",
+            routes,
+            headers: &[],
+            not_found: None,
+        }]
+        .leak();
+        (
+            Services { by_name: services },
+            Listener {
+                name: "www",
+                bind: "127.0.0.1:0",
+                tls: Tls::Plain,
+                h1: Config::default(),
+                vhosts,
+            },
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore = "sockets and processes: native runs keep it")]
+    fn a_script_answers_from_its_environment_and_its_stdin() {
+        let root = www("a_script_answers_from_its_environment_and_its_stdin");
+        let exec = script(root);
+        let (services, listener) = policy_cgi(root, exec);
+        let listeners = [listener];
+        let logs = Logs::none();
+        let bound = bind(&listeners).unwrap();
+        let addr = bound.local_addr(ListenerId::new(0)).unwrap();
+        let stop = Stop::new();
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                bound.serve(
+                    4,
+                    |ss: &mut Streams<'_, Front>, now, jobs| {
+                        act(&services, &logs, ss, now, jobs);
+                    },
+                    Workers::default(),
+                    &stop,
+                )
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // the head's status and headers, the route's header, and
+                // the environment, with no length so the close ends it
+                let got1 = ask(addr, &get("/cgi/a/b?x=1&y=a%26b", ""));
+                let text1 = String::from_utf8_lossy(&got1);
+                assert!(
+                    text1.starts_with(
+                        "HTTP/1.1 201 \r\ncontent-type: text/plain\r\nconnection: close\r\n\
+                         x-cgi: 1\r\nX-Info: /a/b\r\n\r\n"
+                    ),
+                    "{text1}"
+                );
+                assert!(
+                    text1.ends_with("method=GET query=x=1&y=a%26b uri=/cgi/a/b https=\n"),
+                    "{text1}"
+                );
+                // a POST's body goes to its stdin, and comes back from cat
+                let body = "hello, script";
+                let got2 = ask(
+                    addr,
+                    &format!(
+                        "POST /cgi/in HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
+                );
+                let text2 = String::from_utf8_lossy(&got2);
+                assert!(text2.starts_with("HTTP/1.1 201 \r\n"), "{text2}");
+                assert!(
+                    text2.ends_with(&format!("method=POST query= uri=/cgi/in https=\n{body}")),
+                    "{text2}"
+                );
+                // a Location is a 302
+                let got3 = ask(addr, &get("/cgi/there", ""));
+                assert!(
+                    got3.starts_with(
+                        b"HTTP/1.1 302 Redirect\r\nconnection: close\r\nx-cgi: 1\r\nLocation: /elsewhere\r\n"
+                    ),
+                    "{}",
+                    got3.escape_ascii()
+                );
+                // one that exits without a head: C's page
+                let got4 = ask(addr, &get("/cgi/fail", ""));
+                assert!(
+                    got4.starts_with(b"HTTP/1.1 500 Internal Server Error\r\n"),
+                    "{}",
+                    got4.escape_ascii()
+                );
+                // a HEAD gets the head alone
+                let got5 = ask(
+                    addr,
+                    "HEAD /cgi/h HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                );
+                let text5 = String::from_utf8_lossy(&got5);
+                assert!(text5.starts_with("HTTP/1.1 201 \r\n"), "{text5}");
+                assert!(text5.ends_with("\r\n\r\n"), "{text5}");
+            }));
+            stop.stop();
+            server.join().unwrap().unwrap();
+            if let Err(e) = outcome {
+                std::panic::resume_unwind(e);
+            }
+        });
+        drop(std::fs::remove_dir_all(root));
     }
 }
