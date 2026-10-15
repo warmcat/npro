@@ -17,7 +17,7 @@ mod front {
     use std::path::PathBuf;
     use std::thread;
 
-    use npro_cli::front::{Front, Service, Services, act, check};
+    use npro_cli::front::{Front, Logs, Service, Services, act, check};
     use npro_cli::runner::{Streams, bind};
     use npro_files::{Cache, Intermediaries, Mount, Revalidate};
     use npro_h1::server::Config;
@@ -176,6 +176,8 @@ mod front {
         let (services, listener) = policy(root);
         let listeners = [listener];
         check(&services, &listeners).unwrap();
+        let log = format!("{root}/access.log");
+        let logs = Logs::open(&[("localhost", &log)]).unwrap();
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -183,7 +185,9 @@ mod front {
             let server = scope.spawn(|| {
                 bound.serve(
                     4,
-                    |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+                    |ss: &mut Streams<'_, Front>, now, jobs| {
+                        act(&services, &logs, ss, now, jobs);
+                    },
                     Workers::default(),
                     &stop,
                 )
@@ -199,7 +203,44 @@ mod front {
                 std::panic::resume_unwind(e);
             }
         });
+        // each request is a line of the vhost's access log, in C's
+        // form, written as its transaction ended
+        let lines = std::fs::read_to_string(&log).unwrap();
         drop(std::fs::remove_dir_all(root));
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        for l in &lines {
+            assert!(l.starts_with("127.0.0.1 - - ["), "{l}");
+            assert!(l.ends_with(" \"\" \"\""), "{l}");
+        }
+        assert!(
+            lines[0].contains("] \"GET / HTTP/1.1\" 200 "),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[2].contains("\"GET /sub HTTP/1.1\" 301 "),
+            "{}",
+            lines[2]
+        );
+        assert!(lines[3].contains("\"GET / HTTP/1.1\" 304 "), "{}", lines[3]);
+        // the bytes are the whole answer: the head and the file
+        let big = lines[4]
+            .split_once("\"GET /big.txt HTTP/1.1\" 200 ")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(bytes, _)| bytes.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!((300_000..300_000 + 1024).contains(&big), "{}", lines[4]);
+        assert!(
+            lines[5].contains("\"HEAD /big.txt HTTP/1.1\" 200 "),
+            "{}",
+            lines[5]
+        );
+        assert!(
+            lines[6].contains("\"GET /nothing HTTP/1.1\" 302 "),
+            "{}",
+            lines[6]
+        );
     }
 
     /// What a client sees of the served tree.
@@ -289,6 +330,7 @@ mod front {
         let root = www("a_request_is_passed_to_the_origin_and_its_answer_back");
         let (services, listener) = policy_with(root, up);
         let listeners = [listener];
+        let logs = Logs::none();
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -296,7 +338,9 @@ mod front {
             let server = scope.spawn(|| {
                 bound.serve(
                     8,
-                    |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+                    |ss: &mut Streams<'_, Front>, now, jobs| {
+                        act(&services, &logs, ss, now, jobs);
+                    },
                     Workers::default(),
                     &stop,
                 )
@@ -350,6 +394,7 @@ mod front {
         let root = www("an_origin_not_there_is_answered_503");
         let (services, listener) = policy_with(root, nowhere);
         let listeners = [listener];
+        let logs = Logs::none();
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -357,7 +402,9 @@ mod front {
             let server = scope.spawn(|| {
                 bound.serve(
                     4,
-                    |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+                    |ss: &mut Streams<'_, Front>, now, jobs| {
+                        act(&services, &logs, ss, now, jobs);
+                    },
                     Workers::default(),
                     &stop,
                 )

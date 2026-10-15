@@ -35,6 +35,7 @@ mod cli {
                 r#"{{
   "listeners": {{ "main": {{ "bind": "unix:{sock}", "vhosts": ["localhost"] }} }},
   "vhosts": {{ "localhost": {{ "headers": {{ "x-npro": "1" }},
+                               "access-log": "{dir}/access.log",
                                "routes": [ {{ "path": "/", "to": "www" }},
                                            {{ "path": "/old", "to": "moved" }} ] }} }},
   "services": {{ "www": {{ "type": "files", "root": "{dir}" }},
@@ -105,11 +106,27 @@ mod cli {
         });
         child.kill().unwrap();
         let out = child.wait_with_output().unwrap();
+        let log = std::fs::read_to_string(dir.join("access.log")).unwrap_or_default();
         drop(std::fs::remove_dir_all(&dir));
         assert!(
             outcome.is_ok(),
             "npro said: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+        // the access log: a line per request, the peer `-` on a unix
+        // socket, the bytes being the whole answer
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(
+            lines[0].starts_with("- - - [") && lines[0].contains("] \"GET / HTTP/1.1\" 200 "),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("] \"GET /old/thing HTTP/1.1\" 301 ")
+                && lines[1].ends_with("\"\" \"\""),
+            "{}",
+            lines[1]
         );
     }
 

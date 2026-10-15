@@ -10,17 +10,21 @@
 //! ([`Service::Proxy`]): npro-proxy, the request passed to its origin by
 //! a stream connecting out, which the adapter connects.  A request on a
 //! route naming no service, or on no route, gets the vhost's 404.
+//!
+//! Each request on a vhost with an access log ([`Logs`]) is written to
+//! it as its transaction ends, in C's line ([`npro_ss::access`]).
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use npro_core::time::Instant;
 use npro_files::{Fs, Mount, Opened, Scheme, Served, Serving, serve};
 use npro_io::threads::Jobs;
 use npro_proxy::{Act, Asked, CAPACITY, Side, Storage, Upstream};
-use npro_ss::event::{Filled, Kind};
+use npro_ss::access::{MAX_LINE, Record};
+use npro_ss::event::{Ended, Filled, Kind, Txn};
 use npro_ss::id::StreamId;
 use npro_ss::policy::{Listener, Tls};
 
@@ -127,6 +131,105 @@ pub fn check(services: &Services<'_>, listeners: &[Listener<'_>]) -> Result<(), 
     Ok(())
 }
 
+/// The access logs: a file for each vhost the policy gives one, C's
+/// `access-log`, opened once however many vhosts share it, appended to a
+/// line per request.  Opened before the listeners are bound, so a log
+/// that cannot be is refused before anything is served.
+#[derive(Debug)]
+pub struct Logs {
+    /// Each file, by its path, once.
+    files: Vec<(String, File)>,
+    /// Each vhost's file, by name, as an index into `files`.
+    by_vhost: Vec<(String, usize)>,
+}
+
+/// An access log that could not be opened.
+#[derive(Debug)]
+pub struct LogError {
+    /// Its path.
+    pub path: String,
+    /// Why.
+    pub error: io::Error,
+}
+
+impl core::fmt::Display for LogError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "access log {}: {}", self.path, self.error)
+    }
+}
+
+impl core::error::Error for LogError {}
+
+impl Logs {
+    /// No logs: nothing is written.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            files: Vec::new(),
+            by_vhost: Vec::new(),
+        }
+    }
+
+    /// Opens the log of each `(vhost, path)`, to append to, made if it is
+    /// not there, as C opens it.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError`], the first path that could not be opened.
+    pub fn open(vhosts: &[(&str, &str)]) -> Result<Self, LogError> {
+        let mut logs = Self::none();
+        for (vhost, path) in vhosts {
+            let at = logs.files.iter().position(|(p, _)| p == path);
+            let at = match at {
+                Some(at) => at,
+                None => logs.open_one(path)?,
+            };
+            logs.by_vhost.push(((*vhost).to_owned(), at));
+        }
+        Ok(logs)
+    }
+
+    /// Opens the file at `path`: its index.
+    fn open_one(&mut self, path: &str) -> Result<usize, LogError> {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|error| LogError {
+                path: path.to_owned(),
+                error,
+            })?;
+        self.files.push((path.to_owned(), file));
+        Ok(self.files.len().saturating_sub(1))
+    }
+
+    /// The record of the request `txn` holds, and which log it goes to,
+    /// if its vhost has one: taken now, at the wall clock's time, since
+    /// the request is gone by the time its transaction ends.
+    fn record<S: AsRef<[u8]> + AsMut<[u8]>>(&self, txn: &Txn<'_, S>) -> Option<(usize, Record)> {
+        let name = txn.vhost().name;
+        let (_, at) = self.by_vhost.iter().find(|(v, _)| v == name)?;
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Some((*at, Record::of(txn, wall)))
+    }
+
+    /// Writes the line for `record`, the transaction having ended as
+    /// `ended` says, to the log `at`.  One write per line, so lines from
+    /// every process appending to the file stay whole.  A write that
+    /// fails is let go, as C's is: there is nothing to tell but the log.
+    fn write(&self, at: usize, record: &Record, ended: Ended) {
+        let Some((_, file)) = self.files.get(at) else {
+            return;
+        };
+        let mut line = [0u8; MAX_LINE];
+        let n = record.line(ended, &mut line);
+        let mut f: &File = file;
+        drop(f.write_all(line.get(..n).unwrap_or_default()));
+    }
+}
+
 /// std's file system, as npro-files opens files on it.  A symbolic link
 /// is followed, as C follows it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -174,9 +277,29 @@ impl Fs for StdFs {
     }
 }
 
-/// A front stream's state: what it is sending.
+/// A front stream's state.
 #[derive(Debug, Default)]
-pub enum Front {
+pub struct Front {
+    /// What it is sending.
+    state: State,
+    /// The access log's record of the request in hand, and which log it
+    /// goes to, while the request is on a vhost with a log.
+    log: Option<(usize, Record)>,
+}
+
+impl Front {
+    /// A stream that is one side of a proxied request.
+    fn proxy(side: Side<Vec<u8>>) -> Self {
+        Self {
+            state: State::Proxy(Box::new(side)),
+            log: None,
+        }
+    }
+}
+
+/// What a front stream is sending.
+#[derive(Debug, Default)]
+pub enum State {
     /// Nothing yet.
     #[default]
     Idle,
@@ -192,9 +315,9 @@ pub enum Front {
 
 /// The proxy's side of a front stream, if it is one.
 fn proxy_side(u: &mut Front) -> Option<&mut Side<Vec<u8>>> {
-    match u {
-        Front::Proxy(s) => Some(s),
-        Front::Idle | Front::Answered | Front::File(_) => None,
+    match &mut u.state {
+        State::Proxy(s) => Some(s),
+        State::Idle | State::Answered | State::File(_) => None,
     }
 }
 
@@ -217,7 +340,7 @@ enum Then {
 fn status(ss: &mut Streams<'_, Front>, now: Instant, stream: StreamId, code: u16) {
     if ss.status(now, stream, code).is_ok() {
         if let Ok(u) = ss.user(stream) {
-            *u = Front::Answered;
+            u.state = State::Answered;
         }
         let _ = ss.request_tx(stream);
     }
@@ -276,7 +399,11 @@ fn read_off_the_turn<'s, 'j>(
             let chunk = read_chunk(&file, read);
             move |streams: &mut Streams<'s, Front>, _: Instant| {
                 // the stream may have gone meanwhile
-                if let Ok(Front::File(back)) = streams.user(stream) {
+                if let Ok(Front {
+                    state: State::File(back),
+                    ..
+                }) = streams.user(stream)
+                {
                     back.read_done(file, chunk);
                     let _ = streams.request_tx(stream);
                 }
@@ -290,7 +417,7 @@ fn read_off_the_turn<'s, 'j>(
 /// fit [`MAX_LOCATION`].
 fn redirect<S: AsRef<[u8]> + AsMut<[u8]>>(
     r: &Redirect<'_>,
-    txn: &mut npro_ss::event::Txn<'_, S>,
+    txn: &mut Txn<'_, S>,
 ) -> Result<(), npro_ss::event::RespondError> {
     let mut loc = Vec::with_capacity(MAX_LOCATION);
     loc.extend_from_slice(r.to.as_bytes());
@@ -309,71 +436,89 @@ fn redirect<S: AsRef<[u8]> + AsMut<[u8]>>(
     }
 }
 
+/// Answers the request `txn` holds from the service its route names,
+/// setting the stream's `state` for what follows.
+fn answer(services: &Services<'static>, txn: &mut Txn<'_, Vec<u8>>, user: &mut State) -> Then {
+    let scheme = match txn.listener().tls {
+        Tls::Plain => Scheme::Http,
+        Tls::Server { .. } => Scheme::Https,
+    };
+    let service = txn.route().and_then(|r| services.find(r.route.to));
+    match service {
+        // refused only as the role refuses it: the request
+        // stays unanswered, and its timeout ends the connection
+        Some(Service::Files(mount)) => match serve(mount, txn, &mut StdFs, scheme) {
+            Ok(Served::Answered) => {
+                *user = State::Answered;
+                Then::Tx
+            }
+            Ok(Served::Body(s)) => {
+                *user = State::File(s);
+                Then::Tx
+            }
+            Err(_) => Then::Nothing,
+        },
+        Some(Service::Proxy(up)) => match Asked::of(up, txn) {
+            Ok(asked) => Then::Start(*up, Box::new(asked)),
+            Err(e) => Then::Status(e.status()),
+        },
+        Some(Service::Redirect(r)) => match redirect(r, txn) {
+            Ok(()) => {
+                *user = State::Answered;
+                Then::Tx
+            }
+            Err(_) => Then::Nothing,
+        },
+        None => match txn.status(404) {
+            Ok(()) => {
+                *user = State::Answered;
+                Then::Tx
+            }
+            Err(_) => Then::Nothing,
+        },
+    }
+}
+
 /// The front's turn: every event answered, the file reads wanted given
-/// to `jobs`.  This is what the runner's `serve()` is given.
+/// to `jobs`, each transaction over written to its vhost's log.  This is
+/// what the runner's `serve()` is given.
 pub fn act<'s>(
     services: &Services<'static>,
+    logs: &Logs,
     ss: &mut Streams<'s, Front>,
     now: Instant,
     jobs: &Jobs<'_, Streams<'s, Front>>,
 ) {
     while let Some(ev) = ss.poll_event(now) {
-        let (stream, user): (StreamId, &mut Front) = (ev.stream, ev.user);
-        let then = match (user, ev.kind) {
-            (Front::Proxy(side), kind) => Then::Acts(npro_proxy::on_event(stream, side, kind)),
-            (user, Kind::ServerTxn(mut txn)) => {
-                let scheme = match txn.listener().tls {
-                    Tls::Plain => Scheme::Http,
-                    Tls::Server { .. } => Scheme::Https,
-                };
-                let service = txn.route().and_then(|r| services.find(r.route.to));
-                match service {
-                    // refused only as the role refuses it: the request
-                    // stays unanswered, and its timeout ends the connection
-                    Some(Service::Files(mount)) => match serve(mount, &mut txn, &mut StdFs, scheme)
-                    {
-                        Ok(Served::Answered) => {
-                            *user = Front::Answered;
-                            Then::Tx
-                        }
-                        Ok(Served::Body(s)) => {
-                            *user = Front::File(s);
-                            Then::Tx
-                        }
-                        Err(_) => Then::Nothing,
-                    },
-                    Some(Service::Proxy(up)) => match Asked::of(up, &txn) {
-                        Ok(asked) => Then::Start(*up, Box::new(asked)),
-                        Err(e) => Then::Status(e.status()),
-                    },
-                    Some(Service::Redirect(r)) => match redirect(r, &mut txn) {
-                        Ok(()) => {
-                            *user = Front::Answered;
-                            Then::Tx
-                        }
-                        Err(_) => Then::Nothing,
-                    },
-                    None => match txn.status(404) {
-                        Ok(()) => {
-                            *user = Front::Answered;
-                            Then::Tx
-                        }
-                        Err(_) => Then::Nothing,
-                    },
+        let stream: StreamId = ev.stream;
+        let Front { state, log } = ev.user;
+        let then = match (state, ev.kind) {
+            (
+                State::Idle | State::Answered | State::File(_) | State::Proxy(_),
+                Kind::ServerTxnEnd(ended),
+            ) => {
+                if let Some((at, record)) = log.take() {
+                    logs.write(at, &record, ended);
                 }
+                Then::Nothing
+            }
+            (State::Proxy(side), kind) => Then::Acts(npro_proxy::on_event(stream, side, kind)),
+            (user, Kind::ServerTxn(mut txn)) => {
+                *log = logs.record(&txn);
+                answer(services, &mut txn, user)
             }
             (user, Kind::Tx(tx)) => {
                 tx.fill(|buf| match user {
-                    Front::Idle | Front::Answered | Front::Proxy(_) => Filled::Last(0),
-                    Front::File(s) => s.fill(buf),
+                    State::Idle | State::Answered | State::Proxy(_) => Filled::Last(0),
+                    State::File(s) => s.fill(buf),
                 });
-                if let Front::File(serving) = user {
+                if let State::File(serving) = user {
                     read_off_the_turn(serving, stream, jobs);
                 }
                 Then::Nothing
             }
             (
-                Front::Idle | Front::Answered | Front::File(_),
+                State::Idle | State::Answered | State::File(_),
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
                 | Kind::Rx { .. }
@@ -395,12 +540,11 @@ pub fn act<'s>(
                     staging: vec![0; CAPACITY],
                     out: vec![0; CAPACITY],
                 };
-                match npro_proxy::start(&up, &asked, stream, ss, storage(), storage(), |side| {
-                    Front::Proxy(Box::new(side))
-                }) {
+                match npro_proxy::start(&up, &asked, stream, ss, storage(), storage(), Front::proxy)
+                {
                     Ok(side) => {
                         if let Ok(u) = ss.user(stream) {
-                            *u = Front::Proxy(Box::new(side));
+                            u.state = State::Proxy(Box::new(side));
                         }
                     }
                     Err(e) => status(ss, now, stream, e.status()),

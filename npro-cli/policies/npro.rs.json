@@ -13,6 +13,7 @@
   "vhosts": {
     "npro.rs": {
       "not-found": "/404.html",
+      "access-log": "/srv/log/lwsws/npro-access-log",
       "headers": {
         "strict-transport-security": "max-age=15768000; includeSubDomains",
         "x-frame-options": "deny",

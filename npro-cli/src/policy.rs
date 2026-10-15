@@ -358,6 +358,9 @@ pub struct Policy {
     pub listeners: &'static [Listener<'static>],
     /// The services, for the front.
     pub services: Services<'static>,
+    /// Each vhost's access log, by the vhost's name, for the front's
+    /// [`crate::front::Logs`].
+    pub logs: &'static [(&'static str, &'static str)],
     /// How many streams at once.
     pub slots: usize,
     /// How many worker threads for the application's jobs.
@@ -540,7 +543,7 @@ pub fn policy(v: &Value) -> Result<Policy, PolicyError> {
     let top = Members::of(String::new(), v)?;
     top.only(&["listeners", "vhosts", "services", "npro"])?;
     let services = services(&top)?;
-    let vhosts = vhosts(&top, &services)?;
+    let (vhosts, logs) = vhosts(&top, &services)?;
     let listeners = listeners(&top, &vhosts)?;
     let npro = top.object("npro")?;
     let (slots, workers) = match npro {
@@ -555,6 +558,7 @@ pub fn policy(v: &Value) -> Result<Policy, PolicyError> {
         services: Services {
             by_name: Vec::leak(services),
         },
+        logs: Vec::leak(logs),
         slots: usize::try_from(slots.unwrap_or(64)).unwrap_or(64),
         workers: usize::try_from(workers.unwrap_or(2)).unwrap_or(2),
     })
@@ -644,18 +648,28 @@ fn services(top: &Members<'_>) -> Result<Vec<(&'static str, Service<'static>)>, 
     Ok(out)
 }
 
+/// The vhosts by name, and the access log of each that has one.
+type Vhosts = (
+    Vec<(&'static str, Vhost<'static>)>,
+    Vec<(&'static str, &'static str)>,
+);
+
 fn vhosts(
     top: &Members<'_>,
     services: &[(&'static str, Service<'static>)],
-) -> Result<Vec<(&'static str, Vhost<'static>)>, PolicyError> {
+) -> Result<Vhosts, PolicyError> {
     let Some(all) = top.object("vhosts")? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let known: Vec<String> = services.iter().map(|(n, _)| (*n).to_owned()).collect();
     let mut out = Vec::new();
+    let mut logs = Vec::new();
     for (name, v) in all.members {
         let m = Members::of(all.path(name), v)?;
-        m.only(&["routes", "headers", "not-found"])?;
+        m.only(&["routes", "headers", "not-found", "access-log"])?;
+        if let Some(path) = m.string("access-log")? {
+            logs.push((keep(name), keep(path)));
+        }
         let mut routes = Vec::new();
         for (i, r) in m.array("routes")?.unwrap_or_default().iter().enumerate() {
             let rm = Members::of(format!("{}[{i}]", m.path("routes")), r)?;
@@ -732,7 +746,7 @@ fn vhosts(
             },
         ));
     }
-    Ok(out)
+    Ok((out, logs))
 }
 
 fn listeners(
@@ -852,6 +866,7 @@ mod tests {
     const FULL: &str = r#"{
         "listeners": { "l": { "bind": "unix:/tmp/x", "vhosts": ["v"] } },
         "vhosts": { "v": { "not-found": "/404.html", "headers": {"x-a": "1"},
+                           "access-log": "/var/log/v.log",
                            "routes": [ { "path": "/", "to": "www" },
                                        { "path": "/up", "to": "up", "exact": true },
                                        { "path": "/go", "to": "go" },
@@ -873,6 +888,7 @@ mod tests {
         assert_eq!((l.name, l.bind, l.tls), ("l", "unix:/tmp/x", Tls::Plain));
         let v = &l.vhosts[0];
         assert_eq!((v.name, v.not_found), ("v", Some("/404.html")));
+        assert_eq!(p.logs, &[("v", "/var/log/v.log")]);
         assert_eq!(v.headers, &[(&b"x-a"[..], &b"1"[..])]);
         assert_eq!(v.routes.len(), 4);
         assert_eq!(v.routes[1].matching, Match::Exact);

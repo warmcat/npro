@@ -53,6 +53,7 @@ authority come after; nothing here stops them):
     "example.com": {
       "headers": { "strict-transport-security": "max-age=15768000" },
       "not-found": "/404.html",
+      "access-log": "/var/log/npro/example.com.log",
       "routes": [
         { "path": "/",     "to": "www" },
         { "path": "/git",  "to": "git", "headers": { "x-git": "1" } },
@@ -83,8 +84,14 @@ authority come after; nothing here stops them):
   leads the request's winning (`exact` for one that must match whole),
   each sent `to` a service by name, with its own `headers` and, if `ws`
   is given, ws taken on it with those `protocols`; `headers` on every
-  response; and `not-found`, a document a request nothing serves is
-  redirected to (C's `error-document-404`).
+  response; `not-found`, a document a request nothing serves is
+  redirected to (C's `error-document-404`); and `access-log`, a file
+  a line is appended to for each request, in C's (Apache's) form, as
+  its transaction ends: the peer's address (`-` on a unix domain
+  socket), the time in UTC, the request line, the status, the bytes
+  the answer took, the referrer and the user agent.  The file is
+  opened before the listeners are bound, made if it is not there.
+  A request upgraded to ws is not yet logged.
 - **services**, by name, each of a `type` built into this program:
   - `files`: the directory `root` served, `default` (`index.html`) for
     a directory, `cache` as C's `cache-*` (`no-cache`, or `max-age`
@@ -107,4 +114,4 @@ it loading.
 
 Not in this form yet: the h1 limits and timeouts per listener (the
 defaults are C's), client streamtypes, the deployment and front layers
-with their instances, the login guard, the access log, and cgi.
+with their instances, the login guard, and cgi.

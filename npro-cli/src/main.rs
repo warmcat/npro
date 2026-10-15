@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use npro_cli::front::{Front, act, check};
+use npro_cli::front::{Front, Logs, act, check};
 use npro_cli::policy::{self, Policy};
 use npro_cli::runner::{Streams, bind};
 use npro_io::threads::{Stop, Workers};
@@ -104,6 +104,7 @@ fn serve(policy: Option<&Path>, fragments: &[String]) -> Result<(), String> {
     let Policy {
         listeners,
         services,
+        logs,
         slots,
         workers,
     } = policy::policy(&merged).map_err(|e| format!("policy: {e}"))?;
@@ -111,12 +112,15 @@ fn serve(policy: Option<&Path>, fragments: &[String]) -> Result<(), String> {
         return Err("policy: no listeners: nothing to serve".into());
     }
     check(&services, listeners).map_err(|e| format!("policy: {e}"))?;
+    // the logs before the listeners: a log that cannot be opened is
+    // refused before a port is taken
+    let logs = Logs::open(logs).map_err(|e| e.to_string())?;
     let bound = bind(listeners).map_err(|e| e.to_string())?;
     let stop = Stop::new();
     bound
         .serve(
             slots,
-            move |ss: &mut Streams<'_, Front>, now, jobs| act(&services, ss, now, jobs),
+            move |ss: &mut Streams<'_, Front>, now, jobs| act(&services, &logs, ss, now, jobs),
             Workers(workers),
             &stop,
         )
