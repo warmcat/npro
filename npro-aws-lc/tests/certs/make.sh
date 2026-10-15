@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# Makes the test certificates: a CA, and a leaf for localhost it signs,
-# ECDSA P-256, valid for a hundred years.  Test material only: the keys are
+# Makes the test certificates: a CA, a leaf for localhost it signs, and a
+# client leaf for npro.rs it signs, ECDSA P-256, valid for a hundred years.  Test material only: the keys are
 # public, here.  Run from this directory; it overwrites what is here.
 
 set -eu
@@ -22,9 +22,22 @@ printf '%s\n' "basicConstraints=critical,CA:FALSE" \
 openssl x509 -req -in leaf.csr -CA ca-cert.pem -CAkey ca.pem -CAcreateserial \
 	-sha256 -days 36500 -extfile leaf.ext -out leaf-cert.pem
 
+# a client leaf the CA signs, for a server that asks who the client is:
+# its CN is the name it manages, as the certificate distribution client's
+openssl ecparam -name prime256v1 -genkey -noout -out client.pem
+openssl req -new -key client.pem -subj "/CN=npro.rs" -out client.csr
+printf '%s\n' "basicConstraints=critical,CA:FALSE" \
+	"keyUsage=critical,digitalSignature" \
+	"extendedKeyUsage=clientAuth" > client.ext
+openssl x509 -req -in client.csr -CA ca-cert.pem -CAkey ca.pem -CAcreateserial \
+	-sha256 -days 36500 -extfile client.ext -out client-cert.pem
+
 # DER, as the tests take them: no PEM parsing needed
 openssl x509 -in ca-cert.pem -outform DER -out ca.der
 openssl x509 -in leaf-cert.pem -outform DER -out leaf.der
 openssl pkcs8 -topk8 -nocrypt -in leaf.pem -outform DER -out leaf-key.der
+openssl x509 -in client-cert.pem -outform DER -out client.der
+openssl pkcs8 -topk8 -nocrypt -in client.pem -outform DER -out client-key.der
 
-rm -f ca.pem ca-cert.pem leaf.pem leaf-cert.pem leaf.csr leaf.ext ca-cert.srl
+rm -f ca.pem ca-cert.pem leaf.pem leaf-cert.pem leaf.csr leaf.ext ca-cert.srl \
+	client.pem client-cert.pem client.csr client.ext
