@@ -15,6 +15,7 @@
 //! by closing the socket.
 
 use core::mem;
+use core::net::SocketAddr;
 
 use npro_core::close::Close;
 use npro_core::random::Random;
@@ -31,7 +32,7 @@ use npro_ws::conn::{self as ws, Ws};
 use npro_ws::handshake::{self, MAX_101};
 
 use crate::event::{
-    End, Event, Flow, Kind, Own, Refusal, Resp, RespondError, Response, Tx, TxWant, Txn,
+    End, Ended, Event, Flow, Kind, Own, Refusal, Resp, RespondError, Response, Tx, TxWant, Txn,
     request_path, respond,
 };
 use crate::id::{ConnId, ListenerId, StreamId};
@@ -99,8 +100,9 @@ enum Stream<U> {
 /// How a stream lost its connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loss {
-    /// It was gone.
-    Disconnected,
+    /// It was gone, with a transaction still open if `ended` is given,
+    /// which the stream is told of first.
+    Disconnected { ended: Option<Ended> },
     /// It could not be made.
     ConnectFailed,
 }
@@ -182,6 +184,25 @@ struct Live<S, R, T> {
     h1: Spare<npro_h1::Storage<S>>,
     /// tls' buffers, when the connection is not tls.
     net: Spare<NetBuffers<S>>,
+    /// Where it was accepted from, if that has an address.
+    peer: Option<SocketAddr>,
+    /// The request in hand, for its transaction's end to be told.
+    open: Open,
+}
+
+/// The request in hand on an accepted connection, as far as telling its
+/// transaction's end goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// None was told.
+    Idle,
+    /// One was told, when the driver had sent this many bytes: the
+    /// difference at its end is what its answer took.
+    Marked(u64),
+    /// One is parsed and not yet told: the bytes that brought it ended
+    /// the transaction before it, which the stream is told first.  It
+    /// is told at the next look.
+    Held,
 }
 
 /// Where a request was routed, by place in the listener's policy.
@@ -599,9 +620,10 @@ where
     }
 
     /// The adapter accepted a socket on `listener`, at `now`, with `tls`
-    /// its record layer if the listener is tls: the connection is made,
-    /// and a stream on it with `U`'s default, and the adapter drives it by
-    /// the id returned.
+    /// its record layer if the listener is tls, and `peer` the address it
+    /// came from, if it has one (a unix domain socket's has none): the
+    /// connection is made, and a stream on it with `U`'s default, and the
+    /// adapter drives it by the id returned.
     ///
     /// # Errors
     ///
@@ -611,6 +633,7 @@ where
         now: Instant,
         listener: ListenerId,
         tls: Option<T>,
+        peer: Option<SocketAddr>,
     ) -> Result<ConnId, AcceptError>
     where
         U: Default,
@@ -643,6 +666,8 @@ where
             routed: None,
             h1: Spare::InUse,
             net,
+            peer,
+            open: Open::Idle,
         });
         slot.stream = Stream::Live {
             user: U::default(),
@@ -779,6 +804,8 @@ where
             routed: None,
             h1: Spare::InUse,
             net,
+            peer: None,
+            open: Open::Idle,
         };
         // a stream destroyed while connecting: nothing to carry
         if !matches!(slot.stream, Stream::Live { .. }) {
@@ -913,8 +940,22 @@ where
             .slots
             .get_mut(usize::try_from(id.slot).map_err(|_| Gone)?)
             .ok_or(Gone)?;
-        let Link::Live(live) = mem::replace(&mut slot.conn, Link::Lost) else {
+        let Link::Live(mut live) = mem::replace(&mut slot.conn, Link::Lost) else {
             return Err(Gone);
+        };
+        // a transaction still open ends with the connection: C's
+        // lws_access_log() at close; a request parsed and not told has
+        // no one to tell
+        let ended = match live.open {
+            Open::Marked(mark) => Some(Ended {
+                status: match live.driver.conn().role() {
+                    Role::H1Server(s) => s.answered(),
+                    Role::WsServer(_) => Some(101),
+                    Role::H1Client(_) | Role::WsClient(_) | Role::Raw(_) => None,
+                },
+                sent: live.driver.sent().saturating_sub(mark),
+            }),
+            Open::Idle | Open::Held => None,
         };
         let Parts { conn, bufs, tls } = live.driver.into_parts();
         let h1 = match (live.h1, conn.into_storage()) {
@@ -933,7 +974,7 @@ where
         slot.stream = match mem::replace(&mut slot.stream, Stream::Free) {
             Stream::Live { user, .. } => Stream::Ending {
                 user,
-                why: Loss::Disconnected,
+                why: Loss::Disconnected { ended },
             },
             // a stream destroyed first has no one to tell
             s @ (Stream::Free | Stream::Ending { .. } | Stream::Ended(_)) => s,
@@ -1085,6 +1126,7 @@ where
             .ok_or(RespondError::Gone)?;
         let at = live.routed.ok_or(RespondError::Gone)?;
         let (vhost, route) = at.in_listener(l).ok_or(RespondError::Gone)?;
+        let peer = live.peer;
         let RoleMut::H1Server(server) = live.driver.conn().role_mut() else {
             return Err(RespondError::Gone);
         };
@@ -1094,6 +1136,7 @@ where
             vhost: at.vhost,
             route: at.route,
             now,
+            peer,
         };
         let _ = (vhost, route);
         txn.status(code)
@@ -1163,6 +1206,10 @@ where
                 slot: index,
                 generation: *stream_generation,
             };
+            // a transaction its connection took with it is told first
+            if has_transaction_to_tell(stream) {
+                return transaction_taken_with(id, stream);
+            }
             // a stream whose connection is gone, or was never made, is
             // told so, and let go
             if let Stream::Ending { .. } = stream {
@@ -1178,7 +1225,7 @@ where
                     stream: id,
                     user,
                     kind: match why {
-                        Loss::Disconnected => Kind::Disconnected,
+                        Loss::Disconnected { .. } => Kind::Disconnected,
                         Loss::ConnectFailed => Kind::ConnectFailed,
                     },
                 });
@@ -1189,55 +1236,107 @@ where
                 // one being made has nothing yet
                 continue;
             };
-            let Live {
-                driver,
-                side,
-                routed,
-                h1,
-                ..
-            } = live;
-            let l = match side {
-                Side::Accepted(listener) => {
-                    listeners.get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
-                }
-                Side::Client => None,
-            };
-            // the chance to write, if it asked and can
-            if *tx != TxWant::Idle && driver.is_writable() {
-                let payload = l
-                    .and_then(|l| routed.and_then(|r| r.in_listener(l)))
-                    .and_then(|(_, r)| r)
-                    .map_or(Payload::Binary, |r| match r.ws {
-                        WsPolicy::Taken(w) => w.payload,
-                        WsPolicy::NotTaken => Payload::Binary,
-                    });
-                return Some(Event {
-                    stream: id,
-                    user,
-                    kind: Kind::Tx(Tx {
-                        driver,
-                        want: tx,
-                        payload,
-                        now,
-                    }),
-                });
-            }
-            // what the peer sent, if anything, unless the stream holds
-            // it back: the last look at this slot
-            if *rx == Flow::Held {
-                continue;
-            }
-            if let Some(step) = driver.poll_rx(now) {
-                let (event, role) = step.into_parts();
-                return Some(Event {
-                    stream: id,
-                    user,
-                    kind: told(event, role, l, routed, h1, now),
-                });
+            if let Some(ev) = live_event(id, user, tx, *rx, live, listeners, now) {
+                return Some(ev);
             }
         }
         None
     }
+}
+
+/// What a live stream is told next, if anything: its transaction over,
+/// a request held back, its chance to write, or what its peer sent.
+fn live_event<'a, U, S, R, T>(
+    id: StreamId,
+    user: &'a mut U,
+    tx: &'a mut TxWant,
+    rx: Flow,
+    live: &'a mut Live<S, R, T>,
+    listeners: &'a [Listener<'a>],
+    now: Instant,
+) -> Option<Event<'a, U, S, R, T>>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+    T: RecordLayer,
+{
+    let Live {
+        driver,
+        side,
+        routed,
+        h1,
+        peer,
+        open,
+        ..
+    } = live;
+    let l = match side {
+        Side::Accepted(listener) => {
+            listeners.get(usize::try_from(listener.index()).unwrap_or(usize::MAX))
+        }
+        Side::Client => None,
+    };
+    // a transaction over since the last look: told before anything
+    // else of the stream's, so the next request's is its own
+    if let Some(e) = transaction_over(driver, open) {
+        return Some(Event {
+            stream: id,
+            user,
+            kind: Kind::ServerTxnEnd(e),
+        });
+    }
+    // a request held back while the transaction before it was
+    // told over
+    if *open == Open::Held {
+        *open = Open::Marked(driver.sent());
+        let request = ConnEvent::H1Server(server::Event::Request);
+        return Some(Event {
+            stream: id,
+            user,
+            kind: told(request, driver.conn(), l, routed, h1, now, *peer),
+        });
+    }
+    // the chance to write, if it asked and can
+    if *tx != TxWant::Idle && driver.is_writable() {
+        return Some(Event {
+            stream: id,
+            user,
+            kind: Kind::Tx(Tx {
+                driver,
+                want: tx,
+                payload: payload_of(l, *routed),
+                now,
+            }),
+        });
+    }
+    // what the peer sent, if anything, unless the stream holds
+    // it back: the last look at this slot
+    if rx == Flow::Held {
+        return None;
+    }
+    let sent = driver.sent();
+    if let Some(step) = driver.poll_rx(now) {
+        let (event, role) = step.into_parts();
+        if matches!(event, ConnEvent::H1Server(server::Event::Request)) {
+            // the same bytes may have ended the transaction before
+            // it, whose end goes first: the request waits
+            if let Some(e) = settled_by_the_same_bytes(role, open, sent) {
+                *open = Open::Held;
+                return Some(Event {
+                    stream: id,
+                    user,
+                    kind: Kind::ServerTxnEnd(e),
+                });
+            }
+            // a request's transaction is open from its head
+            *open = Open::Marked(sent);
+        }
+        return Some(Event {
+            stream: id,
+            user,
+            kind: told(event, role, l, routed, h1, now, *peer),
+        });
+    }
+    None
 }
 
 /// The adapter's side of [`Ss`], for an adapter carrying any host, as
@@ -1259,8 +1358,9 @@ where
         now: Instant,
         listener: ListenerId,
         tls: Option<T>,
+        peer: Option<SocketAddr>,
     ) -> Result<ConnId, AcceptError> {
-        Ss::accepted(self, now, listener, tls)
+        Ss::accepted(self, now, listener, tls, peer)
     }
 
     fn want(&mut self, now: Instant, conn: ConnId) -> Result<Want<'_>, Gone> {
@@ -1308,8 +1408,92 @@ where
     }
 }
 
+/// What a stream's ws messages are, by the route its request was on:
+/// binary on anything else.
+fn payload_of(l: Option<&Listener<'_>>, routed: Option<Routed>) -> Payload {
+    l.and_then(|l| routed.and_then(|r| r.in_listener(l)))
+        .and_then(|(_, r)| r)
+        .map_or(Payload::Binary, |r| match r.ws {
+            WsPolicy::Taken(w) => w.payload,
+            WsPolicy::NotTaken => Payload::Binary,
+        })
+}
+
+/// Whether the stream's connection went with a transaction open, which
+/// the stream is yet to be told.
+const fn has_transaction_to_tell<U>(stream: &Stream<U>) -> bool {
+    matches!(
+        stream,
+        Stream::Ending {
+            why: Loss::Disconnected { ended: Some(_) },
+            ..
+        }
+    )
+}
+
+/// The transaction the stream's gone connection took with it, told: what
+/// [`has_transaction_to_tell`] said there is.
+fn transaction_taken_with<U, S, R, T>(
+    id: StreamId,
+    stream: &mut Stream<U>,
+) -> Option<Event<'_, U, S, R, T>> {
+    let Stream::Ending {
+        user,
+        why: Loss::Disconnected { ended },
+    } = stream
+    else {
+        return None;
+    };
+    Some(Event {
+        stream: id,
+        user,
+        kind: Kind::ServerTxnEnd(ended.take()?),
+    })
+}
+
+/// The transaction over on a live connection since the last look, if one
+/// is and its request was told: one refused before any request was told
+/// has no stream to tell.
+fn transaction_over<S, R, T>(driver: &mut Driver<S, R, S, T>, open: &mut Open) -> Option<Ended>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+    T: RecordLayer,
+{
+    let sent = driver.sent();
+    settled_by_the_same_bytes(driver.conn(), open, sent)
+}
+
+/// The transaction the connection's h1 server settled since it was last
+/// asked, if one and its request was told: `sent` is the driver's count
+/// now.  The request is then no longer open.
+fn settled_by_the_same_bytes<S, R>(
+    conn: &mut Conn<S, R>,
+    open: &mut Open,
+    sent: u64,
+) -> Option<Ended>
+where
+    S: AsRef<[u8]> + AsMut<[u8]>,
+    R: Random,
+{
+    let settled = match conn.role_mut() {
+        RoleMut::H1Server(s) => s.take_settled(),
+        RoleMut::H1Client(_) | RoleMut::WsServer(_) | RoleMut::WsClient(_) | RoleMut::Raw(_) => {
+            None
+        }
+    }?;
+    let Open::Marked(mark) = *open else {
+        return None;
+    };
+    *open = Open::Idle;
+    Some(Ended {
+        status: settled.status,
+        sent: sent.saturating_sub(mark),
+    })
+}
+
 /// What a stream is told of its connection's event: `l` is the listener
-/// an accepted one came in on.
+/// an accepted one came in on, and `peer` where from.
 fn told<'a, S, R, T>(
     event: ConnEvent<'a>,
     conn: &'a mut Conn<S, R>,
@@ -1317,13 +1501,16 @@ fn told<'a, S, R, T>(
     routed: &mut Option<Routed>,
     h1: &mut Spare<npro_h1::Storage<S>>,
     now: Instant,
+    peer: Option<SocketAddr>,
 ) -> Kind<'a, S, R, T>
 where
     S: AsRef<[u8]> + AsMut<[u8]>,
     R: Random,
 {
     match (event, l) {
-        (ConnEvent::H1Server(server::Event::Request), Some(l)) => request(conn, l, routed, h1, now),
+        (ConnEvent::H1Server(server::Event::Request), Some(l)) => {
+            request(conn, l, routed, h1, now, peer)
+        }
         (
             ConnEvent::H1Server(server::Event::Body(data))
             | ConnEvent::H1Client(h1c::Event::Body(data))
@@ -1373,6 +1560,7 @@ fn request<'a, S, R, T>(
     routed: &mut Option<Routed>,
     spare: &mut Spare<npro_h1::Storage<S>>,
     now: Instant,
+    peer: Option<SocketAddr>,
 ) -> Kind<'a, S, R, T>
 where
     S: AsRef<[u8]> + AsMut<[u8]>,
@@ -1415,6 +1603,7 @@ where
             vhost: at.vhost,
             route: at.route,
             now,
+            peer,
         });
     };
     let RoleMut::H1Server(server) = conn.role_mut() else {
@@ -1506,6 +1695,7 @@ mod tests {
     extern crate alloc;
 
     use super::*;
+    use crate::access::{MAX_HEAD, MAX_LINE, MAX_PARTS, Record};
     use crate::event::{Filled, MAX_HEADERS};
     use crate::policy::Payload;
     use alloc::vec;
@@ -1623,6 +1813,8 @@ mod tests {
         Tx,
         Pong,
         PeerClose(Option<u16>),
+        /// A transaction over: its status, and what it took.
+        End(Option<u16>, u64),
         Disconnected(StreamId),
     }
 
@@ -1662,6 +1854,7 @@ mod tests {
                 }
                 Kind::Pong => Seen::Pong,
                 Kind::PeerClose { code } => Seen::PeerClose(code),
+                Kind::ServerTxnEnd(e) => Seen::End(e.status, e.sent),
                 Kind::Response(_) | Kind::ConnectFailed | Kind::Disconnected => {
                     Seen::Disconnected(stream)
                 }
@@ -1680,19 +1873,27 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(2);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, b"GET /one HTTP/1.1\r\n\r\n");
         let seen = serve(&mut ss, true);
         let Some(Seen::Txn(stream, path)) = seen.first().cloned() else {
             panic!("{seen:?}");
         };
         assert_eq!(path, b"/one");
-        assert_eq!(seen.get(1), Some(&Seen::Tx));
+        let sent = u64::try_from(OK.len()).unwrap();
+        assert_eq!(
+            seen.get(1..),
+            Some(&[Seen::Tx, Seen::End(Some(200), sent)][..])
+        );
         assert_eq!(written(&mut ss, conn), OK);
         read(&mut ss, conn, b"GET /two HTTP/1.1\r\n\r\n");
         assert_eq!(
             serve(&mut ss, true),
-            [Seen::Txn(stream, b"/two".to_vec()), Seen::Tx]
+            [
+                Seen::Txn(stream, b"/two".to_vec()),
+                Seen::Tx,
+                Seen::End(Some(200), sent)
+            ]
         );
         assert_eq!(written(&mut ss, conn), OK);
     }
@@ -1702,7 +1903,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, b"GET / HTTP/1.1\r\n\r\n");
         let Some(Seen::Txn(stream, _)) = serve(&mut ss, false).first().cloned() else {
             panic!("no request");
@@ -1714,6 +1915,18 @@ mod tests {
             Ok(Want::Release(npro_io::driver::Outcome::Delivered))
         ));
         ss.released(conn).unwrap();
+        // the request, unanswered, is over first; then the stream is gone
+        {
+            let over = ss.poll_event(T0).unwrap();
+            assert!(matches!(
+                over.kind,
+                Kind::ServerTxnEnd(Ended {
+                    status: None,
+                    sent: 0
+                })
+            ));
+            assert_eq!(over.stream, stream);
+        }
         {
             let told = ss.poll_event(T0).unwrap();
             assert!(matches!(told.kind, Kind::Disconnected));
@@ -1728,7 +1941,7 @@ mod tests {
         assert!(ss.want(T0, conn).is_err());
         assert_eq!(ss.released(conn), Err(Gone));
         // the slot carries the next, under new ids
-        let next = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let next = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         assert_ne!(next, conn);
         read(&mut ss, next, b"GET /again HTTP/1.1\r\n\r\n");
         let Some(Seen::Txn(again, path)) = serve(&mut ss, true).first().cloned() else {
@@ -1754,17 +1967,17 @@ mod tests {
         let mut sl: Slots = (0..2).map(|_| Slot::new(storage(512, 64))).collect();
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         assert_eq!(
-            ss.accepted(T0, ListenerId::new(1), None),
+            ss.accepted(T0, ListenerId::new(1), None, None),
             Err(AcceptError::Tls)
         );
         assert_eq!(
-            ss.accepted(T0, ListenerId::new(2), None),
+            ss.accepted(T0, ListenerId::new(2), None, None),
             Err(AcceptError::NoListener)
         );
-        let a = ss.accepted(T0, ListenerId::new(0), None).unwrap();
-        ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let a = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         assert_eq!(
-            ss.accepted(T0, ListenerId::new(0), None),
+            ss.accepted(T0, ListenerId::new(0), None, None),
             Err(AcceptError::Full)
         );
         // a stream destroyed leaves its slot busy until its connection goes
@@ -1774,12 +1987,12 @@ mod tests {
         };
         ss.destroy(T0, stream).unwrap();
         assert_eq!(
-            ss.accepted(T0, ListenerId::new(0), None),
+            ss.accepted(T0, ListenerId::new(0), None, None),
             Err(AcceptError::Full)
         );
         assert!(matches!(ss.want(T0, a), Ok(Want::Release(_))));
         ss.released(a).unwrap();
-        ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
     }
 
     #[test]
@@ -1787,7 +2000,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, b"GET / HTTP/1.1\r\n\r\n");
         let Some(Seen::Txn(stream, _)) = serve(&mut ss, false).first().cloned() else {
             panic!("no request");
@@ -1860,7 +2073,7 @@ mod tests {
         let ls = [two_vhosts()];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(
             &mut ss,
             conn,
@@ -1890,6 +2103,7 @@ mod tests {
                 }
                 Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ServerTxnEnd(_)
                 | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
@@ -1964,14 +2178,14 @@ mod tests {
         let ls = [two_vhosts()];
         let mut sl = slots(2);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let a = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let a = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, a, UPGRADE);
         assert_eq!(
             serve(&mut ss, true),
             [Seen::Upgrade(b"echo".to_vec(), "echo".into())]
         );
         // the same request under /sai is the proxy's to answer
-        let b = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let b = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         let under_sai =
             alloc::string::String::from_utf8_lossy(UPGRADE).replace("/chat", "/sai/chat");
         read(&mut ss, b, under_sai.as_bytes());
@@ -1996,7 +2210,7 @@ mod tests {
         }];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, b"GET / HTTP/1.1\r\n\r\n");
         let mut refused = None;
         while let Some(ev) = ss.poll_event(T0) {
@@ -2017,7 +2231,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, b"GET / HTTP/1.1\r\n\r\n");
         let Some(Seen::Txn(stream, _)) = serve(&mut ss, false).first().cloned() else {
             panic!("no request");
@@ -2035,7 +2249,7 @@ mod tests {
         let ls = [listener!(ws(None))];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, conn, UPGRADE);
         assert_eq!(
             serve(&mut ss, true),
@@ -2067,7 +2281,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken), listener!(ws(None))];
         let mut sl = slots(2);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let a = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let a = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(&mut ss, a, UPGRADE);
         assert!(matches!(
             serve(&mut ss, true).first(),
@@ -2075,7 +2289,7 @@ mod tests {
         ));
         assert_eq!(written(&mut ss, a), OK);
         // a listener with no default refuses a request naming no protocol
-        let b = ss.accepted(T0, ListenerId::new(1), None).unwrap();
+        let b = ss.accepted(T0, ListenerId::new(1), None, None).unwrap();
         let none = b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
             Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
@@ -2089,7 +2303,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         read(
             &mut ss,
             conn,
@@ -2173,6 +2387,7 @@ mod tests {
                 Kind::ServerTxn(_)
                 | Kind::ServerUpgrade { .. }
                 | Kind::UpgradeRefused(_)
+                | Kind::ServerTxnEnd(_)
                 | Kind::Tx(_)
                 | Kind::Pong
                 | Kind::PeerClose { .. }
@@ -2241,7 +2456,7 @@ mod tests {
         assert!(ss.user(stream).is_err());
         assert_eq!(ss.request_tx(stream), Err(CallError::Gone));
         // the slot is free again, for a connection or an accept
-        ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         // an address too long, and a request the client refuses, make no
         // stream and keep the slot
         let long = alloc::string::String::from_utf8(alloc::vec![b'a'; MAX_ADDRESS + 1]).unwrap();
@@ -2267,7 +2482,7 @@ mod tests {
         let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         let stream = StreamId {
             slot: 0,
             generation: 0,
@@ -2452,5 +2667,285 @@ mod tests {
             at(RouteError::DeflateNotBuilt)
         };
         assert_eq!(Ss::new(&deflate, &mut for_deflate).err(), Some(want));
+    }
+
+    #[test]
+    fn a_transaction_over_is_told_with_its_status_and_what_it_took() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        read(&mut ss, conn, b"GET /one HTTP/1.1\r\n\r\n");
+        let seen = serve(&mut ss, true);
+        let Some(Seen::Txn(stream, _)) = seen.first().cloned() else {
+            panic!("{seen:?}");
+        };
+        // the answer went whole to the connection with the Tx: the end is
+        // told at the next look, with what the answer took, before the
+        // adapter has written any of it, as C logs when the transaction
+        // is completed
+        let sent = u64::try_from(OK.len()).unwrap();
+        assert_eq!(
+            seen.get(1..),
+            Some(&[Seen::Tx, Seen::End(Some(200), sent)][..])
+        );
+        assert_eq!(written(&mut ss, conn), OK);
+        // the next request's is its own, counted from its head
+        read(&mut ss, conn, b"GET /two HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            serve(&mut ss, true),
+            [
+                Seen::Txn(stream, b"/two".to_vec()),
+                Seen::Tx,
+                Seen::End(Some(200), sent)
+            ]
+        );
+        assert_eq!(written(&mut ss, conn), OK);
+        // a status page is an answer too, told once it has gone
+        read(&mut ss, conn, b"GET /none HTTP/1.1\r\n\r\n");
+        assert_eq!(serve(&mut ss, false).len(), 1);
+        ss.status(T0, stream, 404).unwrap();
+        let page = written(&mut ss, conn);
+        assert!(page.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+        assert_eq!(
+            serve(&mut ss, false),
+            [Seen::End(Some(404), u64::try_from(page.len()).unwrap())]
+        );
+    }
+
+    #[test]
+    fn a_connection_gone_with_a_request_open_tells_its_end_first() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        read(&mut ss, conn, b"GET / HTTP/1.1\r\n\r\n");
+        let Some(Seen::Txn(stream, _)) = serve(&mut ss, false).first().cloned() else {
+            panic!("no request");
+        };
+        ss.hangup(T0, conn).unwrap();
+        assert!(matches!(ss.want(T0, conn), Ok(Want::Release(_))));
+        ss.released(conn).unwrap();
+        // unanswered: no status, nothing sent, as C logs 0
+        assert_eq!(
+            serve(&mut ss, true),
+            [Seen::End(None, 0), Seen::Disconnected(stream)]
+        );
+        // and a stream destroyed first is told nothing
+        let next = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        read(&mut ss, next, b"GET / HTTP/1.1\r\n\r\n");
+        let Some(Seen::Txn(destroyed, _)) = serve(&mut ss, false).first().cloned() else {
+            panic!("no request");
+        };
+        ss.destroy(T0, destroyed).unwrap();
+        drop(written(&mut ss, next));
+        ss.hangup(T0, next).unwrap();
+        assert!(matches!(ss.want(T0, next), Ok(Want::Release(_))));
+        ss.released(next).unwrap();
+        assert_eq!(serve(&mut ss, true), []);
+    }
+
+    #[test]
+    fn a_ws_connections_end_is_told_at_its_close_as_a_101() {
+        let ls = [listener!(ws(Some(0)))];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        read(
+            &mut ss,
+            conn,
+            b"GET /chat HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let upgraded = serve(&mut ss, true);
+        assert!(
+            matches!(upgraded.first(), Some(Seen::Upgrade(..))),
+            "{upgraded:?}"
+        );
+        let the_101 = written(&mut ss, conn);
+        assert!(the_101.starts_with(b"HTTP/1.1 101"));
+        // nothing is over while the connection carries ws
+        assert_eq!(serve(&mut ss, true), []);
+        // a masked text frame, "hi", echoed back unmasked: 4 bytes
+        read(&mut ss, conn, &[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]);
+        let echoed = serve(&mut ss, true);
+        assert!(
+            echoed.iter().any(|s| matches!(s, Seen::Rx(..))),
+            "{echoed:?}"
+        );
+        drop(written(&mut ss, conn));
+        ss.hangup(T0, conn).unwrap();
+        assert!(matches!(ss.want(T0, conn), Ok(Want::Release(_))));
+        ss.released(conn).unwrap();
+        let closed = serve(&mut ss, true);
+        let Some(Seen::End(Some(101), sent)) = closed.first() else {
+            panic!("{closed:?}");
+        };
+        // the 101 and whatever frames went
+        assert!(*sent >= u64::try_from(the_101.len()).unwrap(), "{sent}");
+        assert!(matches!(closed.get(1), Some(Seen::Disconnected(_))));
+    }
+
+    #[test]
+    fn the_access_log_line_is_cs_from_the_peer_to_the_user_agent() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let peer: SocketAddr = "[::ffff:203.0.113.9]:4242".parse().unwrap();
+        let conn = ss
+            .accepted(T0, ListenerId::new(0), None, Some(peer))
+            .unwrap();
+        read(
+            &mut ss,
+            conn,
+            b"GET /a%20b/../c?x=\"1\" HTTP/1.1\r\nHost: test\r\nReferer: https://x/\"q\"\r\n\
+              User-Agent: ua \"q\" \x01\r\n\r\n",
+        );
+        let mut record = None;
+        while let Some(ev) = ss.poll_event(T0) {
+            if let Kind::ServerTxn(txn) = ev.kind {
+                assert_eq!(txn.peer(), Some(peer));
+                assert_eq!(txn.version(), npro_h1::head::Version::Http11);
+                // RFC 9110's date, in UTC; the path decoded and made safe
+                // as the parser does, without its arguments; the peer's
+                // fields sanitized, the v4-mapped address as v4
+                record = Some(Record::of(&txn, 784_111_777));
+            }
+        }
+        let record = record.unwrap();
+        let mut out = [0u8; MAX_LINE];
+        let n = record.line(
+            Ended {
+                status: Some(200),
+                sent: 46,
+            },
+            &mut out,
+        );
+        assert_eq!(
+            core::str::from_utf8(&out[..n]).unwrap(),
+            "203.0.113.9 - - [06/Nov/1994:08:49:37 +0000] \"GET /c HTTP/1.1\" 200 46 \
+             \"https://x/'q'\" \"ua 'q' _\"\n"
+        );
+        // unanswered, from nowhere, nothing known: still a whole line
+        let m = record.line(
+            Ended {
+                status: None,
+                sent: 0,
+            },
+            &mut out,
+        );
+        assert!(out[..m].ends_with(b"\" 0 0 \"https://x/'q'\" \"ua 'q' _\"\n"));
+    }
+
+    #[test]
+    fn an_access_log_line_is_cut_to_c_size_the_user_agent_first() {
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl: Slots = (0..2).map(|_| Slot::new(storage(4096, 0))).collect();
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        let long = |c: u8, n: usize| alloc::string::String::from_utf8(vec![c; n]).unwrap();
+        let req = alloc::format!(
+            "GET /{} HTTP/1.0\r\nReferer: {}\r\nUser-Agent: {}\r\n\r\n",
+            long(b'p', 300),
+            long(b'r', 300),
+            long(b'u', 300)
+        );
+        read(&mut ss, conn, req.as_bytes());
+        let mut record = None;
+        while let Some(ev) = ss.poll_event(T0) {
+            if let Kind::ServerTxn(txn) = ev.kind {
+                record = Some(Record::of(&txn, 0));
+            }
+        }
+        let mut out = [0u8; MAX_LINE];
+        let n = record.unwrap().line(
+            Ended {
+                status: Some(200),
+                sent: u64::MAX,
+            },
+            &mut out,
+        );
+        let line = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(n <= MAX_LINE, "{line}");
+        assert!(line.starts_with("- - - [01/Jan/1970:00:00:00 +0000] \"GET /ppp"));
+        // the head is C's 255, so the request line is cut, its quote lost
+        // as C loses it; the referrer takes what is left, which C gives it
+        // first; nothing is left for the user agent; and the line closes
+        assert_eq!(line.find(" 200 "), Some(MAX_HEAD));
+        assert!(line.ends_with(&alloc::format!(
+            " 200 {} \"{}\" \"\"\n",
+            u64::MAX,
+            long(b'r', MAX_PARTS - MAX_HEAD)
+        )));
+        assert_eq!(line.matches('"').count(), 5);
+        // a short referrer leaves the user agent its room
+        let conn2 = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        let req2 = alloc::format!(
+            "GET / HTTP/1.1\r\nReferer: ref\r\nUser-Agent: {}\r\n\r\n",
+            long(b'u', 600)
+        );
+        read(&mut ss, conn2, req2.as_bytes());
+        let mut record2 = None;
+        while let Some(ev) = ss.poll_event(T0) {
+            if let Kind::ServerTxn(txn) = ev.kind {
+                record2 = Some(Record::of(&txn, 0));
+            }
+        }
+        let m = record2.unwrap().line(
+            Ended {
+                status: Some(200),
+                sent: 1,
+            },
+            &mut out,
+        );
+        let line2 = core::str::from_utf8(&out[..m]).unwrap();
+        assert!(m <= MAX_LINE && m > MAX_LINE - 40, "{m}: {line2}");
+        assert!(line2.contains("\"GET / HTTP/1.1\" 200 1 \"ref\" \"uuuu"));
+        assert!(line2.ends_with("u\"\n"));
+        assert_eq!(line2.matches('"').count(), 6);
+    }
+
+    #[test]
+    fn a_request_brought_by_the_bytes_that_ended_the_last_waits_for_its_end() {
+        // the fuzzer's find: two POSTs whose bodies arrive together, the
+        // first answered before its body is taken, so the bytes that end
+        // its transaction also bring the second request
+        let ls = [listener!(WsPolicy::NotTaken)];
+        let mut sl = slots(1);
+        let mut ss = Ss::new(&ls, &mut sl).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
+        read(
+            &mut ss,
+            conn,
+            b"POST /p HTTP/1.1\r\nContent-Length: 5\r\n\r\n",
+        );
+        let Some(Seen::Txn(stream, _)) = serve(&mut ss, true).first().cloned() else {
+            panic!("no request");
+        };
+        // answered whole, and over once its body is taken
+        assert_eq!(written(&mut ss, conn), OK);
+        read(
+            &mut ss,
+            conn,
+            b"helloPOST /q HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let seen = serve(&mut ss, true);
+        let sent = u64::try_from(OK.len()).unwrap();
+        assert_eq!(seen.first(), Some(&Seen::End(Some(200), sent)), "{seen:?}");
+        assert_eq!(seen.get(1), Some(&Seen::Txn(stream, b"/q".to_vec())));
+        // the second is a transaction of its own, counted from its head
+        assert!(seen.contains(&Seen::Tx), "{seen:?}");
+        assert_eq!(written(&mut ss, conn), OK);
+        let rest: Vec<Seen> = seen
+            .into_iter()
+            .skip(2)
+            .chain(serve(&mut ss, true))
+            .collect();
+        assert_eq!(
+            rest.iter().filter(|s| matches!(s, Seen::End(..))).count(),
+            1,
+            "{rest:?}"
+        );
+        assert!(rest.contains(&Seen::End(Some(200), sent)), "{rest:?}");
     }
 }

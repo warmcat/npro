@@ -7,7 +7,9 @@ use npro_core::time::Instant;
 use npro_h1::client::{Connection, Request, RequestBody, Scheme};
 use npro_h1::server::Config;
 use npro_io::driver::{Buffers, NetBuffers, Want};
-use npro_ss::event::{End, Filled, Kind, Resp, Response, Txn};
+use npro_io::tls::NoTls;
+use npro_ss::access::{MAX_LINE, Record};
+use npro_ss::event::{End, Ended, Filled, Kind, Resp, Response, Tx, Txn};
 use npro_ss::id::{ConnId, ListenerId, StreamId};
 use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
 use npro_ss::ss::{AcceptError, CallError, ConnStorage, ConnectError, Slot, Ss};
@@ -139,6 +141,8 @@ struct Run<'s> {
     /// Connections accepted, and whether each was released.
     conns: Vec<(ConnId, bool)>,
     streams: Vec<(StreamId, Known)>,
+    /// Streams told a request whose transaction's end they are owed.
+    open: Vec<StreamId>,
     accepted: usize,
     /// How the application last chose to answer.
     how: u8,
@@ -173,6 +177,79 @@ fn check_routed(txn: &Txn<'_, Vec<u8>>) {
                 );
             }
         }
+    }
+}
+
+/// The access log's line for the request is whole and one line: the
+/// peer's fields cannot add a record, hide the rest, or break the
+/// quoting, however long or strange they are.
+fn check_access_line(txn: &Txn<'_, Vec<u8>>, how: u8) {
+    let record = Record::of(txn, u64::from(how) << 24);
+    let mut out = [0u8; MAX_LINE];
+    let n = record.line(
+        Ended {
+            status: (how & 1 == 0).then_some(u16::from(how)),
+            sent: u64::from(how).pow(4),
+        },
+        &mut out,
+    );
+    let line = out.get(..n).unwrap_or_default();
+    let quotes = line.split(|b| *b == b'"').count().saturating_sub(1);
+    let controls = line
+        .iter()
+        .filter(|b| (**b < 0x20 && **b != b'\n') || **b == 0x7f)
+        .count();
+    if n == 0 || n > MAX_LINE || !line.ends_with(b"\n") || quotes != 6 || controls != 0 {
+        finding(
+            TARGET,
+            format_args!(
+                "access line of {n}, {quotes} quotes: {}",
+                line.escape_ascii()
+            ),
+        );
+    }
+}
+
+/// The stream's chance to write, filled with `how >> 3` bytes, the last
+/// of them said to be: it gave no more than it had.
+fn filled(tx: Tx<'_, Vec<u8>, SeededRandom, NoTls>, how: u8) -> Then {
+    let mut left = usize::from(how >> 3);
+    let gave = tx.fill(|buf| {
+        let n = left.min(buf.len());
+        if let Some(b) = buf.get_mut(..n) {
+            b.fill(b'x');
+        }
+        left = left.saturating_sub(n);
+        if left == 0 {
+            Filled::Last(n)
+        } else {
+            Filled::More(n)
+        }
+    });
+    if gave > usize::from(how >> 3) {
+        finding(TARGET, format_args!("gave {gave}, had {}", how >> 3));
+    }
+    Then::Nothing
+}
+
+/// A stream's transaction ended: it was open, and is no more.
+fn ended(open: &mut Vec<StreamId>, stream: StreamId, e: Ended) {
+    match open.iter().position(|s| *s == stream) {
+        Some(i) => {
+            open.swap_remove(i);
+        }
+        None => finding(TARGET, format_args!("{stream} ended, not open: {e:?}")),
+    }
+}
+
+/// A stream is gone: its transaction, if one was open, was told over
+/// first.
+fn gone(open: &[StreamId], stream: StreamId) {
+    if open.contains(&stream) {
+        finding(
+            TARGET,
+            format_args!("{stream} gone, its transaction untold"),
+        );
     }
 }
 
@@ -215,6 +292,15 @@ impl Run<'_> {
             .iter()
             .find(|(id, _)| *id == s)
             .map(|(_, k)| *k)
+    }
+
+    /// A request was told on `s`: it is owed its transaction's end, and
+    /// is told no other request before that.
+    fn opened(&mut self, s: StreamId) {
+        if self.open.contains(&s) {
+            finding(TARGET, format_args!("{s} told a request, one open"));
+        }
+        self.open.push(s);
     }
 
     fn set(&mut self, s: StreamId, k: Known) {
@@ -286,10 +372,12 @@ impl Run<'_> {
 
     fn accept(&mut self, listener: u8) {
         let must = self.holding() < SLOTS;
-        match self
-            .ss
-            .accepted(self.now, ListenerId::new(u32::from(listener % 2)), None)
-        {
+        match self.ss.accepted(
+            self.now,
+            ListenerId::new(u32::from(listener % 2)),
+            None,
+            None,
+        ) {
             Ok(c) => {
                 self.conns.push((c, false));
                 self.accepted = self.accepted.saturating_add(1);
@@ -332,10 +420,14 @@ impl Run<'_> {
                 return;
             };
             let stream = ev.stream;
+            // a request told, to note once the event lets the streams go
+            let mut opened = false;
             let then = match ev.kind {
                 Kind::ServerTxn(mut txn) => {
                     let _ = (txn.method(), txn.header(b"host"));
                     check_routed(&txn);
+                    check_access_line(&txn, how);
+                    opened = true;
                     let length = (how & 2 == 0).then_some(u64::from(how >> 4));
                     if txn.route().is_none() {
                         // nothing serves it: C's page, as the stream says
@@ -366,32 +458,25 @@ impl Run<'_> {
                         Then::Nothing
                     }
                 }
-                Kind::Tx(tx) => {
-                    let mut left = usize::from(how >> 3);
-                    let gave = tx.fill(|buf| {
-                        let n = left.min(buf.len());
-                        if let Some(b) = buf.get_mut(..n) {
-                            b.fill(b'x');
-                        }
-                        left = left.saturating_sub(n);
-                        if left == 0 {
-                            Filled::Last(n)
-                        } else {
-                            Filled::More(n)
-                        }
-                    });
-                    if gave > usize::from(how >> 3) {
-                        finding(TARGET, format_args!("gave {gave}, had {}", how >> 3));
-                    }
+                Kind::Tx(tx) => filled(tx, how),
+                Kind::Disconnected | Kind::ConnectFailed => {
+                    gone(&self.open, stream);
+                    Then::Gone
+                }
+                Kind::Response(r) => response_seen(&r, how),
+                Kind::ServerUpgrade { .. } | Kind::UpgradeRefused(_) => {
+                    opened = true;
                     Then::Nothing
                 }
-                Kind::Disconnected | Kind::ConnectFailed => Then::Gone,
-                Kind::Response(r) => response_seen(&r, how),
-                Kind::ServerUpgrade { .. }
-                | Kind::UpgradeRefused(_)
-                | Kind::Pong
-                | Kind::PeerClose { .. } => Then::Nothing,
+                Kind::ServerTxnEnd(e) => {
+                    ended(&mut self.open, stream, e);
+                    Then::Nothing
+                }
+                Kind::Pong | Kind::PeerClose { .. } => Then::Nothing,
             };
+            if opened {
+                self.opened(stream);
+            }
             match self.known(stream) {
                 None | Some(Known::Live) => {}
                 Some(k) => finding(TARGET, format_args!("{stream}, {k:?}, told more")),
@@ -405,6 +490,8 @@ impl Run<'_> {
                     let now = self.now;
                     self.call(stream, |ss| ss.destroy(now, stream));
                     self.set(stream, Known::Destroyed);
+                    // destroyed, it is told nothing more
+                    self.open.retain(|s| *s != stream);
                     if self.ss.request_tx(stream) != Err(CallError::Gone) {
                         finding(TARGET, format_args!("{stream} destroyed, still there"));
                     }
@@ -524,6 +611,7 @@ pub fn ss_server(data: &[u8]) {
         now: T0,
         conns: Vec::new(),
         streams: Vec::new(),
+        open: Vec::new(),
         accepted: 0,
         how: 0,
     };
@@ -599,7 +687,7 @@ pub fn ss_server(data: &[u8]) {
         );
     }
     for i in 0..SLOTS {
-        if let Err(e) = run.ss.accepted(run.now, ListenerId::new(0), None) {
+        if let Err(e) = run.ss.accepted(run.now, ListenerId::new(0), None, None) {
             finding(TARGET, format_args!("slot {i} of {SLOTS} lost: {e}"));
         }
     }

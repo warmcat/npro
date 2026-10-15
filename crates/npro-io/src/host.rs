@@ -11,6 +11,8 @@
 //! The application is not the host's: it acts on the host between the
 //! adapter's calls, as the adapter is told it may ([`crate::threads`]).
 
+use core::net::SocketAddr;
+
 use npro_core::time::Instant;
 
 use crate::driver::Want;
@@ -58,8 +60,10 @@ pub trait Host {
     type Refused: core::fmt::Display;
 
     /// The adapter accepted a socket on `listener` at `now`, with `tls`
-    /// its tls if the listener's connections are: the connection is made,
-    /// and driven from here by the id returned.
+    /// its tls if the listener's connections are, and `peer` the address
+    /// it was accepted from, if it has one (a unix domain socket's has
+    /// none): the connection is made, and driven from here by the id
+    /// returned.
     ///
     /// # Errors
     ///
@@ -69,6 +73,7 @@ pub trait Host {
         now: Instant,
         listener: Self::Listener,
         tls: Option<Self::Tls>,
+        peer: Option<SocketAddr>,
     ) -> Result<Self::Conn, Self::Refused>;
 
     /// What the connection wants of the adapter now.  On

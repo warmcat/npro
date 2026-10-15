@@ -6,9 +6,12 @@
 //! and answer it, or a [`Tx`] to fill with payload.  Anything else is a
 //! call made on the [`crate::ss::Ss`] after the event.
 
+use core::net::SocketAddr;
+
 use npro_core::random::Random;
 use npro_core::time::Instant;
 use npro_h1::client::Client;
+use npro_h1::head::Version;
 use npro_h1::server::{self, Response as H1Response, Server, TxSource};
 use npro_h1::table::{Fragments, HeaderTable};
 use npro_h1::token::{Lookup, Token, lookup};
@@ -48,6 +51,15 @@ pub enum Kind<'a, S, R, T> {
     /// The request asked for ws, and was refused as C refuses it: the
     /// connection closes once the refusal has gone.
     UpgradeRefused(Refusal),
+    /// The request's transaction is over: what it was answered with, and
+    /// what that took.  Told once for every request told, as
+    /// [`Kind::ServerTxn`], [`Kind::ServerUpgrade`] or
+    /// [`Kind::UpgradeRefused`]: when its answer has been handed to the
+    /// connection whole, or, if the connection goes first, or carried
+    /// ws from it, before [`Kind::Disconnected`].  For the access log,
+    /// whose line is written at C's `lws_http_transaction_completed()`
+    /// ([`crate::access`]).
+    ServerTxnEnd(Ended),
     /// A stream that connected out has its answer's head, C's
     /// `ESTABLISHED_CLIENT_HTTP`, and so is connected, as the peer has
     /// agreed: read it through the [`Resp`].  Its body follows as
@@ -78,6 +90,19 @@ pub enum Kind<'a, S, R, T> {
     /// The stream's connection is gone, and so is the stream: its id is
     /// refused from here, and its `U` dropped before the next event.
     Disconnected,
+}
+
+/// A transaction over: [`Kind::ServerTxnEnd`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ended {
+    /// The status it was answered with, the last status line composed
+    /// for it, 101 for ws agreed; or `None` if its connection went
+    /// unanswered.  C's `access_log.response`, which is 0 then.
+    pub status: Option<u16>,
+    /// How many bytes the connection wrote from the request's head to
+    /// the end: the answer's head and payload, the plaintext before any
+    /// tls; for ws, the 101 and every frame.  C's `access_log.sent`.
+    pub sent: u64,
 }
 
 /// Whether what a stream's peer sends is given to it: [`crate::ss::Ss::flow`].
@@ -252,6 +277,8 @@ pub struct Txn<'a, S> {
     /// much of the path that was.
     pub(crate) route: Option<(usize, usize)>,
     pub(crate) now: Instant,
+    /// Where the connection was accepted from, if it has an address.
+    pub(crate) peer: Option<SocketAddr>,
 }
 
 /// Where a request was routed: [`Txn::route`].
@@ -312,6 +339,19 @@ impl<'a, S: AsRef<[u8]> + AsMut<[u8]>> Txn<'a, S> {
     #[must_use]
     pub const fn listener(&self) -> &'a Listener<'a> {
         self.listener
+    }
+
+    /// The address the connection was accepted from, if it has one: a
+    /// unix domain socket's has none.  C's `lws_get_peer_simple()`.
+    #[must_use]
+    pub const fn peer(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// The version the request asked in.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.server.version()
     }
 
     /// The vhost the request is for: the one its `Host` named, or the

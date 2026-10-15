@@ -146,7 +146,7 @@ mod serve {
         }];
         let mut sl = slots();
         let mut ss: S<'_> = Ss::new(&listeners, &mut sl).unwrap();
-        let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let conn = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         let Ok(Want::Io(io)) = ss.want(T0, conn) else {
             panic!("not io");
         };
@@ -196,6 +196,7 @@ mod serve {
                     | Kind::Rx { .. }
                     | Kind::Pong
                     | Kind::PeerClose { .. }
+                    | Kind::ServerTxnEnd(_)
                     | Kind::Response(_)
                     | Kind::ConnectFailed
                     | Kind::Disconnected => {}

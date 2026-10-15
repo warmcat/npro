@@ -354,6 +354,8 @@ pub struct Driver<S, R, B, T = NoTls> {
     fin: Fin,
     stage: Stage,
     wire: Wire<T, B>,
+    /// Plaintext bytes the roles wrote, since the connection was made.
+    sent: u64,
 }
 
 impl<S, R, B> Driver<S, R, B, NoTls> {
@@ -400,6 +402,7 @@ impl<S, R, B, T> Driver<S, R, B, T> {
             fin: Fin::Open,
             stage: Stage::Live,
             wire: Wire::Plain,
+            sent: 0,
         }
     }
 
@@ -431,7 +434,18 @@ impl<S, R, B, T> Driver<S, R, B, T> {
                 rx: Window::default(),
                 tx: Window::default(),
             }),
+            sent: 0,
         }
+    }
+
+    /// How many bytes the connection's roles have written since it was
+    /// made: the plaintext, heads and payload alike, before any tls, as
+    /// C's `lws_write()` counts them for the access log.  A host marks it
+    /// at a request, and the difference at the transaction's end is what
+    /// the answer took.
+    #[must_use]
+    pub const fn sent(&self) -> u64 {
+        self.sent
     }
 
     /// The record layer, if the connection is over tls: to ask it the
@@ -821,6 +835,9 @@ where
         }
         let n = self.conn.tx(now, room, src).min(room.len());
         self.tx.end = self.tx.end.saturating_add(n);
+        self.sent = self
+            .sent
+            .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         if n == 0 {
             self.write = Write::Idle;
         }

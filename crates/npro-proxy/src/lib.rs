@@ -595,7 +595,8 @@ where
             | Kind::ServerUpgrade { .. }
             | Kind::UpgradeRefused(_)
             | Kind::Pong
-            | Kind::PeerClose { .. },
+            | Kind::PeerClose { .. }
+            | Kind::ServerTxnEnd(_),
         )
         | (Role::Client { .. }, Kind::Response(_) | Kind::ConnectFailed) => {}
     }

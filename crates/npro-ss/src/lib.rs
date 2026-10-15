@@ -13,7 +13,9 @@
 //! - [`ss`]: the streams and their connections, driven by the adapter on
 //!   one side and the application on the other;
 //! - [`event`]: what a stream is told, and the handles some events lend;
-//! - [`id`]: the ids streams, connections and listeners are named by.
+//! - [`id`]: the ids streams, connections and listeners are named by;
+//! - [`access`]: the access log's line, in C's form, from a request and
+//!   its transaction's end.
 //!
 //! So far it is the server's half: listeners, each with its vhosts and
 //! their routes, the streams accepted on them, a request's head in, routed
@@ -59,7 +61,7 @@
 //! let now = Instant::from_micros(1_000_000);
 //!
 //! // the adapter accepted a socket, and reads a request from it
-//! let conn = ss.accepted(now, ListenerId::new(0), None)?;
+//! let conn = ss.accepted(now, ListenerId::new(0), None, None)?;
 //! let Want::Io(io) = ss.want(now, conn)? else { unreachable!() };
 //! let req = b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
 //! io.read.unwrap()[..req.len()].copy_from_slice(req);
@@ -103,6 +105,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod event;
 pub mod id;
 pub mod policy;

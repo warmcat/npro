@@ -270,7 +270,7 @@ pub fn proxy(data: &[u8]) {
     let mut ss: S<'_> = Ss::new(&listeners, &mut slots)
         .unwrap_or_else(|e| finding(TARGET, format_args!("policy refused: {e}")));
     let client = ss
-        .accepted(T0, ListenerId::new(0), None)
+        .accepted(T0, ListenerId::new(0), None, None)
         .unwrap_or_else(|e| finding(TARGET, format_args!("not accepted: {e}")));
     let mut origin: Option<ConnId> = None;
     let mut taken = 0;

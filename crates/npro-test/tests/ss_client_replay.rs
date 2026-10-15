@@ -92,7 +92,8 @@ mod ss_client_replay {
                 | Kind::UpgradeRefused(_)
                 | Kind::Tx(_)
                 | Kind::Pong
-                | Kind::PeerClose { .. } => panic!("not a client's event"),
+                | Kind::PeerClose { .. }
+                | Kind::ServerTxnEnd(_) => panic!("not a client's event"),
             }
         }
     }

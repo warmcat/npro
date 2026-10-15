@@ -262,6 +262,15 @@ enum Socket {
 }
 
 impl Socket {
+    /// The peer's address, for a socket that has one.
+    fn peer(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.peer_addr().ok(),
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+        }
+    }
+
     fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Tcp(s) => s.try_clone().map(Self::Tcp),
@@ -687,7 +696,10 @@ fn accept<'scope, 'a, H, A, M>(
         let conn = {
             let mut s = lock(&shared.state);
             let now = shared.clock.now();
-            let Ok(conn) = s.host.accepted(now, id, tls.for_listener(id)) else {
+            let Ok(conn) = s
+                .host
+                .accepted(now, id, tls.for_listener(id), socket.peer())
+            else {
                 // the host would not take it: it is closed
                 shared.stop.forget(key);
                 continue;

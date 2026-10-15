@@ -212,6 +212,7 @@ fn events(ss: &mut S<'_>, answered: &mut usize) {
             | Kind::Rx { .. }
             | Kind::Pong
             | Kind::PeerClose { .. }
+            | Kind::ServerTxnEnd(_)
             | Kind::Response(_)
             | Kind::ConnectFailed
             | Kind::Disconnected => {}
@@ -237,7 +238,7 @@ pub fn files(data: &[u8]) {
     let mut ss: S<'_> = Ss::new(&listeners, &mut slots)
         .unwrap_or_else(|e| finding(TARGET, format_args!("policy refused: {e}")));
     let conn = ss
-        .accepted(T0, ListenerId::new(0), None)
+        .accepted(T0, ListenerId::new(0), None, None)
         .unwrap_or_else(|e| finding(TARGET, format_args!("not accepted: {e}")));
     let mut answered = 0;
     let mut written = 0usize;

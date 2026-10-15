@@ -284,7 +284,7 @@ mod proxy {
         }];
         let mut sl = slots(2);
         let mut ss = Ss::new(&listeners, &mut sl).unwrap();
-        let client = ss.accepted(T0, ListenerId::new(0), None).unwrap();
+        let client = ss.accepted(T0, ListenerId::new(0), None, None).unwrap();
         let mut input = request;
         let mut out = Vec::new();
         let mut origin = Origin {

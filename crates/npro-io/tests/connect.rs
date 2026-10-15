@@ -10,6 +10,7 @@
 // held to clippy's rules for tests
 #[cfg(test)]
 mod connect {
+    use core::net::SocketAddr;
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -63,7 +64,13 @@ mod connect {
         type Tls = NoTls;
         type Refused = Gone;
 
-        fn accepted(&mut self, _: Instant, (): (), _: Option<NoTls>) -> Result<(), Gone> {
+        fn accepted(
+            &mut self,
+            _: Instant,
+            (): (),
+            _: Option<NoTls>,
+            _: Option<SocketAddr>,
+        ) -> Result<(), Gone> {
             Err(Gone)
         }
 

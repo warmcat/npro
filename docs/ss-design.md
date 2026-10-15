@@ -278,8 +278,10 @@ differs from the sketch above, and why:
 - **The application loops on `poll_event()`**, each event naming the
   stream, lending its `&mut U`, and saying what happened:
   `ServerTxn(Txn)`, a request to read (method, path, arguments, headers
-  by name) and answer; `ServerUpgrade`; `UpgradeRefused`; `Rx` with
-  whether it is the last of a body or message; `Tx`; `Pong`;
+  by name, the peer's address, the version) and answer; `ServerUpgrade`;
+  `UpgradeRefused`; `ServerTxnEnd`, the request's transaction over,
+  with the status it was answered and the bytes that took (below);
+  `Rx` with whether it is the last of a body or message; `Tx`; `Pong`;
   `PeerClose`; `Disconnected`.  **Calls on the `Ss` come after the
   event**: the event borrows it, so the compiler holds the application
   to that.  Every event a connection makes is told to its stream, a
@@ -354,6 +356,28 @@ Not yet, in this half:
 streams over real sockets (2026-10-12): its tests serve h1 over TCP and
 a unix domain socket, echo ws, send an answer far larger than the
 buffers, and take more clients than there are slots.
+
+- **The access log** (2026-10-15) is C's line, one per request, as
+  lwsws writes it, so what reads one log reads the other.  What C
+  prepares when the request is parsed, npro-ss gives the application
+  as `npro_ss::access::Record::of(&txn, wall)` at `ServerTxn`: the
+  peer (from the adapter, through `accepted()`; `-` on a unix domain
+  socket), the time (UTC: nothing here reads a time zone, where C's is
+  local), the request line, the referrer and the user agent, sanitized
+  as C sanitizes them, in 512 bytes of the stream's own storage.  What
+  C writes at `lws_http_transaction_completed()`, or at the close,
+  npro-ss tells as `ServerTxnEnd`: once for every request told, when
+  the h1 role settles the transaction (its answer handed to the
+  connection whole, which the h1 server now reports, with the status it
+  composed last), or, for a connection that goes first or carried ws,
+  before `Disconnected`, with 101 for ws.  The bytes are the driver's
+  count of plaintext the roles wrote since the request's head, as C
+  counts `lws_write()`.  Writing the line to a file is the front's
+  (`npro_cli::front::Logs`), one write per line, the file opened before
+  the listeners are bound; the policy names it per vhost, as C does.
+  Not yet: a request upgraded to ws is told its end but the upgrade
+  event lends no request to take a record from, so it is not logged;
+  reopening the log on a signal, for rotation.
 
 ### The client half, first form
 
@@ -972,6 +996,10 @@ code for exactly this trust model.
   service manager starts only the supervisor.  Privilege is the
   supervisor's alone; the front holds none.  A datagram listener is the
   instance's own and reached directly.
+- 2026-10-15: the access log is C's line, byte for byte but for the
+  time, which is UTC with `+0000`, since npro reads no time zone; a
+  unix domain socket's peer is `-`.  Every request told is followed by
+  one `ServerTxnEnd`, which is what the line is written on.
 
 ## Open
 

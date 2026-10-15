@@ -142,6 +142,7 @@ mod files_replay {
                 | Kind::Rx { .. }
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::ServerTxnEnd(_)
                 | Kind::Response(_)
                 | Kind::ConnectFailed
                 | Kind::Disconnected => {}
@@ -195,7 +196,9 @@ mod files_replay {
         let mut ss = Ss::new(&listeners, &mut slots).unwrap();
         let time = |t_us: u64| Instant::from_micros(t.t0_us.checked_add(t_us).unwrap());
         let start = t.steps.first().map_or(0, |s| s.t_us);
-        let conn = ss.accepted(time(start), ListenerId::new(0), None).unwrap();
+        let conn = ss
+            .accepted(time(start), ListenerId::new(0), None, None)
+            .unwrap();
         let mut steps = t.steps.iter().peekable();
         while let Some(step) = steps.next() {
             let StepKind::Rx(rx) = &step.kind else {

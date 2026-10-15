@@ -187,6 +187,7 @@ mod threads {
                 | Kind::UpgradeRefused(_)
                 | Kind::Pong
                 | Kind::PeerClose { .. }
+                | Kind::ServerTxnEnd(_)
                 | Kind::ConnectFailed
                 | Kind::Disconnected => Then::Nothing,
             };

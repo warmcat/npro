@@ -237,6 +237,7 @@ impl Driver {
     fn hangup(&mut self, now: Instant);                // POLLHUP, an error
     fn received(&mut self, now: Instant, bytes: &[u8]) -> usize; // copy-in form of read
     fn poll_event(&mut self, now: Instant) -> Option<Delivery<'_, S, R>>;
+    fn sent(&self) -> u64;  // plaintext the roles wrote, for the access log's count
 }
 
 pub struct Delivery<'d, S, R> {
@@ -276,7 +277,9 @@ until `until`, then calls `timer()`.  It writes from a copy, outside the
 lock, and closes the socket as the host asks, which wakes the reader.
 `threads::bind` takes `unix:/path` (removing what is there first, as C
 does) or an address and port; `Stop` ends it, waking the acceptors and
-shutting every connection's socket.  The sketch as it was:
+shutting every connection's socket.  A socket accepted is given to the
+host with the address it came from, if it has one, for the access log
+(2026-10-15).  The sketch as it was:
 
 **threads** (std): a reader and a writer thread, the driver in a `Mutex`.
 Neither can hold a slice of the driver while it blocks, so both copy:

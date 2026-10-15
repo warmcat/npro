@@ -43,7 +43,11 @@ The protocol crates' targets start from the C library's corpora
   hangup, a POST's body, a stream destroyed, a head that times out, a ws
   echo and close, ws with permessage-deflate, an upgrade refused, the
   slots running out, a stream connecting out with a GET and with a
-  POST's body, and a connect that fails.
+  POST's body, a connect that fails, and a GET with a referrer and a
+  user agent holding what the access log line must sanitize;
+  `regress-pipelined-end` is two POSTs whose bodies arrive together,
+  so the bytes that end the first transaction bring the second
+  request, which the harness once saw told before the first's end.
 - `files`: written for it, a control byte then the request: a file, a
   directory's default document, a route asked for without its `/`, a
   HEAD with a matching `if-none-match`, a large file, a path reaching
