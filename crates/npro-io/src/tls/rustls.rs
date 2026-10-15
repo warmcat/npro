@@ -141,6 +141,70 @@ pub type RustlsClient = Rustls<UnbufferedClientConnection>;
 /// A server's rustls record layer.
 pub type RustlsServer = Rustls<UnbufferedServerConnection>;
 
+/// A client's or a server's record layer, for a host that carries both:
+/// npro-ss, whose accepted connections are a server's and whose connects
+/// a client's, has one record-layer type for all.
+pub enum RustlsAny {
+    /// A connection made out.
+    Client(RustlsClient),
+    /// A connection accepted.
+    Server(RustlsServer),
+}
+
+impl core::fmt::Debug for RustlsAny {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // rustls' connections say nothing of themselves
+        f.write_str(match self {
+            Self::Client(_) => "RustlsAny::Client",
+            Self::Server(_) => "RustlsAny::Server",
+        })
+    }
+}
+
+impl RecordLayer for RustlsAny {
+    fn open(&mut self, now: Instant, net: &mut [u8], plain: &mut [u8]) -> Result<Opened, Failed> {
+        match self {
+            Self::Client(c) => c.open(now, net, plain),
+            Self::Server(s) => s.open(now, net, plain),
+        }
+    }
+
+    fn seal(&mut self, now: Instant, plain: &[u8], net: &mut [u8]) -> Result<Sealed, Failed> {
+        match self {
+            Self::Client(c) => c.seal(now, plain, net),
+            Self::Server(s) => s.seal(now, plain, net),
+        }
+    }
+
+    fn wants_write(&self) -> bool {
+        match self {
+            Self::Client(c) => c.wants_write(),
+            Self::Server(s) => s.wants_write(),
+        }
+    }
+
+    fn is_established(&self) -> bool {
+        match self {
+            Self::Client(c) => c.is_established(),
+            Self::Server(s) => s.is_established(),
+        }
+    }
+
+    fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Client(c) => c.alpn(),
+            Self::Server(s) => s.alpn(),
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Client(c) => c.close(),
+            Self::Server(s) => s.close(),
+        }
+    }
+}
+
 impl<C: Side> Rustls<C> {
     /// The record layer of `conn`, which the application made with its
     /// config, its provider among it.
