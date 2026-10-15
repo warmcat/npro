@@ -30,7 +30,16 @@
 //! - **connects** the host asks for ([`Host::next_connect`]) are made by
 //!   a thread each, since std's connect blocks, resolving a name with the
 //!   platform's resolver on the way; a connection made gets its reader
-//!   and writer as an accepted one does.
+//!   and writer as an accepted one does;
+//! - **timers** are what the application asks to be called back with
+//!   later ([`Jobs::after`]): a reconnect after a backoff, say.  One
+//!   thread keeps them, and applies each when it is due, under the lock,
+//!   followed by the application's turn.
+//!
+//! The application's first turn comes as [`serve`] starts, before any
+//! socket is accepted, so what it does of its own accord (connect out,
+//! say) is asked for from the start; after that it has a turn after
+//! anything changed.
 //!
 //! Time is std's monotonic clock, as [`Clock`] gives it.  tls is the
 //! host's: the adapter makes each connection's record layer as `tls`
@@ -73,12 +82,13 @@ pub type Done<'j, H> = Box<dyn FnOnce(&mut H, Instant) + Send + 'j>;
 /// A job: done on a worker thread, with no lock held.
 type Job<'j, H> = Box<dyn FnOnce() -> Done<'j, H> + Send + 'j>;
 
-/// Where the application gives the adapter work to do off its turn: see
-/// the module's description.  It is given to the application on every
-/// turn ([`serve`]'s `app`).
+/// Where the application gives the adapter work to do off its turn, and
+/// what to do later: see the module's description.  It is given to the
+/// application on every turn ([`serve`]'s `app`).
 #[derive(Debug)]
 pub struct Jobs<'j, H> {
     tx: Sender<Job<'j, H>>,
+    timers: Sender<(Duration, Done<'j, H>)>,
 }
 
 impl<'j, H> Jobs<'j, H> {
@@ -106,6 +116,29 @@ impl<'j, H> Jobs<'j, H> {
             done
         });
         if let Err(not_sent) = self.tx.send(boxed) {
+            drop(not_sent);
+        }
+    }
+
+    /// Has `done` applied to the host `delay` from now, under the lock,
+    /// with the application's turn after: a retry after a backoff, say.
+    /// The application has no clock of its own to wait on, so this is
+    /// how it is called back.  If the adapter is stopping, it may never
+    /// be.
+    ///
+    /// ```no_run
+    /// # fn example<H>(jobs: &npro_io::threads::Jobs<'_, H>) {
+    /// jobs.after(core::time::Duration::from_secs(2), |_host: &mut H, _now| {
+    ///     // two seconds on: connect again
+    /// });
+    /// # }
+    /// ```
+    pub fn after<G>(&self, delay: Duration, done: G)
+    where
+        G: FnOnce(&mut H, Instant) + Send + 'j,
+    {
+        let boxed: Done<'j, H> = Box::new(done);
+        if let Err(not_sent) = self.timers.send((delay, boxed)) {
             drop(not_sent);
         }
     }
@@ -463,12 +496,13 @@ where
     M: Makes<H> + Sync,
 {
     let (tx, rx) = mpsc::channel::<Job<'a, H>>();
+    let (timers, due) = mpsc::channel::<(Duration, Done<'a, H>)>();
     let shared = Shared {
         state: Mutex::new(State { host, app }),
         changed: Condvar::new(),
         clock: Clock::new(),
         stop,
-        jobs: Jobs { tx },
+        jobs: Jobs { tx, timers },
     };
     let mut accepting = Vec::new();
     for (id, l) in listeners {
@@ -478,6 +512,13 @@ where
         accepting.push((id, l));
     }
     let rx = Mutex::new(rx);
+    // the application's first turn comes at once: what it does on its
+    // own, connect out say, it asks for before anything else happens
+    {
+        let mut s = lock(&shared.state);
+        let now = shared.clock.now();
+        shared.acted(&mut s, now);
+    }
     thread::scope(|scope| {
         for (id, l) in accepting {
             let shared = &shared;
@@ -489,6 +530,7 @@ where
         }
         let shared = &shared;
         scope.spawn(move || connector(scope, shared, tls));
+        scope.spawn(move || keep_time(shared, &due));
     });
     lock(&stop.listeners).clear();
     shared
@@ -628,6 +670,49 @@ fn connect_unix(_: &str) -> io::Result<Socket> {
         io::ErrorKind::Unsupported,
         "no unix domain sockets here",
     ))
+}
+
+/// Applies what the application asked for later, when it is due, under
+/// the lock, with the application's turn after; until stopped.
+fn keep_time<'a, H, A>(shared: &Shared<'a, H, A>, due: &Receiver<(Duration, Done<'a, H>)>)
+where
+    H: Host,
+    A: FnMut(&mut H, Instant, &Jobs<'a, H>),
+{
+    let mut timers: Vec<(std::time::Instant, Done<'a, H>)> = Vec::new();
+    loop {
+        if shared.stop.is_stopping() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        // what is due, in the order it was asked for
+        let mut i = 0;
+        while i < timers.len() {
+            if timers.get(i).is_some_and(|(at, _)| *at <= now) {
+                let (_, done) = timers.remove(i);
+                let mut s = lock(&shared.state);
+                let at = shared.clock.now();
+                done(&mut s.host, at);
+                shared.acted(&mut s, at);
+            } else {
+                i = i.saturating_add(1);
+            }
+        }
+        let wait = timers
+            .iter()
+            .map(|(at, _)| at.saturating_duration_since(now))
+            .min()
+            .unwrap_or(ACCEPT_RETRY)
+            .min(ACCEPT_RETRY);
+        match due.recv_timeout(wait) {
+            Ok((delay, done)) => timers.push((
+                std::time::Instant::now().checked_add(delay).unwrap_or(now),
+                done,
+            )),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Does jobs as they come, until stopped: each with no lock held, then

@@ -239,6 +239,10 @@ impl Driver {
     fn poll_event(&mut self, now: Instant) -> Option<Delivery<'_, S, R>>;
     fn sent(&self) -> u64;  // plaintext the roles wrote, for the access log's count
 }
+// the threads adapter's Jobs: spawn(job -> apply) off the turn, and
+// after(delay, apply), a timer (2026-10-15); the application's first
+// turn comes as serve() starts
+
 
 pub struct Delivery<'d, S, R> {
     pub event: Event<'d>,        // borrows the rx buffer

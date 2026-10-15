@@ -238,6 +238,54 @@ mod connect {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "threads: native runs keep it")]
+    fn what_is_asked_for_later_is_applied_then_on_the_hosts_turn() {
+        let mut host = One::new("127.0.0.1:1");
+        // nothing to connect: the timer alone
+        host.asked = true;
+        let stop = Stop::new();
+        let fired = std::sync::Mutex::new(None);
+        let began = std::time::Instant::now();
+        thread::scope(|scope| {
+            let (fired, began, stop) = (&fired, &began, &stop);
+            let served = scope.spawn(move || {
+                let mut asked = false;
+                serve(
+                    host,
+                    Vec::new(),
+                    &|(): ()| None::<NoTls>,
+                    move |_: &mut One, _, jobs| {
+                        if !asked {
+                            asked = true;
+                            jobs.after(
+                                core::time::Duration::from_millis(80),
+                                move |h: &mut One, _| {
+                                    h.done = true;
+                                    *fired.lock().unwrap() = Some(began.elapsed());
+                                },
+                            );
+                        }
+                    },
+                    Workers(1),
+                    stop,
+                )
+            });
+            for _ in 0..500 {
+                if fired.lock().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(core::time::Duration::from_millis(10));
+            }
+            stop.stop();
+            let h = served.join().unwrap();
+            assert!(h.done);
+        });
+        let at = fired.lock().unwrap().unwrap();
+        assert!(at >= core::time::Duration::from_millis(80), "{at:?}");
+        assert!(at < core::time::Duration::from_secs(3), "{at:?}");
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
     fn a_connection_that_cannot_be_made_is_told_so() {
         // bound then dropped: nothing listens there
