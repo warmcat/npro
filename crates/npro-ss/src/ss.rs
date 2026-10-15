@@ -1542,23 +1542,29 @@ mod tests {
 
     const ECHO: [&[u8]; 2] = [b"chat", b"echo"];
 
-    /// One vhost, one route serving everything, taking ws as `ws` says.
-    fn listener(ws: WsPolicy<'static>) -> Listener<'static> {
-        let routes: &'static [Route<'static>] = alloc::vec![Route {
+    /// One route serving everything, taking ws as `ws` says.
+    const fn routes(ws: WsPolicy<'static>) -> [Route<'static>; 1] {
+        [Route {
             path: "/",
             matching: crate::policy::Match::Prefix,
             to: "app",
             ws,
             headers: &[],
         }]
-        .leak();
-        let vhosts: &'static [Vhost<'static>] = alloc::vec![Vhost {
+    }
+
+    /// One vhost with `routes`, and a header of its own.
+    const fn vhosts(routes: &'static [Route<'static>]) -> [Vhost<'static>; 1] {
+        [Vhost {
             name: "test",
             routes,
             headers: &[(b"x-vhost", b"1")],
             not_found: None,
         }]
-        .leak();
+    }
+
+    /// A plain listener on `vhosts`.
+    fn listener(vhosts: &'static [Vhost<'static>]) -> Listener<'static> {
         Listener {
             name: "test",
             bind: "unix:/test",
@@ -1568,7 +1574,17 @@ mod tests {
         }
     }
 
-    fn ws(default: Option<usize>) -> WsPolicy<'static> {
+    /// A listener on one vhost with one route serving everything, taking
+    /// ws as `$ws` says: the policy is built at compile time, a reference
+    /// to a const block being `'static`, so nothing is leaked for it
+    /// (Miri counts a leak as a failure).
+    macro_rules! listener {
+        ($ws:expr) => {
+            listener(&const { vhosts(&const { routes($ws) }) })
+        };
+    }
+
+    const fn ws(default: Option<usize>) -> WsPolicy<'static> {
         WsPolicy::Taken(WsServer {
             protocols: &ECHO,
             default,
@@ -1661,7 +1677,7 @@ mod tests {
 
     #[test]
     fn requests_are_answered_one_after_another_on_one_stream() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(2);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -1683,7 +1699,7 @@ mod tests {
 
     #[test]
     fn a_connection_gone_tells_its_stream_once_and_its_ids_are_refused() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -1726,13 +1742,13 @@ mod tests {
     #[test]
     fn accepting_is_refused_when_full_or_when_tls_does_not_fit() {
         let ls = [
-            listener(WsPolicy::NotTaken),
+            listener!(WsPolicy::NotTaken),
             Listener {
                 tls: Tls::Server {
                     cert: "c.pem",
                     key: "k.pem",
                 },
-                ..listener(WsPolicy::NotTaken)
+                ..listener!(WsPolicy::NotTaken)
             },
         ];
         let mut sl: Slots = (0..2).map(|_| Slot::new(storage(512, 64))).collect();
@@ -1768,7 +1784,7 @@ mod tests {
 
     #[test]
     fn destroyed_a_stream_is_gone_and_its_transaction_dropped_untold() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -1835,7 +1851,7 @@ mod tests {
         ];
         Listener {
             vhosts: &VHOSTS,
-            ..listener(WsPolicy::NotTaken)
+            ..listener!(WsPolicy::NotTaken)
         }
     }
 
@@ -1976,7 +1992,7 @@ mod tests {
         }];
         let ls = [Listener {
             vhosts: &vhosts,
-            ..listener(WsPolicy::NotTaken)
+            ..listener!(WsPolicy::NotTaken)
         }];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
@@ -1998,7 +2014,7 @@ mod tests {
 
     #[test]
     fn a_length_is_asked_for_a_ws_message_not_an_h1_answer() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -2016,7 +2032,7 @@ mod tests {
 
     #[test]
     fn ws_is_taken_as_the_listener_says_and_carries_messages() {
-        let ls = [listener(ws(None))];
+        let ls = [listener!(ws(None))];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -2048,7 +2064,7 @@ mod tests {
 
     #[test]
     fn ws_not_taken_is_a_request_like_any_and_one_not_had_is_refused() {
-        let ls = [listener(WsPolicy::NotTaken), listener(ws(None))];
+        let ls = [listener!(WsPolicy::NotTaken), listener!(ws(None))];
         let mut sl = slots(2);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let a = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -2070,7 +2086,7 @@ mod tests {
 
     #[test]
     fn a_request_is_read_by_name() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -2113,7 +2129,7 @@ mod tests {
 
     #[test]
     fn a_stream_connects_out_and_is_told_the_answer() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let stream = ss
@@ -2190,10 +2206,10 @@ mod tests {
         }
         assert!(released);
         ss.released(conn).unwrap();
-        let mut told = 0;
+        let mut told = 0_usize;
         while let Some(ev) = ss.poll_event(T0) {
             assert!(matches!(ev.kind, Kind::Disconnected));
-            told += 1;
+            told = told.checked_add(1).unwrap();
         }
         assert_eq!(told, 1);
         assert!(ss.user(stream).is_err());
@@ -2203,7 +2219,7 @@ mod tests {
 
     #[test]
     fn a_connect_that_fails_tells_the_stream_and_frees_the_slot() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let stream = ss
@@ -2248,7 +2264,7 @@ mod tests {
 
     #[test]
     fn a_held_stream_is_told_nothing_until_it_is_given_again() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let conn = ss.accepted(T0, ListenerId::new(0), None).unwrap();
@@ -2270,7 +2286,7 @@ mod tests {
 
     #[test]
     fn a_stream_destroyed_while_connecting_is_hung_up_once_made() {
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut sl = slots(1);
         let mut ss = Ss::new(&ls, &mut sl).unwrap();
         let stream = ss
@@ -2288,7 +2304,7 @@ mod tests {
 
     #[test]
     fn the_policy_is_checked() {
-        let no_protocols = WsPolicy::Taken(WsServer {
+        const NO_PROTOCOLS: WsPolicy<'static> = WsPolicy::Taken(WsServer {
             protocols: &[],
             default: None,
             payload: Payload::Text,
@@ -2301,12 +2317,12 @@ mod tests {
             why,
         };
         for (l, want) in [
-            (listener(no_protocols), at(RouteError::NoProtocols)),
-            (listener(ws(Some(2))), at(RouteError::NoSuchDefault)),
+            (listener!(NO_PROTOCOLS), at(RouteError::NoProtocols)),
+            (listener!(ws(Some(2))), at(RouteError::NoSuchDefault)),
             (
                 Listener {
                     vhosts: &[],
-                    ..listener(WsPolicy::NotTaken)
+                    ..listener!(WsPolicy::NotTaken)
                 },
                 NewError::Listener {
                     listener: ListenerId::new(0),
@@ -2344,7 +2360,7 @@ mod tests {
         ] {
             let ls = [Listener {
                 vhosts,
-                ..listener(WsPolicy::NotTaken)
+                ..listener!(WsPolicy::NotTaken)
             }];
             let mut sl = slots(1);
             assert_eq!(
@@ -2373,7 +2389,7 @@ mod tests {
             }];
             let ls = [Listener {
                 vhosts: &vhosts,
-                ..listener(WsPolicy::NotTaken)
+                ..listener!(WsPolicy::NotTaken)
             }];
             let mut sl = slots(1);
             assert_eq!(
@@ -2396,7 +2412,7 @@ mod tests {
             route: 0,
             why,
         };
-        let ls = [listener(WsPolicy::NotTaken)];
+        let ls = [listener!(WsPolicy::NotTaken)];
         let mut small: Slots = vec![Slot::new(storage(64, 0))];
         assert_eq!(
             Ss::new(&ls, &mut small).err(),
@@ -2410,7 +2426,7 @@ mod tests {
                 cert: "c.pem",
                 key: "k.pem",
             },
-            ..listener(WsPolicy::NotTaken)
+            ..listener!(WsPolicy::NotTaken)
         }];
         let mut for_tls = slots(1);
         assert_eq!(
@@ -2420,7 +2436,7 @@ mod tests {
                 why: SlotError::Net
             })
         );
-        let deflate = [listener(WsPolicy::Taken(WsServer {
+        let deflate = [listener!(WsPolicy::Taken(WsServer {
             protocols: &ECHO,
             default: None,
             payload: Payload::Text,
