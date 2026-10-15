@@ -227,6 +227,11 @@ fn cgi_head() {
 }
 
 #[test]
+fn certdist_update() {
+    smoke(Target::CertdistUpdate, seeded).unwrap();
+}
+
+#[test]
 fn chunked() {
     smoke(Target::Chunked, seeded).unwrap();
 }
@@ -291,6 +296,7 @@ fn every_target_has_a_smoke_test() {
         "files",
         "proxy",
         "cgi-head",
+        "certdist-update",
     ];
     assert_eq!(Target::ALL.map(Target::name), tested);
 }

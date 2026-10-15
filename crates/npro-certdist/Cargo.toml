@@ -1,0 +1,22 @@
+[package]
+name        = "npro-certdist"
+description = "npro's certificate distribution client: lws' cert-dist protocol, the messages and the rules of installing what comes, sans-IO"
+readme      = "../../README.md"
+keywords    = ["sans-io", "no-std", "tls", "certificates"]
+categories  = ["network-programming", "no-std"]
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+npro-core.workspace = true
+npro-json           = { path = "../npro-json", version = "0.0.2" }
+
+[dev-dependencies]
+npro-core = { workspace = true, features = ["replay"] }
+
+[lints]
+workspace = true

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+mod certdist;
 mod cgi;
 mod files;
 mod h1;
@@ -29,6 +30,7 @@ mod ss;
 mod targets;
 mod ws;
 
+pub use certdist::certdist_update;
 pub use cgi::cgi_head;
 pub use files::files;
 pub use h1::{chunked, h1_request, h1_response, uri};
@@ -84,11 +86,14 @@ pub enum Target {
     Proxy,
     /// [`cgi_head`]: a script's answer's head, as npro-cgi parses it.
     CgiHead,
+    /// [`certdist_update`]: the distribution server's message, as
+    /// npro-certdist parses it.
+    CertdistUpdate,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Utf8,
         Self::Sha1,
         Self::Base64,
@@ -105,6 +110,7 @@ impl Target {
         Self::Files,
         Self::Proxy,
         Self::CgiHead,
+        Self::CertdistUpdate,
     ];
 
     /// The target's name.
@@ -127,6 +133,7 @@ impl Target {
             Self::Files => "files",
             Self::Proxy => "proxy",
             Self::CgiHead => "cgi-head",
+            Self::CertdistUpdate => "certdist-update",
         }
     }
 
@@ -154,6 +161,7 @@ impl Target {
             Self::Files => files(data),
             Self::Proxy => proxy(data),
             Self::CgiHead => cgi_head(data),
+            Self::CertdistUpdate => certdist_update(data),
         }
     }
 }

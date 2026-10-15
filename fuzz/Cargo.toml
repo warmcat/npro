@@ -136,3 +136,10 @@ path  = "fuzz_targets/cgi_head.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "certdist-update"
+path  = "fuzz_targets/certdist_update.rs"
+test  = false
+doc   = false
+bench = false

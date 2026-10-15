@@ -47,7 +47,10 @@ The protocol crates' targets start from the C library's corpora
   user agent holding what the access log line must sanitize;
   `regress-pipelined-end` is two POSTs whose bodies arrive together,
   so the bytes that end the first transaction bring the second
-  request, which the harness once saw told before the first's end.
+  request, which the harness once saw told before the first's end;
+  `regress-ws-not-upgraded` is a ws connect the server answers with
+  200, which was once told as the server's refusal, an event a
+  transaction's end follows.
 - `files`: written for it, a control byte then the request: a file, a
   directory's default document, a route asked for without its `/`, a
   HEAD with a matching `if-none-match`, a large file, a path reaching
@@ -67,6 +70,10 @@ The protocol crates' targets start from the C library's corpora
   which is no header; `regress-crlf-count` is a head of CRLF lines
   near the limit, which takes more input than it keeps, as the
   harness once did not allow for.
+- `certdist-update`: written for it, a control byte then the
+  distribution server's message: a chain and key, an unchanged pair,
+  one side alone, a chain that is no PEM, and members the client does
+  not know, nested.
 
 A `tight-*` seed's control byte has its top bit set, choosing the small
 table with token limits.  A seed named `regress-*` is an input the fuzzer

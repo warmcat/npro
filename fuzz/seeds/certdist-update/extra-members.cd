@@ -1,0 +1,1 @@
+{"version":1,"subdomain":"a.b","note":{"x":[1,2]},"fullchain":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","privkey":"-----BEGIN PRIVATE KEY-----\nMIGH\n-----END PRIVATE KEY-----\n"}

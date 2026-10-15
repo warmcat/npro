@@ -49,6 +49,7 @@ allow = [
 	"npro-files",
 	"npro-proxy",
 	"npro-cgi",
+	"npro-certdist",
 	"npro-fuzz",
 	"npro-test",
 

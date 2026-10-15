@@ -85,6 +85,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "npro-certdist"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-json",
+]
+
+[[package]]
 name = "npro-cgi"
 version = "0.0.2"
 dependencies = [
@@ -106,6 +114,7 @@ dependencies = [
 name = "npro-fuzz"
 version = "0.0.2"
 dependencies = [
+ "npro-certdist",
  "npro-cgi",
  "npro-core",
  "npro-files",
