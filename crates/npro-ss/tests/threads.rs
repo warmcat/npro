@@ -15,7 +15,6 @@
 mod threads {
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::path::PathBuf;
     use std::thread;
 
     use npro_core::random::SeededRandom;
@@ -363,6 +362,7 @@ mod threads {
     #[cfg_attr(miri, ignore = "sockets: native runs keep it")]
     fn an_h1_request_over_a_unix_socket_is_answered() {
         use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
         let path: PathBuf =
             std::env::temp_dir().join(format!("npro-ss-test-{}.sock", std::process::id()));
         let bind: &'static str = format!("unix:{}", path.display()).leak();
