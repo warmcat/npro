@@ -28,6 +28,11 @@ mod policies {
         assert_eq!(p.listeners[0].vhosts[0].routes.len(), 8);
         assert!(p.services.by_name.iter().any(|(n, _)| *n == "repo"));
         assert_eq!(p.logs, &[("npro.rs", "/srv/log/lwsws/npro-access-log")]);
+        let dist = p.dist.as_ref().unwrap();
+        assert_eq!(dist.certs.len(), 1);
+        assert_eq!(dist.certs[0].name, "npro.rs");
+        // the https listener's certificate is the one the client installs
+        assert_eq!(p.awaited, &["https"]);
         assert_eq!((p.slots, p.workers), (256, 4));
     }
 }

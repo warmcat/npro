@@ -3,8 +3,8 @@
     "https": {
       "bind": "[::]:443",
       "tls": {
-        "cert": "/var/dnssec/domains/npro.rs/certs/production/crt/npro.rs-latest-fullchain.crt",
-        "key": "/var/dnssec/domains/npro.rs/certs/production/key/npro.rs-latest.key"
+        "cert": "/var/npro/pki/npro.rs/fullchain.pem",
+        "key": "/var/npro/pki/npro.rs/privkey.pem"
       },
       "vhosts": ["npro.rs"]
     },
@@ -51,5 +51,12 @@
     "lwsws": { "type": "proxy", "address": "unix:/var/run/lwsws-npro", "path": "/" },
     "to-https": { "type": "redirect", "to": "https://npro.rs", "append-path": true }
   },
-  "npro": { "slots": 256, "workers": 4 }
+  "npro": { "slots": 256, "workers": 4 },
+  "cert-dist": {
+    "server": "wss://distribution-server.local",
+    "ca": "/etc/npro/dist-server-ca.pem",
+    "pki": "/var/npro/pki",
+    "certs": { "npro.rs": { "cert": "/etc/npro/npro.rs-dist-client.pem",
+                            "key": "/etc/npro/npro.rs-dist-client.key" } }
+  }
 }

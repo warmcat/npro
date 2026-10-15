@@ -18,7 +18,7 @@ mod runner {
     use std::thread;
 
     use npro_cli::runner::{RunError, Streams, bind};
-    use npro_cli::tls::{CHECK_EVERY, CertError, Certs};
+    use npro_cli::tls::{CHECK_EVERY, CertError, Certs, Presence};
     use npro_core::time::Instant;
     use npro_h1::server::Config;
     use npro_io::threads::{Jobs, Stop, Workers};
@@ -207,23 +207,23 @@ mod runner {
         let (cert, key) = pem_files("reload");
         let t0 = std::time::Instant::now();
         let later = |n: u32| t0.checked_add(CHECK_EVERY.checked_mul(n).unwrap()).unwrap();
-        let mut c = Certs::load(cert.as_ref(), key.as_ref(), t0).unwrap();
-        let first = c.config(t0);
+        let mut c = Certs::load(cert.as_ref(), key.as_ref(), t0, Presence::Required).unwrap();
+        let first = c.config(t0).unwrap();
         let good = std::fs::read(cert).unwrap();
         // half written: kept as it was, and why said
         std::fs::write(cert, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
         // not looked at again until it is time
-        assert!(Arc::ptr_eq(&c.config(t0), &first));
+        assert!(Arc::ptr_eq(&c.config(t0).unwrap(), &first));
         assert!(c.failed().is_none());
-        assert!(Arc::ptr_eq(&c.config(later(1)), &first));
+        assert!(Arc::ptr_eq(&c.config(later(1)).unwrap(), &first));
         assert!(matches!(c.failed(), Some(CertError::Cert(_))));
         // whole again: a new config, for the connections after
         std::fs::write(cert, &good).unwrap();
-        let renewed = c.config(later(2));
+        let renewed = c.config(later(2)).unwrap();
         assert!(!Arc::ptr_eq(&renewed, &first));
         assert!(c.failed().is_none());
         // unchanged since: the same one
-        assert!(Arc::ptr_eq(&c.config(later(3)), &renewed));
+        assert!(Arc::ptr_eq(&c.config(later(3)).unwrap(), &renewed));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //!   dropped, and the streams carried by npro-io's threads adapter, with
 //!   rustls over aws-lc for tls listeners;
 //! - [`front`]: the server's application, answering each request from the
-//!   service its route names: files, the proxy, or a redirect;
+//!   service its route names: files, the proxy, a redirect, or a script;
+//! - [`certdist`]: the certificate distribution client, its links kept
+//!   up from the front, and what the server sends installed;
 //! - [`policy`]: the policy from JSON, its layers merged, made into the
 //!   types the runner and the front take;
 //! - [`tls`]: a listener's certificate and key, by path, made into a
@@ -22,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod certdist;
 pub mod front;
 pub mod policy;
 pub mod privileges;

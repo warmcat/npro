@@ -16,23 +16,26 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use npro_core::time::Instant;
 use npro_io::driver::{Buffers, NetBuffers};
+use npro_io::threads::Makes;
 use npro_io::threads::{self, Jobs, Listening, Stop, Workers};
-use npro_io::tls::rustls::RustlsServer;
+use npro_io::tls::rustls::RustlsAny;
 use npro_ss::id::ListenerId;
 use npro_ss::policy::{Listener, Tls};
 use npro_ss::ss::{ConnStorage, NewError, Slot, Ss};
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 
 use crate::privileges::{self, Kept};
 use crate::random::ProviderRandom;
-use crate::tls::{CertError, Certs};
+use crate::tls::{CertError, Certs, Presence};
 
 /// The streams as the runner makes them: each application's `U`, buffers
 /// of its own, the provider's random, and rustls.
-pub type Streams<'s, U> = Ss<'s, U, Vec<u8>, ProviderRandom, RustlsServer>;
+pub type Streams<'s, U> = Ss<'s, U, Vec<u8>, ProviderRandom, RustlsAny>;
 
 /// Each connection's buffers, by what they hold.  tls opens and seals a
 /// record only whole: 16KiB of payload, and up to 2KiB more on the wire.
@@ -93,6 +96,33 @@ pub struct Bound<'p> {
     listeners: &'p [Listener<'p>],
     sockets: Vec<Listening>,
     certs: Vec<Option<Certs>>,
+    identities: Identities,
+}
+
+/// The client identities the process connects out with, by name: what a
+/// stream's [`npro_ss::ss::ClientTls::identity`] names.
+#[derive(Debug, Default)]
+pub struct Identities {
+    by_name: Vec<(String, Arc<ClientConfig>)>,
+}
+
+impl Identities {
+    /// None.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            by_name: Vec::new(),
+        }
+    }
+
+    /// Adds `config` as `name`: [`crate::tls::identity`] makes one.
+    pub fn add(&mut self, name: &str, config: Arc<ClientConfig>) {
+        self.by_name.push((name.to_owned(), config));
+    }
+
+    fn find(&self, name: &str) -> Option<&Arc<ClientConfig>> {
+        self.by_name.iter().find(|(n, _)| n == name).map(|(_, c)| c)
+    }
 }
 
 /// Binds each of `listeners` where it says, loads each tls one's
@@ -105,6 +135,21 @@ pub struct Bound<'p> {
 /// [`RunError`]: a listener not bound, a certificate not loaded, or a
 /// capability not dropped.
 pub fn bind<'p>(listeners: &'p [Listener<'p>]) -> Result<Bound<'p>, RunError> {
+    bind_awaiting(listeners, &[])
+}
+
+/// [`bind`], with the certificates of the listeners named in `awaited`
+/// allowed not to be there yet: the certificate distribution client is
+/// to fetch them, and until one comes its listener refuses every
+/// connection.
+///
+/// # Errors
+///
+/// As [`bind`]'s.
+pub fn bind_awaiting<'p>(
+    listeners: &'p [Listener<'p>],
+    awaited: &[&str],
+) -> Result<Bound<'p>, RunError> {
     let now = std::time::Instant::now();
     let mut sockets = Vec::with_capacity(listeners.len());
     let mut certs = Vec::with_capacity(listeners.len());
@@ -113,10 +158,15 @@ pub fn bind<'p>(listeners: &'p [Listener<'p>]) -> Result<Bound<'p>, RunError> {
             listener: l.name.to_owned(),
             error,
         })?);
+        let presence = if awaited.contains(&l.name) {
+            Presence::Awaited
+        } else {
+            Presence::Required
+        };
         certs.push(match l.tls {
             Tls::Plain => None,
             Tls::Server { cert, key } => Some(
-                Certs::load(Path::new(cert), Path::new(key), now).map_err(|error| {
+                Certs::load(Path::new(cert), Path::new(key), now, presence).map_err(|error| {
                     RunError::Certs {
                         listener: l.name.to_owned(),
                         error,
@@ -130,10 +180,55 @@ pub fn bind<'p>(listeners: &'p [Listener<'p>]) -> Result<Bound<'p>, RunError> {
         listeners,
         sockets,
         certs,
+        identities: Identities::new(),
     })
 }
 
+/// What makes each connection's tls: a listener's from its certificates,
+/// looked at again as they change; a connect's from the identity it
+/// names.
+struct Maker {
+    certs: Mutex<Vec<Option<Certs>>>,
+    identities: Identities,
+}
+
+impl<U: Default> Makes<Streams<'_, U>> for Maker {
+    fn for_listener(&self, id: ListenerId) -> Option<RustlsAny> {
+        let mut all = self.certs.lock().unwrap_or_else(PoisonError::into_inner);
+        let c = all.get_mut(usize::try_from(id.index()).ok()?)?.as_mut()?;
+        // one that cannot be made, or whose certificate is awaited, is
+        // refused, and the socket closed
+        let config = c.config(std::time::Instant::now())?;
+        npro_aws_lc::server(config).ok().map(RustlsAny::Server)
+    }
+
+    fn for_connect(&self, server_name: &str, identity: Option<&str>) -> Option<RustlsAny> {
+        // a connect with no identity has no roots to verify by either:
+        // refused, until there is a trust store to give it
+        let config = self.identities.find(identity?)?;
+        let name = ServerName::try_from(server_name.to_owned()).ok()?;
+        npro_aws_lc::client(Arc::clone(config), name)
+            .ok()
+            .map(RustlsAny::Client)
+    }
+}
+
 impl Bound<'_> {
+    /// With `identities` to connect out with.
+    #[must_use]
+    pub fn with_identities(mut self, identities: Identities) -> Self {
+        self.identities = identities;
+        self
+    }
+
+    /// Whether the tls listener `id` has its certificate: not while it
+    /// is awaited.
+    #[must_use]
+    pub fn has_certificate(&self, id: ListenerId) -> Option<bool> {
+        let i = usize::try_from(id.index()).ok()?;
+        self.certs.get(i)?.as_ref().map(Certs::is_loaded)
+    }
+
     /// Where the listener `id` is bound, if it is TCP: what a port of 0
     /// came to.
     #[must_use]
@@ -167,7 +262,7 @@ impl Bound<'_> {
             .iter()
             .any(|l| matches!(l.tls, Tls::Server { .. }));
         let records = if tls { size::RECORDS } else { 0 };
-        let mut storage: Vec<Slot<U, Vec<u8>, ProviderRandom, RustlsServer>> = (0..slots)
+        let mut storage: Vec<Slot<U, Vec<u8>, ProviderRandom, RustlsAny>> = (0..slots)
             .map(|_| {
                 Slot::new(ConnStorage {
                     h1: npro_h1::Storage {
@@ -187,12 +282,9 @@ impl Bound<'_> {
             })
             .collect();
         let ss: Streams<'_, U> = Ss::new(self.listeners, &mut storage).map_err(RunError::Policy)?;
-        let certs = Mutex::new(self.certs);
-        let make_tls = |id: ListenerId| {
-            let mut all = certs.lock().unwrap_or_else(PoisonError::into_inner);
-            let c = all.get_mut(usize::try_from(id.index()).ok()?)?.as_mut()?;
-            // one that cannot be made is refused, and the socket closed
-            npro_aws_lc::server(c.config(std::time::Instant::now())).ok()
+        let maker = Maker {
+            certs: Mutex::new(self.certs),
+            identities: self.identities,
         };
         let listening = (0..)
             .zip(self.sockets)
@@ -200,7 +292,7 @@ impl Bound<'_> {
         threads::serve(
             ss,
             listening.collect(),
-            &make_tls,
+            &maker,
             |ss: &mut Streams<'_, U>, now, jobs| app(ss, now, jobs),
             workers,
             stop,

@@ -56,6 +56,7 @@ use core::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use npro_certdist::valid_name;
 use npro_cgi::Script;
 use npro_files::{Cache, Intermediaries, Mount, Revalidate};
 use npro_h1::server::Config as H1Config;
@@ -63,6 +64,7 @@ use npro_json::{Config, Event, Parser, Storage};
 use npro_proxy::Upstream;
 use npro_ss::policy::{Deflate, Listener, Match, Payload, Route, Tls, Vhost, Ws, WsServer};
 
+use crate::certdist::{DEFAULT_PKI, Server};
 use crate::front::{Append, Redirect, Service, Services};
 
 /// The lowest layer: what npro does with no policy at all.
@@ -354,7 +356,7 @@ fn read_layer(path: &Path, present: Present) -> Result<Option<Value>, PolicyErro
 
 /// The policy as the runner and the front take it, made once, its
 /// storage leaked for the life of the process.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Policy {
     /// The listeners, for the runner.
     pub listeners: &'static [Listener<'static>],
@@ -363,10 +365,41 @@ pub struct Policy {
     /// Each vhost's access log, by the vhost's name, for the front's
     /// [`crate::front::Logs`].
     pub logs: &'static [(&'static str, &'static str)],
+    /// The certificate distribution client, if there is one.
+    pub dist: Option<DistPolicy>,
+    /// The listeners whose certificates the distribution client is to
+    /// fetch: they may be absent when the listener is bound.
+    pub awaited: &'static [&'static str],
     /// How many streams at once.
     pub slots: usize,
     /// How many worker threads for the application's jobs.
     pub workers: usize,
+}
+
+/// The certificate distribution client, as the policy's `cert-dist`
+/// declares it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistPolicy {
+    /// The distribution server.
+    pub server: Server,
+    /// The CA file the server's certificate is verified by.
+    pub ca: PathBuf,
+    /// Where the certificates fetched are installed, `<pki>/<name>/`.
+    pub pki: PathBuf,
+    /// Each certificate managed: the name it is installed under, and the
+    /// client certificate and key the link for it presents.
+    pub certs: Vec<DistCert>,
+}
+
+/// One certificate the distribution client manages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistCert {
+    /// The name, which is the directory under `pki` and the identity's.
+    pub name: &'static str,
+    /// The client certificate's path.
+    pub cert: PathBuf,
+    /// Its key's path.
+    pub key: PathBuf,
 }
 
 /// A member of an object, by name, with what it may hold.
@@ -547,10 +580,28 @@ const DEFAULT_TIMEOUT: u64 = 30;
 /// [`PolicyError`].
 pub fn policy(v: &Value) -> Result<Policy, PolicyError> {
     let top = Members::of(String::new(), v)?;
-    top.only(&["listeners", "vhosts", "services", "npro"])?;
+    top.only(&["listeners", "vhosts", "services", "npro", "cert-dist"])?;
     let services = services(&top)?;
     let (vhosts, logs) = vhosts(&top, &services)?;
     let listeners = listeners(&top, &vhosts)?;
+    let dist = dist(&top)?;
+    // a listener whose certificate is one the client installs may be
+    // bound before it is there
+    let awaited: Vec<&'static str> = dist
+        .as_ref()
+        .map(|d| {
+            listeners
+                .iter()
+                .filter(|l| match l.tls {
+                    Tls::Server { cert, .. } => d.certs.iter().any(|c| {
+                        Path::new(cert) == crate::certdist::Dist::fullchain_path(&d.pki, c.name)
+                    }),
+                    Tls::Plain => false,
+                })
+                .map(|l| l.name)
+                .collect()
+        })
+        .unwrap_or_default();
     let npro = top.object("npro")?;
     let (slots, workers) = match npro {
         Some(n) => {
@@ -565,6 +616,8 @@ pub fn policy(v: &Value) -> Result<Policy, PolicyError> {
             by_name: Vec::leak(services),
         },
         logs: Vec::leak(logs),
+        dist,
+        awaited: Vec::leak(awaited),
         slots: usize::try_from(slots.unwrap_or(64)).unwrap_or(64),
         workers: usize::try_from(workers.unwrap_or(2)).unwrap_or(2),
     })
@@ -671,6 +724,48 @@ fn services(top: &Members<'_>) -> Result<Vec<(&'static str, Service<'static>)>, 
         out.push((keep(name), service));
     }
     Ok(out)
+}
+
+/// The `cert-dist` member: the client, if there is one.
+fn dist(top: &Members<'_>) -> Result<Option<DistPolicy>, PolicyError> {
+    let Some(m) = top.object("cert-dist")? else {
+        return Ok(None);
+    };
+    m.only(&["server", "ca", "pki", "certs"])?;
+    let url = m.required("server")?;
+    let server = Server::parse(url).ok_or_else(|| PolicyError::Type {
+        at: m.path("server"),
+        expected: "wss://host[:port], or ws:// for a test",
+    })?;
+    let ca = PathBuf::from(m.required("ca")?);
+    let pki = PathBuf::from(m.string("pki")?.unwrap_or(DEFAULT_PKI));
+    let mut certs = Vec::new();
+    if let Some(all) = m.object("certs")? {
+        for (name, v) in all.members {
+            let c = Members::of(all.path(name), v)?;
+            c.only(&["cert", "key"])?;
+            if !valid_name(name) {
+                return Err(PolicyError::Type {
+                    at: all.path(name),
+                    expected: "a plain name, [A-Za-z0-9._-], not starting with . or -",
+                });
+            }
+            certs.push(DistCert {
+                name: keep(name),
+                cert: PathBuf::from(c.required("cert")?),
+                key: PathBuf::from(c.required("key")?),
+            });
+        }
+    }
+    if certs.is_empty() {
+        return Err(PolicyError::Missing(m.path("certs")));
+    }
+    Ok(Some(DistPolicy {
+        server,
+        ca,
+        pki,
+        certs,
+    }))
 }
 
 /// The vhosts by name, and the access log of each that has one.
@@ -902,7 +997,9 @@ mod tests {
                       "up": { "type": "proxy", "address": "unix:/tmp/o", "path": "/o" },
                       "go": { "type": "redirect", "to": "https://x", "append-path": true },
                       "cgi": { "type": "cgi", "exec": "/usr/bin/env", "env": { "A": "1" }, "timeout": 5 } },
-        "npro": { "slots": 4 }
+        "npro": { "slots": 4 },
+        "cert-dist": { "server": "wss://dist.example:8443", "ca": "/etc/npro/ca.pem",
+                       "certs": { "v": { "cert": "/etc/npro/v.pem", "key": "/etc/npro/v.key" } } }
     }"#;
 
     #[test]
@@ -910,6 +1007,17 @@ mod tests {
         let p = policy(&parse("t", FULL.as_bytes()).unwrap()).unwrap();
         assert_eq!((p.slots, p.workers), (4, 2));
         assert_eq!(p.listeners.len(), 1);
+        let dist = p.dist.as_ref().unwrap();
+        assert_eq!(
+            (dist.server.address.as_str(), dist.server.host.as_str()),
+            ("dist.example:8443", "dist.example")
+        );
+        assert_eq!(dist.pki, PathBuf::from(DEFAULT_PKI));
+        assert_eq!(dist.certs.len(), 1);
+        assert_eq!(dist.certs[0].name, "v");
+        assert_eq!(dist.certs[0].cert, PathBuf::from("/etc/npro/v.pem"));
+        // the listener's certificate is a file, not one distributed
+        assert_eq!(p.awaited.len(), 0);
         let l = &p.listeners[0];
         assert_eq!((l.name, l.bind, l.tls), ("l", "unix:/tmp/x", Tls::Plain));
         let v = &l.vhosts[0];

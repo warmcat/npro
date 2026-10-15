@@ -141,6 +141,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "npro-certdist"
+version = "0.0.2"
+dependencies = [
+ "npro-core",
+ "npro-json",
+]
+
+[[package]]
 name = "npro-cgi"
 version = "0.0.2"
 dependencies = [
@@ -153,6 +161,7 @@ version = "0.0.0"
 dependencies = [
  "caps",
  "npro-aws-lc",
+ "npro-certdist",
  "npro-cgi",
  "npro-core",
  "npro-files",

@@ -403,6 +403,32 @@ buffers, and take more clients than there are slots.
   frames it chunked, which needs chunked output in the h1 server,
   not yet built.  Not yet: `cgi-chroot`, the login guard's headers.
 
+- **The certificate distribution client** (2026-10-15) is what lets
+  npro.rs be deployed at all: its tls certificate comes from the
+  distribution server, as lwsws' does through `lws-cert-dist-client`.
+  `npro-certdist` is the protocol, wire-compatible with the C server:
+  a ws link per certificate under mTLS, the client certificate saying
+  which name it manages; the hash of the installed chain said first;
+  the server's `{"subdomain","fullchain","privkey"}` parsed as the
+  frames bring it into caller storage, each side at most 256K and
+  plausibly PEM, both empty for unchanged; C's backoffs.  `npro serve`
+  runs it in its own process (`npro_cli::certdist`): the links are
+  client streams of the front's (`Ss::connect_ws`, the identity named
+  per link), their tls from the identities the runner holds, reconnects
+  by the adapter's timers, and the install is lws' `cdc_install()` done
+  by this process into `<pki>/<name>/`, a directory it owns, since npro
+  runs unprivileged and needs no root stub: timestamped files, the key
+  readable by this user alone, and `fullchain.pem` and `privkey.pem`
+  symlinks moved onto them atomically, the key's first.  A listener
+  whose certificate is one the client installs may be bound before it
+  is there (`Presence::Awaited`): it refuses connections until the
+  files come, and serves each renewal as the runner's look at its
+  files finds it.  Tested against a server the test plays over mTLS
+  with the test CA: nothing installed, the pair fetched and installed;
+  then the hash said and unchanged taken.  Not yet: the supervisor's
+  instance for it, the server's `dist-client/` provisioning (the
+  monitor's), reloading anything but the listener's own look.
+
 ### The client half, first form
 
 Built 2026-10-14, as far as the proxy needs it.  `Ss::connect(address,
@@ -1056,6 +1082,12 @@ code for exactly this trust model.
   name; the threads adapter gives the application timers
   (`Jobs::after`) and its first turn at the start, for links it keeps
   up of its own accord.
+- 2026-10-15: the certificate distribution client runs inside `npro
+  serve`, as a `cert-dist` section of the policy, installing into
+  `/var/npro/pki` (Andy's suggestion of `/var/npro`) as this process,
+  with no privileged stub: the pki directory is the service user's.  A
+  listener whose certificate is distributed is bound before the
+  certificate comes, refusing connections until it does.
 
 ## Open
 

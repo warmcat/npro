@@ -20,7 +20,7 @@ mod front {
     use core::time::Duration;
 
     use npro_cgi::Script;
-    use npro_cli::front::{Front, Logs, Service, Services, act, check};
+    use npro_cli::front::{App, Front, Logs, Service, Services, act, check};
     use npro_cli::runner::{Streams, bind};
     use npro_files::{Cache, Intermediaries, Mount, Revalidate};
     use npro_h1::server::Config;
@@ -181,6 +181,11 @@ mod front {
         check(&services, &listeners).unwrap();
         let log = format!("{root}/access.log");
         let logs = Logs::open(&[("localhost", &log)]).unwrap();
+        let mut app = App {
+            services,
+            logs,
+            dist: None,
+        };
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -189,7 +194,7 @@ mod front {
                 bound.serve(
                     4,
                     |ss: &mut Streams<'_, Front>, now, jobs| {
-                        act(&services, &logs, ss, now, jobs);
+                        act(&mut app, ss, now, jobs);
                     },
                     Workers::default(),
                     &stop,
@@ -333,7 +338,11 @@ mod front {
         let root = www("a_request_is_passed_to_the_origin_and_its_answer_back");
         let (services, listener) = policy_with(root, up);
         let listeners = [listener];
-        let logs = Logs::none();
+        let mut app = App {
+            services,
+            logs: Logs::none(),
+            dist: None,
+        };
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -342,7 +351,7 @@ mod front {
                 bound.serve(
                     8,
                     |ss: &mut Streams<'_, Front>, now, jobs| {
-                        act(&services, &logs, ss, now, jobs);
+                        act(&mut app, ss, now, jobs);
                     },
                     Workers::default(),
                     &stop,
@@ -397,7 +406,11 @@ mod front {
         let root = www("an_origin_not_there_is_answered_503");
         let (services, listener) = policy_with(root, nowhere);
         let listeners = [listener];
-        let logs = Logs::none();
+        let mut app = App {
+            services,
+            logs: Logs::none(),
+            dist: None,
+        };
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -406,7 +419,7 @@ mod front {
                 bound.serve(
                     4,
                     |ss: &mut Streams<'_, Front>, now, jobs| {
-                        act(&services, &logs, ss, now, jobs);
+                        act(&mut app, ss, now, jobs);
                     },
                     Workers::default(),
                     &stop,
@@ -542,7 +555,11 @@ mod front {
         let exec = script(root);
         let (services, listener) = policy_cgi(root, exec);
         let listeners = [listener];
-        let logs = Logs::none();
+        let mut app = App {
+            services,
+            logs: Logs::none(),
+            dist: None,
+        };
         let bound = bind(&listeners).unwrap();
         let addr = bound.local_addr(ListenerId::new(0)).unwrap();
         let stop = Stop::new();
@@ -551,7 +568,7 @@ mod front {
                 bound.serve(
                     4,
                     |ss: &mut Streams<'_, Front>, now, jobs| {
-                        act(&services, &logs, ss, now, jobs);
+                        act(&mut app, ss, now, jobs);
                     },
                     Workers::default(),
                     &stop,

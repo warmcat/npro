@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use npro_certdist::hash::MESSAGE_LEN;
 use npro_cgi::{DEFAULT_DIR, Head, Progress, Script, Vars};
 use npro_core::time::Instant;
 use npro_files::{Fs, Mount, Opened, Scheme, Served, Serving, serve};
@@ -38,7 +39,19 @@ use npro_ss::event::{End, Ended, Filled, Flow, Kind, Response, Txn};
 use npro_ss::id::StreamId;
 use npro_ss::policy::{Listener, Tls};
 
+use crate::certdist::{self, Dist};
 use crate::runner::Streams;
+
+/// The front as a whole: what [`act`] is given on every turn.
+#[derive(Debug)]
+pub struct App<'p> {
+    /// The services, by the name a route's `to` gives.
+    pub services: Services<'p>,
+    /// The access logs.
+    pub logs: Logs,
+    /// The certificate distribution client, if the policy has one.
+    pub dist: Option<Dist>,
+}
 
 /// A service the front was built with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +320,14 @@ impl Front {
             log: None,
         }
     }
+
+    /// A stream that is the certificate distribution client's link `i`.
+    pub(crate) const fn dist(i: usize) -> Self {
+        Self {
+            state: State::Dist(i),
+            log: None,
+        }
+    }
 }
 
 /// What a front stream is sending.
@@ -326,13 +347,15 @@ pub enum State {
     /// A script's answer, from npro-cgi: boxed, it holds the head
     /// being parsed.
     Cgi(Box<Running>),
+    /// The certificate distribution client's link, by index.
+    Dist(usize),
 }
 
 /// The proxy's side of a front stream, if it is one.
 fn proxy_side(u: &mut Front) -> Option<&mut Side<Vec<u8>>> {
     match &mut u.state {
         State::Proxy(s) => Some(s),
-        State::Idle | State::Answered | State::File(_) | State::Cgi(_) => None,
+        State::Idle | State::Answered | State::File(_) | State::Cgi(_) | State::Dist(_) => None,
     }
 }
 
@@ -633,6 +656,8 @@ enum Then {
     ReadCgi,
     /// The script is over with: ended and reaped.
     Reap,
+    /// The certificate distribution client's link does something.
+    Dist(certdist::Then),
     /// The stream's reading is held, or given back.
     Flow(Flow),
     /// A request to pass on, copied out: [`npro_proxy::start`].  Boxed:
@@ -796,19 +821,31 @@ fn answer(services: &Services<'static>, txn: &mut Txn<'_, Vec<u8>>, user: &mut S
 }
 
 /// The front's turn: every event answered, the file reads wanted given
-/// to `jobs`, each transaction over written to its vhost's log.  This is
-/// what the runner's `serve()` is given.
+/// to `jobs`, each transaction over written to its vhost's log, and the
+/// certificate distribution client's links kept up.  This is what the
+/// runner's `serve()` is given.
 pub fn act<'s>(
-    services: &Services<'static>,
-    logs: &Logs,
+    app: &mut App<'static>,
     ss: &mut Streams<'s, Front>,
     now: Instant,
     jobs: &Jobs<'_, Streams<'s, Front>>,
 ) {
+    let App {
+        services,
+        logs,
+        dist,
+    } = app;
+    if let Some(d) = dist.as_mut() {
+        d.tick(ss, now, jobs);
+    }
     while let Some(ev) = ss.poll_event(now) {
         let stream: StreamId = ev.stream;
         let Front { state, log } = ev.user;
         let then = match (state, ev.kind) {
+            (State::Dist(i), kind) => match dist.as_mut() {
+                Some(d) => Then::Dist(d.event(*i, kind, now, jobs)),
+                None => Then::Nothing,
+            },
             (
                 State::Idle | State::Answered | State::File(_) | State::Proxy(_),
                 Kind::ServerTxnEnd(ended),
@@ -834,7 +871,9 @@ pub fn act<'s>(
             }
             (user, Kind::Tx(tx)) => {
                 tx.fill(|buf| match user {
-                    State::Idle | State::Answered | State::Proxy(_) => Filled::Last(0),
+                    State::Idle | State::Answered | State::Proxy(_) | State::Dist(_) => {
+                        Filled::Last(0)
+                    }
                     State::File(s) => s.fill(buf),
                     State::Cgi(r) => r.fill(buf),
                 });
@@ -845,7 +884,7 @@ pub fn act<'s>(
                             read_cgi_off_the_turn(r, stream, jobs);
                         }
                     }
-                    State::Idle | State::Answered | State::Proxy(_) => {}
+                    State::Idle | State::Answered | State::Proxy(_) | State::Dist(_) => {}
                 }
                 Then::Nothing
             }
@@ -883,7 +922,7 @@ fn carry_out<'s>(
 ) {
     {
         match then {
-            Then::Nothing => {}
+            Then::Nothing | Then::Dist(certdist::Then::Nothing) => {}
             Then::Tx => {
                 let _ = ss.request_tx(stream);
             }
@@ -907,6 +946,12 @@ fn carry_out<'s>(
                         r.kill(jobs);
                     }
                 }
+            }
+            Then::Dist(certdist::Then::Say) => {
+                let _ = ss.request_tx_len(stream, u64::try_from(MESSAGE_LEN).unwrap_or(0));
+            }
+            Then::Dist(certdist::Then::Drop) => {
+                let _ = ss.destroy(now, stream);
             }
             Then::Status(code) => status(ss, now, stream, code),
             Then::Start(up, asked) => {

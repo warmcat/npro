@@ -28,10 +28,14 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use npro_cli::front::{Front, Logs, act, check};
+use npro_cli::certdist::Dist;
+use npro_cli::front::{App, Front, Logs, act, check};
 use npro_cli::policy::{self, Policy};
-use npro_cli::runner::{Streams, bind};
+use npro_cli::random::ProviderRandom;
+use npro_cli::runner::{Identities, Streams, bind_awaiting};
+use npro_cli::tls;
 use npro_io::threads::{Stop, Workers};
+use npro_ss::id::ListenerId;
 
 const HELP: &str = "npro: npro's utility
 
@@ -105,6 +109,8 @@ fn serve(policy: Option<&Path>, fragments: &[String]) -> Result<(), String> {
         listeners,
         services,
         logs,
+        dist,
+        awaited,
         slots,
         workers,
     } = policy::policy(&merged).map_err(|e| format!("policy: {e}"))?;
@@ -115,12 +121,48 @@ fn serve(policy: Option<&Path>, fragments: &[String]) -> Result<(), String> {
     // the logs before the listeners: a log that cannot be opened is
     // refused before a port is taken
     let logs = Logs::open(logs).map_err(|e| e.to_string())?;
-    let bound = bind(listeners).map_err(|e| e.to_string())?;
+    // the distribution client's identities, before the privileges go
+    let mut identities = Identities::new();
+    let dist = match dist {
+        None => None,
+        Some(d) => {
+            let names: Vec<&str> = d.certs.iter().map(|c| c.name).collect();
+            for c in &d.certs {
+                let config = tls::identity(&d.ca, &c.cert, &c.key)
+                    .map_err(|e| format!("cert-dist: {}: {e}", c.name))?;
+                identities.add(c.name, config);
+            }
+            Some(Dist::new(
+                d.server.clone(),
+                d.pki.clone(),
+                &names,
+                ProviderRandom::new(),
+            ))
+        }
+    };
+    let bound = bind_awaiting(listeners, awaited)
+        .map_err(|e| e.to_string())?
+        .with_identities(identities);
+    for name in awaited {
+        let id = listeners.iter().position(|l| l.name == *name);
+        let there =
+            id.and_then(|i| bound.has_certificate(ListenerId::new(u32::try_from(i).unwrap_or(0))));
+        if there == Some(false) {
+            eprintln!(
+                "npro: {name}: certificate not there yet; refusing connections until it is distributed"
+            );
+        }
+    }
+    let mut app = App {
+        services,
+        logs,
+        dist,
+    };
     let stop = Stop::new();
     bound
         .serve(
             slots,
-            move |ss: &mut Streams<'_, Front>, now, jobs| act(&services, &logs, ss, now, jobs),
+            move |ss: &mut Streams<'_, Front>, now, jobs| act(&mut app, ss, now, jobs),
             Workers(workers),
             &stop,
         )

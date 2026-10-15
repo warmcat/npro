@@ -408,6 +408,7 @@ parameter bound at the scope named.
 | disable-no-protocol-ws-upgrades | a route rule |
 | enable-client-ssl, client-ssl-* | client trust and certs, at the scope of the streams that use them |
 | ws-protocols[] (pvo) | services, with their parameters |
+| `lws-cert-dist-client` pvos (`server-url`, `ca-filepath`, `base-dir`, `certs`) | the top-level `cert-dist` section: `server`, `ca`, `pki`, `certs`; built into `npro serve` for now, an instance of its own once the supervisor exists |
 | dht[] | a dht service |
 
 **Per mount**

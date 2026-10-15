@@ -74,7 +74,14 @@ authority come after; nothing here stops them):
                   "dir": "/tmp", "timeout": 30 },
     "to-https": { "type": "redirect", "to": "https://example.com", "append-path": true }
   },
-  "npro": { "slots": 64, "workers": 2 }
+  "npro": { "slots": 64, "workers": 2 },
+  "cert-dist": {
+    "server": "wss://distribution.example.com",
+    "ca": "/etc/npro/dist-server-ca.pem",
+    "pki": "/var/npro/pki",
+    "certs": { "example.com": { "cert": "/etc/npro/example.com-client.pem",
+                                "key": "/etc/npro/example.com-client.key" } }
+  }
 }
 ```
 
@@ -118,12 +125,30 @@ authority come after; nothing here stops them):
     should allow for the scripts expected at once.
 - **npro**: `slots`, how many streams at once; `workers`, how many
   threads for what is done off the loop (file reads).
+- **cert-dist**: the certificate distribution client, lws'
+  `lws-cert-dist-client` as `npro serve` runs it in its own process:
+  for each of `certs`, by name, a ws link kept open to `server`
+  (`wss://host[:port]`) under mTLS with that entry's client `cert` and
+  `key`, the server's own certificate verified by `ca`; the chain and
+  key the server sends are installed under `<pki>/<name>/` as
+  `fullchain.pem` and `privkey.pem` (symlinks moved atomically onto
+  timestamped files, the key readable by this user alone), and
+  renewals come down the same link.  A listener whose `tls` names
+  those paths may be bound before they are there: it refuses
+  connections until the client has installed them, and serves each
+  renewal as it comes.  The pki directory must be this process'
+  own; `/var/npro/pki` if `pki` is not given.  A dropped link is made
+  again after 1 to 5 seconds; a certificate that could not be
+  installed is fetched again after 10 seconds, growing to hourly.
 
 `policies/npro.rs.json` is npro.rs' policy in this form, from its lwsws
-configuration: files, git and sai proxied over their unix domain
-sockets, `/repo` served by `git-http-backend` as a cgi (its
-`GIT_PROJECT_ROOT` is a guess until the box's is known), the port-80
-redirect, and the mounts not yet ported proxied
+configuration: its certificate fetched by the distribution client into
+`/var/npro/pki/npro.rs/` and served from there (the server's address,
+CA and the client certificate's paths are placeholders), files, git and
+sai proxied over their unix domain sockets, `/repo` served by
+`git-http-backend` as a cgi (its `GIT_PROJECT_ROOT` is a guess until
+the box's is known), the port-80 redirect, and the mounts not yet
+ported proxied
 to an lwsws kept listening on a unix domain socket of its own (the
 path there is a placeholder until that lwsws is set up).  A test keeps
 it loading.
