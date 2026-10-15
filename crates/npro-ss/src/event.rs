@@ -7,6 +7,7 @@
 //! call made on the [`crate::ss::Ss`] after the event.
 
 use core::net::SocketAddr;
+use core::time::Duration;
 
 use npro_core::random::Random;
 use npro_core::time::Instant;
@@ -352,6 +353,13 @@ impl<'a, S: AsRef<[u8]> + AsMut<[u8]>> Txn<'a, S> {
     #[must_use]
     pub const fn version(&self) -> Version {
         self.server.version()
+    }
+
+    /// The stream may take `d` from now to begin its answer, instead of
+    /// the connection's content timeout: for a script spawned to answer,
+    /// C's `cgi-timeout`.
+    pub fn answer_within(&mut self, d: Duration) {
+        self.server.answer_within(self.now, d);
     }
 
     /// The vhost the request is for: the one its `Host` named, or the

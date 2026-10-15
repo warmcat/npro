@@ -1046,6 +1046,20 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         Ok(())
     }
 
+    /// The application may take `d` from `now` to begin its answer to
+    /// the request in hand, instead of [`Timeouts::content`]: what a
+    /// script spawned for it is allowed, C's `lws_set_timeout()` with
+    /// `PENDING_TIMEOUT_CGI`.  Nothing changes once the answer has begun,
+    /// or with no request in hand.
+    pub fn answer_within(&mut self, now: Instant, d: Duration) {
+        if let Phase::Request(mut t) = self.phase {
+            if t.reply == Reply::Awaited {
+                t.watch = Watch::Content(now.saturating_add(d));
+                self.phase = Phase::Request(t);
+            }
+        }
+    }
+
     /// The application is done with the transaction, at `now`: C's
     /// `lws_http_transaction_completed()`.  The rest of the request's body
     /// is taken without it, and once the answer has gone, the connection
