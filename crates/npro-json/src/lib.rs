@@ -486,6 +486,32 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Parser<S> {
         self.storage
     }
 
+    /// Ready for another document, in the same storage: what was parsed
+    /// is forgotten, a refusal with it.  For a stream of documents one
+    /// after another, as a ws link carries them.
+    ///
+    /// ```
+    /// use npro_json::{Config, Event, Parser, Storage};
+    ///
+    /// let mut p = Parser::new(Storage { token: [0u8; 32], names: [0u8; 32] }, Config::new())?;
+    /// assert_eq!(p.next(b"{}")?.event, Some(Event::ObjectStart));
+    /// assert_eq!(p.next(b"}")?.event, Some(Event::ObjectEnd));
+    /// assert!(p.is_over());
+    /// p.reset();
+    /// assert!(!p.is_over());
+    /// assert_eq!(p.next(b"[")?.event, Some(Event::ArrayStart));
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    pub const fn reset(&mut self) {
+        self.depth = 0;
+        self.objects = 0;
+        self.state = State::Expect(Expect::Value);
+        self.token = 0;
+        self.names = 0;
+        self.frame = NO_FRAME;
+        self.at = 0;
+    }
+
     /// Whether the document is whole: its value ended, and only white
     /// space may follow.  A document that is a lone number is whole only
     /// at [`Parser::end`], as nothing before says it has ended.
