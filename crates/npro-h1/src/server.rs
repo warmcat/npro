@@ -361,6 +361,20 @@ pub struct Server<S> {
     /// The version the last request asked in, which C answers a refused
     /// request target in: `wsi->stream.request_version`.
     version: Version,
+    /// The status the request in hand was answered with, if it was: the
+    /// last status line composed for it, as C's `access_log.response`.
+    answered: Option<u16>,
+    /// A transaction over since this was last taken.
+    settled: Option<Settled>,
+}
+
+/// A transaction that is over: its answer, if it had one, handed to the
+/// connection whole, and nothing more of it to come.  [`Server::take_settled`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    /// The status it was answered with: the last status line composed
+    /// for it, or `None` if the connection closed unanswered.
+    pub status: Option<u16>,
 }
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
@@ -384,6 +398,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             phase: Phase::Head(Wait::Head(now.saturating_add(config.timeouts.head))),
             own: Own::new(storage.out),
             version: Version::Http10,
+            answered: None,
+            settled: None,
         })
     }
 
@@ -403,6 +419,38 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
     #[must_use]
     pub const fn request(&self) -> &HeaderTable<S> {
         self.head.table()
+    }
+
+    /// The version the request in hand asked in.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The status the request in hand was answered with, if it was: the
+    /// last status line composed for it, 101 for an upgrade agreed.  For
+    /// an access log line written as the connection closes, with the
+    /// transaction still open: C's `access_log.response`.
+    #[must_use]
+    pub const fn answered(&self) -> Option<u16> {
+        self.answered
+    }
+
+    /// The transaction that is over since this was last asked, if one is:
+    /// its answer, or refusal, handed to the connection whole, and the
+    /// connection on to the next request or closing.  Not an upgrade
+    /// agreed, whose connection goes on as the upgraded protocol's.  For
+    /// the access log, written as C writes it at
+    /// `lws_http_transaction_completed()`.
+    pub const fn take_settled(&mut self) -> Option<Settled> {
+        self.settled.take()
+    }
+
+    /// The transaction in hand is over.
+    const fn settled(&mut self) {
+        self.settled = Some(Settled {
+            status: self.answered,
+        });
     }
 
     /// Whether a request is in hand and not yet answered: the time to
@@ -675,6 +723,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         };
         self.own
             .compose(|o| status_page(o, self.version, code, b"", headers, Page::Whole))?;
+        self.answered = Some(code);
         self.refusing(now);
         Ok(())
     }
@@ -711,6 +760,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         };
         self.own
             .compose(|o| status_page(o, version, code, b"", headers, page))?;
+        self.answered = Some(code);
         // the page is the connection's own bytes: nothing is owed
         t.reply = Reply::Payload(Some(0));
         t.completed = true;
@@ -754,6 +804,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             own.push_headers(headers, &RESERVED)?;
             own.push(b"\r\n")
         })?;
+        self.answered = Some(code);
         t.reply = Reply::Payload(Some(0));
         t.completed = true;
         self.phase = Phase::Request(t);
@@ -769,6 +820,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         let _ = self
             .own
             .compose(|o| status_page(o, version, code, text, &[], Page::Whole));
+        self.answered = Some(code);
         self.refusing(now);
     }
 
@@ -831,6 +883,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             Body::Over
         };
         // C's lws_http_action(): content is due, or the answer
+        self.answered = None;
         self.phase = Phase::Request(Txn {
             body,
             reply: Reply::Awaited,
@@ -933,6 +986,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             own.push_headers(r.headers, &RESERVED)?;
             own.push(b"\r\n")
         })?;
+        self.answered = Some(r.status);
         if r.content_length.is_none() && !bodiless {
             t.keep_alive = false;
         }
@@ -987,6 +1041,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
             own.push_headers(headers, &RESERVED)?;
             own.push(b"\r\n")
         })?;
+        self.answered = Some(101);
         self.phase = Phase::Switching(now.saturating_add(self.config.timeouts.response));
         Ok(())
     }
@@ -1031,7 +1086,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         }
         if !self.own.pending() {
             match self.phase {
-                Phase::Refusing(_) => self.phase = Phase::Closed(Close::Shutdown),
+                Phase::Refusing(_) => {
+                    self.phase = Phase::Closed(Close::Shutdown);
+                    self.settled();
+                }
                 Phase::Switching(_) => self.phase = Phase::Switched,
                 Phase::Head(_) | Phase::Request(_) | Phase::Switched | Phase::Closed(_) => {}
             }
@@ -1054,12 +1112,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
         let Reply::Payload(owed) = t.reply else {
             // completed with no answer: C closes
             self.phase = Phase::Closed(Close::Shutdown);
+            self.settled();
             return;
         };
         // with no length, the close ends it; short of its length, the peer
         // would take what comes next as the rest of it
         if owed.is_none_or(|o| o > 0) || !t.keep_alive {
             self.phase = Phase::Closed(Close::Shutdown);
+            self.settled();
             return;
         }
         match t.body {
@@ -1072,6 +1132,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Server<S> {
                     .keepalive
                     .map(|k| now.saturating_add(k));
                 self.phase = Phase::Head(Wait::Idle(until));
+                self.settled();
             }
             Body::Length(_) | Body::Chunked(_) => {}
         }
@@ -1978,5 +2039,62 @@ mod tests {
         assert!(s.is_awaiting_answer());
         s.respond(OK2).unwrap();
         assert!(!s.is_awaiting_answer());
+    }
+
+    #[test]
+    fn the_transaction_settled_is_taken_once_with_what_it_was_answered() {
+        let mut s = server_out(MIN_OUT);
+        assert_eq!(s.version(), Version::Http11);
+        assert_eq!((s.answered(), s.take_settled()), (None, None));
+        s.status(T0, 404, &[]).unwrap();
+        assert_eq!(s.answered(), Some(404));
+        // not over until the page has gone to the connection
+        assert_eq!(s.take_settled(), None);
+        let mut out = [0u8; 512];
+        assert!(!s.tx(T0, &mut out, &mut NoPayload).more);
+        assert_eq!(s.take_settled(), Some(Settled { status: Some(404) }));
+        assert_eq!(s.take_settled(), None);
+        // the next request starts unanswered
+        assert_eq!(
+            s.rx(T0, b"GET /2 HTTP/1.1\r\nHost: x\r\n\r\n").event,
+            Some(Event::Request)
+        );
+        assert_eq!(s.answered(), None);
+        // an answer with payload is over once the application completes
+        // it and the last of it has gone
+        s.respond(OK2).unwrap();
+        assert_eq!(s.answered(), Some(200));
+        assert!(!s.tx(T0, &mut out, &mut Text(b"ok")).more);
+        assert_eq!(s.take_settled(), None);
+        s.complete(T0);
+        assert_eq!(s.take_settled(), Some(Settled { status: Some(200) }));
+        // completed with no answer: closed, and over, unanswered
+        assert_eq!(
+            s.rx(T0, b"GET /3 HTTP/1.1\r\nHost: x\r\n\r\n").event,
+            Some(Event::Request)
+        );
+        s.complete(T0);
+        assert_eq!(s.take_settled(), Some(Settled { status: None }));
+        assert_eq!(s.close(), Some(Close::Shutdown));
+    }
+
+    #[test]
+    fn an_upgrade_agreed_is_not_settled_and_one_refused_is() {
+        const ASKING: &[u8] =
+            b"GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+        let mut s = server_with(MIN_OUT, ASKING);
+        s.switch(T0, b"websocket", &[]).unwrap();
+        assert_eq!(s.answered(), Some(101));
+        let mut out = [0u8; 512];
+        assert!(!s.tx(T0, &mut out, &mut NoPayload).more);
+        assert!(s.is_switched());
+        // the connection goes on as ws: its end is the connection's
+        assert_eq!(s.take_settled(), None);
+        let mut r = server_with(MIN_OUT, ASKING);
+        r.refuse_upgrade(T0, 426, None).unwrap();
+        assert_eq!(r.answered(), Some(426));
+        assert_eq!(r.take_settled(), None);
+        assert!(!r.tx(T0, &mut out, &mut NoPayload).more);
+        assert_eq!(r.take_settled(), Some(Settled { status: Some(426) }));
     }
 }
